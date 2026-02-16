@@ -1,22 +1,28 @@
 /*
  * calypso_spi.c — Calypso SPI + TWL3025 ABB
  *
- * SPI controller with integrated TWL3025 Analog Baseband emulation.
+ * REWRITE: Correct register map matching real TI Calypso hardware.
  *
- * BUG FIX vs previous implementation:
- *   - twl3025_spi_xfer() is now actually called on TX writes
- *     (was marked __unused__, calypso_spi_read returned hardcoded 0x2)
- *   - Firmware can now read VRPCSTS, ITSTATREG, etc. via SPI protocol
+ * Register map (16-bit, offsets from SPI base 0xFFFE3000):
+ *   0x00  SPI_SET1    Configuration register 1
+ *   0x02  SPI_SET2    Configuration register 2
+ *   0x04  SPI_CTRL    Control (bit0 = start transfer, bits[3:1] = length)
+ *   0x06  SPI_STATUS  Status (bit0 = RE = Ready/done)
+ *   0x08  SPI_TX_LSB  TX data low byte
+ *   0x0A  SPI_TX_MSB  TX data high byte
+ *   0x0C  SPI_RX_LSB  RX data low byte
+ *   0x0E  SPI_RX_MSB  RX data high byte
  *
- * Calypso SPI wire protocol:
+ * OsmocomBB firmware SPI transaction flow:
+ *   1. Poll STATUS until RE=1 (ready)
+ *   2. Write TX_LSB, TX_MSB
+ *   3. Write CTRL with START bit
+ *   4. Poll STATUS until RE=1 (transfer done)
+ *   5. Read RX_LSB, RX_MSB
+ *
+ * TWL3025 ABB SPI wire protocol:
  *   TX word: bit[15]=R/W, bits[14:6]=register addr, bits[5:0]=write data
  *   RX word: for reads, returns the register value
- *
- * Register map (16-bit, offsets from base):
- *   0x00  STATUS  (bit0=TX_READY, bit1=RX_READY)
- *   0x02  CTRL
- *   0x04  TX      (write triggers SPI transaction)
- *   0x06  RX      (result of last transaction)
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -26,6 +32,19 @@
 #include "hw/irq.h"
 #include "qemu/log.h"
 #include "hw/arm/calypso/calypso_spi.h"
+
+/* Register offsets — MUST match real Calypso hardware */
+#define SPI_REG_SET1     0x00
+#define SPI_REG_SET2     0x02
+#define SPI_REG_CTRL     0x04
+#define SPI_REG_STATUS   0x06
+#define SPI_REG_TX_LSB   0x08
+#define SPI_REG_TX_MSB   0x0A
+#define SPI_REG_RX_LSB   0x0C
+#define SPI_REG_RX_MSB   0x0E
+
+/* CTRL bits */
+#define SPI_CTRL_START   (1 << 0)
 
 /* ---- TWL3025 ABB SPI transaction ---- */
 
@@ -43,38 +62,53 @@ static uint16_t twl3025_spi_xfer(CalypsoSPIState *s, uint16_t tx)
         return s->abb_regs[addr];
     } else {
         s->abb_regs[addr] = wdata;
-        /* Side effects for specific registers */
         if (addr == ABB_VRPCDEV) {
-            /* Writing power control → update power status */
-            s->abb_regs[ABB_VRPCSTS] = 0x1F; /* All regulators on */
+            s->abb_regs[ABB_VRPCSTS] = 0x1F;
         }
         return 0;
     }
 }
 
-/* ---- MMIO ---- */
+/* ---- MMIO read ---- */
 
 static uint64_t calypso_spi_read(void *opaque, hwaddr offset, unsigned size)
 {
     CalypsoSPIState *s = CALYPSO_SPI(opaque);
 
     switch (offset) {
-    case 0x00: /* STATUS */
-        /* CRITICAL: Always ready to avoid firmware blocking */
-        s->status = SPI_STATUS_TX_READY | SPI_STATUS_RX_READY;
-        return s->status;
-    case 0x02: /* CTRL */
+    case SPI_REG_SET1:
+        return s->set1;
+
+    case SPI_REG_SET2:
+        return s->set2;
+
+    case SPI_REG_CTRL:
         return s->ctrl;
-    case 0x04: /* TX (read-back) */
-        return s->tx_data;
-    case 0x06: /* RX */
-        return s->rx_data;
+
+    case SPI_REG_STATUS:
+        /* Always ready — transfers complete instantly */
+        return SPI_STATUS_RE;
+
+    case SPI_REG_TX_LSB:
+        return s->tx_data & 0xFF;
+
+    case SPI_REG_TX_MSB:
+        return (s->tx_data >> 8) & 0xFF;
+
+    case SPI_REG_RX_LSB:
+        return s->rx_data & 0xFF;
+
+    case SPI_REG_RX_MSB:
+        return (s->rx_data >> 8) & 0xFF;
+
     default:
-        qemu_log_mask(LOG_UNIMP, "calypso-spi: unimplemented read 0x%02x\n",
+        qemu_log_mask(LOG_UNIMP, "calypso-spi: read at 0x%02x\n",
                        (unsigned)offset);
         return 0;
     }
 }
+
+/* ---- MMIO write ---- */
 
 static void calypso_spi_write(void *opaque, hwaddr offset, uint64_t value,
                                unsigned size)
@@ -82,22 +116,44 @@ static void calypso_spi_write(void *opaque, hwaddr offset, uint64_t value,
     CalypsoSPIState *s = CALYPSO_SPI(opaque);
 
     switch (offset) {
-    case 0x00: /* STATUS (write to clear bits) */
-        s->status &= ~(value & 0xFFFF);
+    case SPI_REG_SET1:
+        s->set1 = value & 0xFFFF;
         break;
-    case 0x02: /* CTRL */
+
+    case SPI_REG_SET2:
+        s->set2 = value & 0xFFFF;
+        break;
+
+    case SPI_REG_CTRL:
         s->ctrl = value & 0xFFFF;
+        if (value & SPI_CTRL_START) {
+            /* Execute SPI transaction */
+            s->rx_data = twl3025_spi_xfer(s, s->tx_data);
+            /* Raise IRQ to signal completion */
+            qemu_irq_pulse(s->irq);
+        }
         break;
-    case 0x04: /* TX — triggers SPI transaction */
-        s->tx_data = value & 0xFFFF;
-        s->rx_data = twl3025_spi_xfer(s, s->tx_data);
-        s->status = SPI_STATUS_TX_READY | SPI_STATUS_RX_READY;
-        /* Raise IRQ to signal completion */
-        qemu_irq_pulse(s->irq);
+
+    case SPI_REG_STATUS:
+        /* Status is read-only, ignore writes */
         break;
-    case 0x06: /* RX (write ignored) */
+
+    case SPI_REG_TX_LSB:
+        s->tx_data = (s->tx_data & 0xFF00) | (value & 0xFF);
         break;
+
+    case SPI_REG_TX_MSB:
+        s->tx_data = (s->tx_data & 0x00FF) | ((value & 0xFF) << 8);
+        break;
+
+    case SPI_REG_RX_LSB:
+    case SPI_REG_RX_MSB:
+        /* RX is read-only */
+        break;
+
     default:
+        qemu_log_mask(LOG_UNIMP, "calypso-spi: write 0x%04x at 0x%02x\n",
+                       (unsigned)value, (unsigned)offset);
         break;
     }
 }
@@ -125,8 +181,10 @@ static void calypso_spi_reset(DeviceState *dev)
 {
     CalypsoSPIState *s = CALYPSO_SPI(dev);
 
+    s->set1 = 0;
+    s->set2 = 0;
     s->ctrl = 0;
-    s->status = SPI_STATUS_TX_READY;  /* TX ready at reset */
+    s->status = SPI_STATUS_RE;  /* Ready at reset */
     s->tx_data = 0;
     s->rx_data = 0;
     memset(s->abb_regs, 0, sizeof(s->abb_regs));

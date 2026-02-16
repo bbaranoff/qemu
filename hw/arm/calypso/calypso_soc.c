@@ -73,7 +73,7 @@ static const MemoryRegionOps calypso_mmio16_ops = {
     .impl = { .min_access_size = 2, .max_access_size = 2 },
 };
 
-static uint64_t calypso_kp_read(void *o, hwaddr a, unsigned s) { return 0; }
+static uint64_t calypso_kp_read(void *o, hwaddr a, unsigned s) { return 0xFF; }
 static void calypso_kp_write(void *o, hwaddr a, uint64_t v, unsigned s) {}
 static const MemoryRegionOps calypso_keypad_ops = {
     .read = calypso_kp_read, .write = calypso_kp_write,
