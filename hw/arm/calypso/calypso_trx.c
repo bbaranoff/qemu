@@ -348,7 +348,12 @@ static void trx_receive_cb(void *opaque)
         TRX_LOG("FN sync: trx=%u local=%u offset=%d",
                 trx_fn, s->fn, fn_offset);
     }
-
+    if (!fn_synced) {
+        TRX_LOG("FN pre-sync: trx=%u local=%u", trx_fn, s->fn);
+        fn_offset = (int32_t)trx_fn - (int32_t)s->fn;
+        fn_synced = true;
+        TRX_LOG("FN sync: trx=%u local=%u offset=%d", trx_fn, s->fn, fn_offset);
+    }
     /* Realign local FN to TRX time */
     trx_fn -= fn_offset;
     s->fn = trx_fn % GSM_HYPERFRAME;
