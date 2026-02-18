@@ -844,20 +844,22 @@ static void calypso_tpu_write(void *opaque, hwaddr offset,
     switch (offset) {
     case TPU_CTRL:
         if ((value & TPU_CTRL_ENABLE) && !s->tpu_enabled) {
-            /* TPU enabled — firmware triggered DSP processing */
             s->tpu_enabled = true;
-
-            /* Process DSP tasks (sync detection + burst handling) */
             calypso_dsp_process(s);
-
-            /* Schedule DSP completion IRQ after small delay (10 µs) */
             timer_mod_ns(s->dsp_timer,
                          qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 10000);
         }
+
         if (value & TPU_CTRL_RESET) {
             s->tpu_enabled = false;
+
+            /* TPU reset usually implies timebase restart */
+            fn_synced = false;
+            fn_offset = 0;
+            TRX_LOG("TPU reset → fn sync reset");
         }
         break;
+
 
     case TPU_OFFSET:
     case TPU_SYNCHRO:
@@ -1080,8 +1082,13 @@ static void calypso_tdma_start(CalypsoTRX *s)
 {
     if (s->tdma_running) return;
     s->tdma_running = true;
+
+    /* RESET FN sync state (important if firmware/TDMA restarts) */
+    fn_synced = false;
+    fn_offset = 0;
+
     s->fn = 0;
-    TRX_LOG("TDMA started (4.615ms frame timer)");
+    TRX_LOG("TDMA started (4.615ms frame timer) [fn sync reset]");
     timer_mod_ns(s->tdma_timer,
                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + GSM_TDMA_NS);
 }
