@@ -53,6 +53,9 @@
 static int gsmtap_fd = -1;
 static struct sockaddr_in gsmtap_addr;
 
+static bool fn_synced = false;
+static int32_t fn_offset = 0;
+
 struct __attribute__((packed)) gsmtap_hdr {
     uint8_t  version;
     uint8_t  hdr_len;
@@ -294,7 +297,6 @@ static void trx_send_burst(CalypsoTRX *s, uint8_t tn, uint32_t fn,
 
 
 }
-
 static void trx_receive_cb(void *opaque)
 {
     CalypsoTRX *s = (CalypsoTRX *)opaque;
@@ -316,21 +318,49 @@ static void trx_receive_cb(void *opaque)
                 inet_ntoa(src.sin_addr), ntohs(src.sin_port));
     }
 
-    /* Parse RX burst (downlink to phone) */
+    /*
+     * TRX RX header layout (osmo-trx):
+     *
+     *  byte 0      : TN
+     *  bytes 1..4 : FN (big endian uint32)
+     *  byte 5     : RSSI
+     *  bytes 6..7 : TOA
+     */
+
     s->rx_tn   = buf[0];
+
+    uint32_t trx_fn = ntohl(*(uint32_t *)(buf + 1));
+
     s->rx_rssi = (int8_t)buf[5];
     s->rx_toa  = (int16_t)((buf[6] << 8) | buf[7]);
 
+    /* ---- FN synchronization (once) ---- */
+    if (!fn_synced) {
+        fn_offset = (int32_t)trx_fn - (int32_t)s->fn;
+        fn_synced = true;
+
+        TRX_LOG("FN sync: trx=%u local=%u offset=%d",
+                trx_fn, s->fn, fn_offset);
+    }
+
+    /* Realign local FN to TRX time */
+    trx_fn -= fn_offset;
+    s->fn = trx_fn % GSM_HYPERFRAME;
+
+    /* Copy burst payload */
     int burst_len = n - TRX_HDR_LEN_RX;
-    if (burst_len > GSM_BURST_BITS) burst_len = GSM_BURST_BITS;
+    if (burst_len > GSM_BURST_BITS)
+        burst_len = GSM_BURST_BITS;
+
     memcpy(s->rx_burst, &buf[TRX_HDR_LEN_RX], burst_len);
     s->rx_pending = true;
 
 #if TRX_DEBUG_TDMA
-    TRX_LOG("TRX RX burst TN=%d RSSI=%d len=%d", s->rx_tn, s->rx_rssi,
-            burst_len);
+    TRX_LOG("TRX RX burst TN=%d FN=%u RSSI=%d len=%d",
+            s->rx_tn, s->fn, s->rx_rssi, burst_len);
 #endif
 }
+
 
 static void trx_socket_init(CalypsoTRX *s, int port)
 {
