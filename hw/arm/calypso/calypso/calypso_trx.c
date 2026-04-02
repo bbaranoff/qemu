@@ -12,8 +12,6 @@
 #include "hw/irq.h"
 #include "hw/arm/calypso/calypso_trx.h"
 #include "hw/arm/calypso/calypso_uart.h"
-#include "hw/arm/calypso/calypso_c54x.h"
-#include "chardev/char-fe.h"
 
 extern CalypsoUARTState *g_uart_modem;
 
@@ -56,9 +54,6 @@ typedef struct CalypsoTRX {
     uint32_t     sb_tasks;
     uint8_t      sync_bsic;
     bool         fw_patched;
-
-    /* C54x DSP emulator */
-    C54xState   *dsp;
 } CalypsoTRX;
 
 static CalypsoTRX *g_trx;
@@ -232,16 +227,6 @@ static void calypso_tdma_tick(void *opaque) {
     { uint16_t pm=PM_RAW_STRONG;
       for(int i=0;i<4;i++){s->dsp_ram[(0x0060+i*2)/2]=pm;s->dsp_ram[(0x0088+i*2)/2]=pm;}
       s->dsp_ram[213]=pm; for(int i=0;i<8;i++)s->dsp_ram[248+i]=pm; }
-    /* Check for UL burst to send */
-    calypso_trx_tx_burst_poll();
-
-    /* Tick C54x DSP — run one frame's worth of processing.
-     * The DSP frame IRQ (SINT17) is triggered by TPU. */
-    if (s->dsp) {
-        c54x_interrupt(s->dsp, C54X_INT_SINT17);
-        c54x_run(s->dsp, 2000);  /* ~2000 insns per frame */
-    }
-
     qemu_irq_raise(s->irqs[CALYPSO_IRQ_TPU_FRAME]);
     timer_mod_ns(s->frame_irq_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)+1000000);
     if (s->tdma_running) timer_mod_ns(s->tdma_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)+GSM_TDMA_NS);
@@ -299,73 +284,11 @@ void calypso_trx_rx_burst(const uint8_t *data, int len)
     (void)nbits;
 }
 
-/* TX burst: send UL burst from DSP write page via UART TX as sercomm DLCI 4 */
-static void calypso_trx_send_ul_burst(CalypsoTRX *s, uint16_t task_u)
-{
-    if (!g_uart_modem || task_u == 0) return;
-
-    /* Read UL burst from write page.
-     * d_burst_u at word 3, burst data follows in NDB a_cu area. */
-    uint16_t *wp = s->dsp_page ?
-        &s->dsp_ram[DSP_API_W_PAGE1 / 2] : &s->dsp_ram[DSP_API_W_PAGE0 / 2];
-
-    /* Build TRXD v0 TX packet: TN(1) FN(4) PWR(1) bits(148) */
-    uint8_t pkt[6 + 148];
-    uint8_t tn = wp[3] & 0x07;  /* d_burst_u has TN info */
-    uint32_t fn = s->fn;
-
-    pkt[0] = tn;
-    pkt[1] = (fn >> 24) & 0xFF;
-    pkt[2] = (fn >> 16) & 0xFF;
-    pkt[3] = (fn >> 8) & 0xFF;
-    pkt[4] = fn & 0xFF;
-    pkt[5] = 0;  /* TX power */
-
-    /* Read burst bits from NDB UL area — for now send dummy burst */
-    memset(&pkt[6], 0, 148);
-
-    /* Wrap in sercomm DLCI 4 and send via UART TX */
-    uint8_t frame[512];
-    int pos = 0;
-    frame[pos++] = 0x7E;  /* FLAG */
-    /* Header: DLCI + CTRL, with escaping */
-    uint8_t hdr[2] = { 0x04, 0x03 };
-    for (int i = 0; i < 2; i++) {
-        if (hdr[i] == 0x7E || hdr[i] == 0x7D) {
-            frame[pos++] = 0x7D;
-            frame[pos++] = hdr[i] ^ 0x20;
-        } else {
-            frame[pos++] = hdr[i];
-        }
-    }
-    /* Payload with escaping */
-    int pkt_len = 6 + 148;
-    for (int i = 0; i < pkt_len && pos < 500; i++) {
-        if (pkt[i] == 0x7E || pkt[i] == 0x7D) {
-            frame[pos++] = 0x7D;
-            frame[pos++] = pkt[i] ^ 0x20;
-        } else {
-            frame[pos++] = pkt[i];
-        }
-    }
-    frame[pos++] = 0x7E;  /* FLAG */
-
-    /* Write to UART chardev (goes to PTY → bridge reads it) */
-    qemu_chr_fe_write_all(&g_uart_modem->chr, frame, pos);
-}
-
+/* TX burst poll — called each TDMA frame to check if firmware wrote a TX burst */
 void calypso_trx_tx_burst_poll(void)
 {
     if (!g_trx) return;
-    /* Check if firmware wrote a UL task */
-    CalypsoTRX *s = g_trx;
-    uint16_t *wp = s->dsp_page ?
-        &s->dsp_ram[DSP_API_W_PAGE1 / 2] : &s->dsp_ram[DSP_API_W_PAGE0 / 2];
-    uint16_t task_u = wp[DB_W_D_TASK_U];
-    if (task_u != 0) {
-        calypso_trx_send_ul_burst(s, task_u);
-        wp[DB_W_D_TASK_U] = 0;  /* clear after sending */
-    }
+    /* TODO: read UL burst from DSP write page and send via UART TX as sercomm DLCI 4 */
 }
 
 /* ---- Init ---- */
@@ -397,24 +320,5 @@ void calypso_trx_init(MemoryRegion *sysmem, qemu_irq *irqs)
 
     g_kick_timer = timer_new_ns(QEMU_CLOCK_REALTIME,calypso_kick_cb,NULL);
     timer_mod_ns(g_kick_timer,qemu_clock_get_ns(QEMU_CLOCK_REALTIME)+5000000);
-
-    /* C54x DSP emulator */
-    {
-        const char *rom_path = getenv("CALYPSO_DSP_ROM");
-        if (!rom_path) rom_path = "/opt/GSM/calypso_dsp.txt";
-        s->dsp = c54x_init();
-        if (s->dsp) {
-            c54x_set_api_ram(s->dsp, s->dsp_ram);
-            if (c54x_load_rom(s->dsp, rom_path) == 0) {
-                c54x_reset(s->dsp);
-                TRX_LOG("C54x DSP loaded from %s", rom_path);
-            } else {
-                TRX_LOG("C54x DSP ROM not found at %s", rom_path);
-                free(s->dsp);
-                s->dsp = NULL;
-            }
-        }
-    }
-
     TRX_LOG("=== Hardware ready ===");
 }
