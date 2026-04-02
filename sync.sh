@@ -11,10 +11,16 @@ CONT_DIR="/opt/GSM/qemu-src"
 
 FILES=(
   hw/arm/calypso/calypso_trx.c
+  hw/arm/calypso/calypso_c54x.c
+  hw/arm/calypso/calypso_c54x.h
+  hw/arm/calypso/calypso_tdma_hw.c
+  hw/arm/calypso/calypso_tdma_hw.h
   hw/arm/calypso/calypso_soc.c
   hw/arm/calypso/calypso_mb.c
   hw/arm/calypso/l1ctl_sock.c
+  hw/arm/calypso/meson.build
   hw/char/calypso_uart.c
+  hw/intc/calypso_inth.c
   include/hw/arm/calypso/calypso_trx.h
   include/hw/arm/calypso/calypso_soc.h
   include/hw/arm/calypso/calypso_uart.h

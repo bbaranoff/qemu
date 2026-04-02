@@ -63,16 +63,22 @@ static inline int asm_shift(C54xState *s)
 
 static uint16_t data_read(C54xState *s, uint16_t addr)
 {
-    /* Timer registers (extended MMR 0x0024-0x0026) */
-    if (addr == 0x0024) {
-        /* TIM — decrement on each read. Fire TINT0 when reaches 0. */
-        if (s->data[0x0024] > 0)
-            s->data[0x0024]--;
-        if (s->data[0x0024] == 0 && s->data[0x0025] > 0) {
-            s->data[0x0024] = s->data[0x0025]; /* reload from PRD */
-            s->ifr |= (1 << 5); /* TINT0 = interrupt 5 */
+    /* Log reads from frame sync area (0x0580-0x05A0) */
+    if (addr >= 0x0580 && addr <= 0x05A0) {
+        static int fr_log = 0;
+        if (fr_log < 30) {
+            C54_LOG("FRAME_RD [0x%04x] = 0x%04x PC=0x%04x", addr, s->data[addr], s->pc);
+            fr_log++;
         }
-        return s->data[0x0024];
+    }
+    /* Timer registers (0x0024-0x0026) — read returns current value */
+    if (addr == TIM_ADDR) return s->data[TIM_ADDR];
+    if (addr == PRD_ADDR) return s->data[PRD_ADDR];
+    if (addr == TCR_ADDR) {
+        /* TCR: PSC is read from bits 9:6, rest from stored value */
+        uint16_t tcr = s->data[TCR_ADDR] & ~TCR_PSC_MASK;
+        tcr |= (s->timer_psc & 0xF) << TCR_PSC_SHIFT;
+        return tcr;
     }
 
     /* MMR region */
@@ -116,25 +122,23 @@ static uint16_t data_read(C54xState *s, uint16_t addr)
     if (addr >= C54X_API_BASE && addr < C54X_API_BASE + C54X_API_SIZE) {
         if (s->api_ram) {
             uint16_t val = s->api_ram[addr - C54X_API_BASE];
-            /* Log task reads: d_dsp_page at 0x08D4, d_task_md at 0x0804 */
-            if (addr == 0x08D4 || addr == 0x0804 || addr == 0x0800) {
-                static int task_read_log = 0;
-                if (task_read_log < 20) {
-                    C54_LOG("TASK READ [0x%04x] = %d PC=0x%04x insn=%u",
-                            addr, val, s->pc, s->insn_count);
-                    task_read_log++;
-                }
+            /* Log ALL API reads during interrupt handler (first 100) */
+            static int api_rd_log = 0;
+            if (api_rd_log < 100 && s->insn_count > 66000) {
+                C54_LOG("API RD [0x%04x] = 0x%04x PC=0x%04x insn=%u",
+                        addr, val, s->pc, s->insn_count);
+                api_rd_log++;
             }
             return val;
         }
     }
 
-    /* Log reads when PC is in the polling loop area */
-    if (s->pc >= 0x2C30 && s->pc <= 0x2C50 && addr >= 0x0020) {
-        static int poll_log = 0;
-        if (poll_log < 20) {
-            C54_LOG("POLL [0x%04x]=0x%04x PC=0x%04x", addr, s->data[addr], s->pc);
-            poll_log++;
+    /* Log data reads during SINT17 handler (PC in 0xFFC0-0xFFFF) */
+    if (s->pc >= 0xFFC0 && s->insn_count > 66090) {
+        static int handler_rd_log = 0;
+        if (handler_rd_log < 30) {
+            C54_LOG("H_RD [0x%04x]=0x%04x PC=0x%04x", addr, s->data[addr], s->pc);
+            handler_rd_log++;
         }
     }
 
@@ -143,10 +147,27 @@ static uint16_t data_read(C54xState *s, uint16_t addr)
 
 static void data_write(C54xState *s, uint16_t addr, uint16_t val)
 {
+    /* Timer registers (0x0024-0x0026) — before MMR check */
+    if (addr == TCR_ADDR) {
+        /* TRB: write 1 → reload TIM from PRD, PSC from TDDR */
+        if (val & TCR_TRB) {
+            s->data[TIM_ADDR] = s->data[PRD_ADDR];
+            s->timer_psc = val & TCR_TDDR_MASK;
+        }
+        /* Store TCR without TRB (TRB is write-only, always reads 0) */
+        s->data[TCR_ADDR] = val & ~TCR_TRB;
+        return;
+    }
+    if (addr == TIM_ADDR) { s->data[TIM_ADDR] = val; return; }
+    if (addr == PRD_ADDR) { s->data[PRD_ADDR] = val; return; }
+
     /* MMR region */
     if (addr < 0x20) {
         switch (addr) {
-        case MMR_IMR:  s->imr = val; return;
+        case MMR_IMR:
+            if (val != s->imr)
+                C54_LOG("IMR change 0x%04x → 0x%04x PC=0x%04x", s->imr, val, s->pc);
+            s->imr = val; return;
         case MMR_IFR:  s->ifr &= ~val; return;  /* write 1 to clear */
         case MMR_ST0:  s->st0 = val; return;
         case MMR_ST1:  s->st1 = val; return;
@@ -166,8 +187,17 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
         case MMR_BRC:  s->brc = val; return;
         case MMR_RSA:  s->rsa = val; return;
         case MMR_REA:  s->rea = val; return;
-        case MMR_PMST: s->pmst = val; return;
-        case MMR_XPC:  s->xpc = val; return;
+        case MMR_PMST:
+            if (val != s->pmst)
+                C54_LOG("PMST change 0x%04x → 0x%04x (IPTR=0x%03x OVLY=%d) PC=0x%04x",
+                        s->pmst, val, (val >> PMST_IPTR_SHIFT) & 0x1FF, !!(val & PMST_OVLY), s->pc);
+            s->pmst = val; return;
+        case MMR_XPC:
+            if (val > 3) {
+                C54_LOG("XPC invalid write 0x%04x PC=0x%04x — clamped", val, s->pc);
+                val &= 3;
+            }
+            s->xpc = val; return;
         default: return;
         }
     }
@@ -332,23 +362,31 @@ static int c54x_exec_one(C54xState *s)
     uint8_t hi4 = (op >> 12) & 0xF;
     uint8_t hi8 = (op >> 8) & 0xFF;
 
-    /* Log every 100000th instruction to see where the DSP spends time */
-    if (s->insn_count > 0 && (s->insn_count % 100000) == 0) {
-        C54_LOG("SAMPLE PC=0x%04x op=0x%04x insn=%u", s->pc, op, s->insn_count);
+    /* Log every instruction of SINT17 handler (short runs after IDLE) */
+    if (s->pc >= 0xFFC0 && s->pc <= 0xFFFF) {
+        static int h_log = 0;
+        if (h_log < 10) {
+            C54_LOG("HIGH_PC PC=0x%04x op=0x%04x insn=%u idle=%d rptb=%d rpt=%d",
+                    s->pc, op, s->insn_count, s->idle, s->rptb_active, s->rpt_active);
+            h_log++;
+        }
     }
 
     switch (hi4) {
     case 0xF:
         /* 0xF --- large group: branches, misc, short immediates */
         if (op == 0xF495) return consumed;  /* NOP */
+        /* F4E2 = RSBX INTM (enable interrupts), F4E3 = SSBX INTM (disable interrupts) */
+        if (op == 0xF4E2) { s->st1 &= ~ST1_INTM; return consumed; }
+        if (op == 0xF4E3) { s->st1 |= ST1_INTM; return consumed; }
         if (op == 0xF4E4) {
             static int idle_log = 0;
-            if (idle_log < 3)
-                C54_LOG("IDLE @0x%04x INTM=%d IMR=0x%04x SP=0x%04x insns=%u",
-                        s->pc, !!(s->st1 & ST1_INTM), s->imr, s->sp, s->insn_count);
+            if (idle_log < 20)
+                C54_LOG("IDLE @0x%04x INTM=%d IMR=0x%04x SP=0x%04x insns=%u XPC=%d",
+                        s->pc, !!(s->st1 & ST1_INTM), s->imr, s->sp, s->insn_count, s->xpc);
             idle_log++;
             s->idle = true;
-            return consumed;
+            return 0;  /* Don't advance PC — ISR return re-executes IDLE */
         } /* IDLE */
         if (hi8 == 0xF4) {
             /* F4xx: unconditional branch/call */
@@ -380,26 +418,16 @@ static int c54x_exec_one(C54xState *s)
             case 0x9: /* F49x: BD pmad (delayed branch) */
                 s->pc = op2;
                 return 0;
-            case 0xD: /* F4Dx: FB/FBACC — far branch (set XPC + PC) */
+            case 0xD: /* F4Dx: FB pmad — far branch (delayed, no XPC change) */
             {
-                uint16_t new_xpc = op2;
-                uint16_t new_pc = prog_read(s, s->pc + 2);
-                consumed = 3;
-                s->xpc = new_xpc;
-                s->pc = new_pc;
+                s->pc = op2;
                 return 0;
             }
-            case 0xF: /* F4Fx: FCALL/FCALLD — far call (set XPC + push PC + branch) */
+            case 0xF: /* F4Fx: FCALL pmad — far call (delayed, no XPC change) */
             {
-                uint16_t new_xpc = op2;
-                uint16_t new_pc = prog_read(s, s->pc + 2);
-                consumed = 3;
                 s->sp--;
-                data_write(s, s->sp, (uint16_t)(s->pc + 3));
-                s->sp--;
-                data_write(s, s->sp, s->xpc);
-                s->xpc = new_xpc;
-                s->pc = new_pc;
+                data_write(s, s->sp, (uint16_t)(s->pc + 2));
+                s->pc = op2;
                 return 0;
             }
             case 0xA: /* F4Ax: BANZ with indirect */
@@ -421,11 +449,16 @@ static int c54x_exec_one(C54xState *s)
             if (op == 0xF074) {
                 uint16_t ra = data_read(s, s->sp); s->sp++;
                 s->st1 &= ~ST1_INTM;
+                static int rete_log = 0;
+                if (rete_log < 10)
+                    C54_LOG("RETE SP=0x%04x→0x%04x RA=0x%04x insn=%u",
+                            s->sp-1, s->sp, ra, s->insn_count);
+                rete_log++;
                 s->pc = ra; return 0;
             }
             /* F072: FRET (far return) — restore XPC then PC from stack */
             if (op == 0xF072) {
-                s->xpc = data_read(s, s->sp); s->sp++;
+                s->xpc = data_read(s, s->sp) & 0x7F; s->sp++;
                 uint16_t ra = data_read(s, s->sp); s->sp++;
                 s->pc = ra; return 0;
             }
@@ -462,10 +495,12 @@ static int c54x_exec_one(C54xState *s)
             /* NOP */
             return consumed;
         }
+        if (op == 0xF4E2) { s->st1 &= ~ST1_INTM; return consumed; }
+        if (op == 0xF4E3) { s->st1 |= ST1_INTM; return consumed; }
         if (op == 0xF4E4) {
             /* IDLE */
             s->idle = true;
-            return consumed;
+            return 0;  /* Don't advance PC — ISR return re-executes IDLE */
         }
         /* FXXX short immediates and misc */
         if (hi8 == 0xF0 || hi8 == 0xF1) {
@@ -1429,8 +1464,18 @@ int c54x_run(C54xState *s, int n_insns)
     int executed = 0;
 
     while (executed < n_insns && s->running && !s->idle) {
+        /* Full trace of first 30 instructions of post-boot runs */
+        static int trace_run = 0;
+        if (executed == 0 && s->insn_count > 28000) trace_run++;
+        if (trace_run >= 1 && trace_run <= 2 && executed < 30) {
+            C54_LOG("HDL[%d] PC=0x%04x op=0x%04x SP=0x%04x A=0x%08x%04x",
+                    executed, s->pc, prog_read(s, s->pc), s->sp,
+                    (uint32_t)(s->a >> 16), (uint16_t)(s->a & 0xFFFF));
+        }
         /* Check RPTB (block repeat) */
         if (s->rptb_active && s->pc == s->rea + 1) {
+            static int rptb_log = 0;
+            if (rptb_log < 3) { C54_LOG("RPTB redirect PC=0x%04x→RSA=0x%04x REA=0x%04x BRC=%d", s->pc, s->rsa, s->rea, s->brc); rptb_log++; }
             if (s->brc > 0) {
                 s->brc--;
                 s->pc = s->rsa;
@@ -1460,24 +1505,29 @@ int c54x_run(C54xState *s, int n_insns)
 
         if (consumed > 0)
             s->pc += consumed;
+        s->pc &= 0xFFFF;  /* C54x has 16-bit PC (23-bit with XPC, but wrap at 16-bit) */
         /* consumed == 0 means PC was set by branch */
 
-        /* Timer tick — decrement TIM every instruction */
-        if (s->data[0x0024] > 0) {
-            s->data[0x0024]--;
-            if (s->data[0x0024] == 0) {
-                if (s->data[0x0025] > 0)
-                    s->data[0x0024] = s->data[0x0025]; /* reload from PRD */
-                s->ifr |= (1 << 5); /* TINT0 */
-                /* Check if TINT0 is unmasked and interrupts enabled */
-                if (!(s->st1 & ST1_INTM) && (s->imr & (1 << 5))) {
-                    s->ifr &= ~(1 << 5);
-                    s->sp--;
-                    data_write(s, s->sp, (uint16_t)s->pc);
-                    s->st1 |= ST1_INTM;
-                    uint16_t iptr = (s->pmst >> PMST_IPTR_SHIFT) & 0x1FF;
-                    s->pc = (iptr * 0x80) + 5 * 4; /* TINT0 vector */
-                    s->idle = false;
+        /* Timer0 tick — real TMS320C54x hardware behavior:
+         * 1. If TSS=1 (timer stopped), do nothing
+         * 2. PSC decrements each CPU clock cycle
+         * 3. When PSC reaches 0: reload PSC from TDDR, decrement TIM
+         * 4. When TIM reaches 0: reload TIM from PRD, set IFR bit 5 (TINT0)
+         */
+        if (!(s->data[TCR_ADDR] & TCR_TSS)) {
+            if (s->timer_psc > 0) {
+                s->timer_psc--;
+            } else {
+                /* PSC expired — reload from TDDR */
+                s->timer_psc = s->data[TCR_ADDR] & TCR_TDDR_MASK;
+                /* Decrement TIM */
+                if (s->data[TIM_ADDR] > 0) {
+                    s->data[TIM_ADDR]--;
+                }
+                if (s->data[TIM_ADDR] == 0 && s->data[PRD_ADDR] > 0) {
+                    /* TIM expired — reload from PRD, fire TINT0 */
+                    s->data[TIM_ADDR] = s->data[PRD_ADDR];
+                    s->ifr |= (1 << C54X_INT_TINT0); /* TINT0 */
                 }
             }
         }
@@ -1596,6 +1646,10 @@ void c54x_reset(C54xState *s)
     s->imr = 0;
     s->ifr = 0;
     s->xpc = 0;
+    s->timer_psc = 0;
+    s->data[TCR_ADDR] = TCR_TSS;  /* Timer stopped at reset (TSS=1) per HW spec */
+    s->data[TIM_ADDR] = 0xFFFF;   /* TIM = max at reset */
+    s->data[PRD_ADDR] = 0xFFFF;   /* PRD = max at reset */
     s->rpt_active = false;
     s->rptb_active = false;
     s->idle = false;
@@ -1634,14 +1688,15 @@ void c54x_interrupt_ex(C54xState *s, int vec, int imr_bit)
         /* Wake from IDLE */
         s->idle = false;
     } else if (s->idle && (s->imr & (1 << imr_bit))) {
-        /* IDLE wakes on any unmasked interrupt even if INTM is set */
+        /* IDLE wakes on any unmasked interrupt even if INTM=1.
+         * Per TMS320C54x spec: IDLE is special — when an unmasked interrupt
+         * arrives during IDLE, the CPU always services it (branches to vector)
+         * regardless of INTM state. INTM is set to 1 on entry. */
         s->idle = false;
         s->ifr &= ~(1 << imr_bit);
-
         s->sp--;
         data_write(s, s->sp, (uint16_t)s->pc);
         s->st1 |= ST1_INTM;
-
         uint16_t iptr = (s->pmst >> PMST_IPTR_SHIFT) & 0x1FF;
         s->pc = (iptr * 0x80) + vec * 4;
     }

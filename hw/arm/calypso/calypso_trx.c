@@ -135,7 +135,7 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
             /* Boot C54x — ARM has finished DSP init */
             if (s->dsp) {
                 c54x_reset(s->dsp);
-                int ran = c54x_run(s->dsp, 500000);
+                int ran = c54x_run(s->dsp, 10000000);
                 TRX_LOG("C54x boot: ran=%d PC=0x%04x idle=%d IMR=0x%04x",
                         ran, s->dsp->pc, s->dsp->idle, s->dsp->imr);
             }
@@ -178,17 +178,31 @@ static void calypso_dsp_done(void *opaque) {
             /* Copy write page to DARAM 0x0586 */
             for (int i = 0; i < 20; i++)
                 s->dsp->data[0x0586 + i] = wp[i];
+            /* Log write page contents for debug */
+            static int wp_log = 0;
+            if (wp_log < 10) {
+                TRX_LOG("WP[%d]: task_d=%d task_md=%d page=0x%04x [%04x %04x %04x %04x %04x %04x %04x %04x]",
+                        page, wp[0], wp[4], s->dsp_ram[0x01A8/2],
+                        wp[0], wp[1], wp[2], wp[3], wp[4], wp[5], wp[6], wp[7]);
+                wp_log++;
+            }
         }
 
-        /* TPU scenario done — send SINT17 and run */
-        c54x_interrupt_ex(s->dsp, C54X_INT_SINT17_VEC, C54X_INT_SINT17_BIT);
-        int ran = c54x_run(s->dsp, 500000);
+        /* TPU scenario done — send frame interrupt to DSP.
+         * Only interrupt if DSP is idle. If busy, just set IFR pending. */
+        if (s->dsp->idle) {
+            c54x_interrupt_ex(s->dsp, C54X_INT_FRAME_VEC, C54X_INT_FRAME_BIT);
+        } else {
+            /* DSP still busy — just set IFR bit, don't push/branch */
+            s->dsp->ifr |= (1 << C54X_INT_FRAME_BIT);
+        }
+        int ran = c54x_run(s->dsp, 10000000);
 
         uint16_t dsp_page = s->dsp_ram[0x01A8/2]; /* d_dsp_page */
         static int done_log = 0;
         if (done_log < 30) {
-            TRX_LOG("DSP_DONE: page=0x%04x ran=%d PC=0x%04x idle=%d IMR=0x%04x",
-                    dsp_page, ran, s->dsp->pc, s->dsp->idle, s->dsp->imr);
+            TRX_LOG("DSP_DONE: page=0x%04x ran=%d PC=0x%04x idle=%d IMR=0x%04x XPC=%d PMST=0x%04x",
+                    dsp_page, ran, s->dsp->pc, s->dsp->idle, s->dsp->imr, s->dsp->xpc, s->dsp->pmst);
             done_log++;
         }
     }
