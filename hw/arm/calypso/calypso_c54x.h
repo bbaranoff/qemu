@@ -85,7 +85,8 @@
 /* Interrupt vectors */
 #define C54X_INT_RESET   0
 #define C54X_INT_NMI     1
-#define C54X_INT_SINT17  2  /* Software interrupt 17 = DSP frame IRQ on Calypso */
+#define C54X_INT_SINT17_VEC  19  /* SINT17 = vector #19 (for PC jump) */
+#define C54X_INT_SINT17_BIT  1   /* SINT17 = bit 1 in IMR/IFR (for masking) */
 #define C54X_INT_SINT18  3
 #define C54X_INT_SINT30  4
 #define C54X_INT_TINT0   5
@@ -172,7 +173,8 @@ void c54x_reset(C54xState *s);
 int c54x_run(C54xState *s, int n_insns);
 
 /* Raise an interrupt */
-void c54x_interrupt(C54xState *s, int irq);
+/* Send interrupt: vec = vector number (for PC), imr_bit = bit in IMR/IFR */
+void c54x_interrupt_ex(C54xState *s, int vec, int imr_bit);
 
 /* Wake from IDLE */
 void c54x_wake(C54xState *s);

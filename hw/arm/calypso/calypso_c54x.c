@@ -79,7 +79,15 @@ static uint16_t data_read(C54xState *s, uint16_t addr)
     if (addr < 0x20) {
         switch (addr) {
         case MMR_IMR:  return s->imr;
-        case MMR_IFR:  return s->ifr;
+        case MMR_IFR:
+        {
+            static int ifr_log = 0;
+            if ((s->ifr & 0x0020) && ifr_log < 10) {
+                C54_LOG("IFR READ=0x%04x (TINT0!) PC=0x%04x", s->ifr, s->pc);
+                ifr_log++;
+            }
+            return s->ifr;
+        }
         case MMR_ST0:  return s->st0;
         case MMR_ST1:  return s->st1;
         case MMR_AL:   return (uint16_t)(s->a & 0xFFFF);
@@ -1584,7 +1592,7 @@ void c54x_reset(C54xState *s)
     s->brc = 0; s->rsa = 0; s->rea = 0;
     s->st0 = 0;
     s->st1 = ST1_INTM;  /* interrupts disabled at reset */
-    s->pmst = 0xFFE0;   /* IPTR = 0x1FF (reset vector at 0xFF80) */
+    s->pmst = 0xFFE0;   /* IPTR = 0x1FF (reset vector at 0xFF80), OVLY = 0 at reset */
     s->imr = 0;
     s->ifr = 0;
     s->xpc = 0;
@@ -1604,14 +1612,15 @@ void c54x_reset(C54xState *s)
             s->pc, s->pmst, s->sp, s->prog[s->pc]);
 }
 
-void c54x_interrupt(C54xState *s, int irq)
+void c54x_interrupt_ex(C54xState *s, int vec, int imr_bit)
 {
-    if (irq < 0 || irq >= C54X_NUM_INTS) return;
-    s->ifr |= (1 << irq);
+    if (vec < 0 || vec >= 32) return;
+    if (imr_bit < 0 || imr_bit >= 16) return;
+    s->ifr |= (1 << imr_bit);
 
     /* If not masked and interrupts enabled, take it */
-    if (!(s->st1 & ST1_INTM) && (s->imr & (1 << irq))) {
-        s->ifr &= ~(1 << irq);
+    if (!(s->st1 & ST1_INTM) && (s->imr & (1 << imr_bit))) {
+        s->ifr &= ~(1 << imr_bit);
 
         /* Push PC, set INTM */
         s->sp--;
@@ -1620,28 +1629,28 @@ void c54x_interrupt(C54xState *s, int irq)
 
         /* Jump to vector */
         uint16_t iptr = (s->pmst >> PMST_IPTR_SHIFT) & 0x1FF;
-        s->pc = (iptr * 0x80) + irq * 4;
+        s->pc = (iptr * 0x80) + vec * 4;
 
         /* Wake from IDLE */
         s->idle = false;
-    } else if (s->idle && (s->imr & (1 << irq))) {
+    } else if (s->idle && (s->imr & (1 << imr_bit))) {
         /* IDLE wakes on any unmasked interrupt even if INTM is set */
         s->idle = false;
-        s->ifr &= ~(1 << irq);
+        s->ifr &= ~(1 << imr_bit);
 
         s->sp--;
         data_write(s, s->sp, (uint16_t)s->pc);
         s->st1 |= ST1_INTM;
 
         uint16_t iptr = (s->pmst >> PMST_IPTR_SHIFT) & 0x1FF;
-        s->pc = (iptr * 0x80) + irq * 4;
+        s->pc = (iptr * 0x80) + vec * 4;
     }
 
     /* Log first few interrupts */
     static int int_log_count = 0;
     if (int_log_count < 5) {
-        C54_LOG("IRQ %d: INTM=%d IMR=0x%04x IFR=0x%04x idle=%d PC=0x%04x",
-                irq, !!(s->st1 & ST1_INTM), s->imr, s->ifr, s->idle, s->pc);
+        C54_LOG("IRQ vec=%d bit=%d: INTM=%d IMR=0x%04x IFR=0x%04x idle=%d PC=0x%04x",
+                vec, imr_bit, !!(s->st1 & ST1_INTM), s->imr, s->ifr, s->idle, s->pc);
         int_log_count++;
     }
 }

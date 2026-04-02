@@ -135,7 +135,7 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
             /* Boot C54x — ARM has finished DSP init */
             if (s->dsp) {
                 c54x_reset(s->dsp);
-                int ran = c54x_run(s->dsp, 50000);
+                int ran = c54x_run(s->dsp, 500000);
                 TRX_LOG("C54x boot: ran=%d PC=0x%04x idle=%d IMR=0x%04x",
                         ran, s->dsp->pc, s->dsp->idle, s->dsp->imr);
             }
@@ -181,7 +181,7 @@ static void calypso_dsp_done(void *opaque) {
         }
 
         /* TPU scenario done — send SINT17 and run */
-        c54x_interrupt(s->dsp, C54X_INT_SINT17);
+        c54x_interrupt_ex(s->dsp, C54X_INT_SINT17_VEC, C54X_INT_SINT17_BIT);
         int ran = c54x_run(s->dsp, 500000);
 
         uint16_t dsp_page = s->dsp_ram[0x01A8/2]; /* d_dsp_page */
