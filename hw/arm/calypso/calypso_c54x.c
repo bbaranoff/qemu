@@ -98,11 +98,17 @@ static uint16_t data_read(C54xState *s, uint16_t addr)
             return s->api_ram[addr - C54X_API_BASE];
     }
 
-    /* Debug: log DARAM reads in low area during first frames */
-    static int daram_log = 0;
-    if (addr >= 0x0020 && addr < 0x0800 && s->data[addr] != 0 && daram_log < 50) {
-        C54_LOG("DARAM read [0x%04x] = 0x%04x PC=0x%04x", addr, s->data[addr], s->pc);
-        daram_log++;
+    /* Log unique DARAM read addresses during frame processing */
+    if (addr >= 0x0020 && addr < 0x0800 && s->insn_count > 100000) {
+        static uint8_t seen[0x0800];
+        static int init = 0;
+        static int daram_log = 0;
+        if (!init) { memset(seen, 0, sizeof(seen)); init = 1; }
+        if (!seen[addr] && daram_log < 200) {
+            C54_LOG("DARAM [0x%04x] = 0x%04x PC=0x%04x", addr, s->data[addr], s->pc);
+            seen[addr] = 1;
+            daram_log++;
+        }
     }
 
     return s->data[addr];
@@ -143,6 +149,12 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
     if (addr >= C54X_API_BASE && addr < C54X_API_BASE + C54X_API_SIZE) {
         if (s->api_ram)
             s->api_ram[addr - C54X_API_BASE] = val;
+        /* Log non-zero API writes */
+        static int api_log = 0;
+        if (val != 0 && api_log < 30) {
+            C54_LOG("API WRITE [0x%04x] = 0x%04x PC=0x%04x", addr, val, s->pc);
+            api_log++;
+        }
     }
 
     s->data[addr] = val;

@@ -46,9 +46,9 @@ sleep 1
 tmux new-window -t $SESSION -n bts
 tmux send-keys -t $SESSION:2 "sleep 2 && osmo-bts-trx -c $BTS_CFG" C-m
 
-# Window 3: mobile
-tmux new-window -t $SESSION -n mobile
-tmux send-keys -t $SESSION:3 "sleep 5 && mobile -c /root/.osmocom/bb/mobile_group1.cfg" C-m
+# Window 3: ccch_scan
+tmux new-window -t $SESSION -n ccch
+tmux send-keys -t $SESSION:3 "sleep 5 && ccch_scan -i 127.0.0.1 -a 514 -s /tmp/osmocom_l2_1" C-m
 
 # Window 4: shell
 tmux new-window -t $SESSION -n shell

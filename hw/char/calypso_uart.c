@@ -194,8 +194,6 @@ void calypso_uart_poll_backend(CalypsoUARTState *s)
 
 void calypso_uart_kick_tx(CalypsoUARTState *s)
 {
-    /* Do nothing — TX is driven by the firmware's sercomm_drv_start_tx.
-     * Forcing IER/pending from here causes an IER write storm. */
     (void)s;
 }
 
@@ -308,6 +306,16 @@ void calypso_uart_receive(void *opaque, const uint8_t *buf, int size)
         s->lsr |= LSR_DR;
     }
 
+    calypso_uart_update_irq(s);
+}
+
+/* Inject raw bytes directly into FIFO — no sercomm parsing */
+void calypso_uart_inject_raw(CalypsoUARTState *s, const uint8_t *buf, int size)
+{
+    for (int i = 0; i < size; i++)
+        fifo_push(s, buf[i]);
+    if (s->rx_count > 0)
+        s->lsr |= LSR_DR;
     calypso_uart_update_irq(s);
 }
 
