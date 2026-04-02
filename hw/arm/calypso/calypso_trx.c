@@ -161,7 +161,16 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
         else if (value == DSP_DL_STATUS_READY) {
             s->dsp_ram[DSP_API_VER_ADDR/2] = DSP_API_VERSION;
             s->dsp_ram[DSP_API_VER2_ADDR/2] = 0;
-            TRX_LOG("DSP ready");
+            /* Unmask API IRQ (IRQ15) in INTH — firmware should do this
+             * via irq_enable(IRQ_API) but our init timing may miss it.
+             * INTH MASK_IT_REG1 is at 0xFFFFFA08, bit 15 = API IRQ. */
+            {
+                uint16_t mask;
+                cpu_physical_memory_read(0xFFFFFA08, &mask, 2);
+                mask &= ~(1 << 15);  /* unmask IRQ15 */
+                cpu_physical_memory_write(0xFFFFFA08, &mask, 2);
+                TRX_LOG("DSP ready — unmasked API IRQ (mask=0x%04x)", mask);
+            }
         }
     }
 }
@@ -173,7 +182,11 @@ static const MemoryRegionOps calypso_dsp_ops = {
 };
 
 /* ---- TPU ---- */
-static void calypso_dsp_done(void *opaque) { qemu_irq_pulse(((CalypsoTRX*)opaque)->irqs[CALYPSO_IRQ_API]); }
+static void calypso_dsp_done(void *opaque) {
+    CalypsoTRX *s = opaque;
+    s->tpu_regs[TPU_CTRL/2] &= ~TPU_CTRL_EN;
+    qemu_irq_raise(s->irqs[CALYPSO_IRQ_API]);
+}
 static void calypso_tdma_start(CalypsoTRX *s);
 
 static uint64_t calypso_tpu_read(void *o, hwaddr off, unsigned sz) {
@@ -228,10 +241,10 @@ static void calypso_tdma_tick(void *opaque) {
     CalypsoTRX *s = opaque;
     s->fn = (s->fn+1) % GSM_HYPERFRAME;
     if (g_uart_modem) { calypso_uart_poll_backend(g_uart_modem); calypso_uart_kick_rx(g_uart_modem); }
-    /* PM every frame */
+    /* PM every frame — plant in read page a_pm only, NOT in NDB fb_det area */
     { uint16_t pm=PM_RAW_STRONG;
       for(int i=0;i<4;i++){s->dsp_ram[(0x0060+i*2)/2]=pm;s->dsp_ram[(0x0088+i*2)/2]=pm;}
-      s->dsp_ram[213]=pm; for(int i=0;i<8;i++)s->dsp_ram[248+i]=pm; }
+      s->dsp_ram[213]=pm; }
     /* Check for UL burst to send */
     calypso_trx_tx_burst_poll();
 

@@ -143,10 +143,18 @@ typedef struct C54xState {
     uint64_t cycles;
     uint32_t insn_count;
 
+    /* BSP (Baseband Serial Port) — burst sample buffer */
+    uint16_t bsp_buf[160];  /* burst samples from radio */
+    int      bsp_len;       /* number of samples */
+    int      bsp_pos;       /* read position */
+
     /* Debug */
     uint32_t unimpl_count;
     uint16_t last_unimpl;
 } C54xState;
+
+/* Feed burst samples to BSP (called by calypso_trx) */
+void c54x_bsp_load(C54xState *s, const uint16_t *samples, int n);
 
 /* Create and initialize C54x state */
 C54xState *c54x_init(void);

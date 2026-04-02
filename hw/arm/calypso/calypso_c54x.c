@@ -98,6 +98,13 @@ static uint16_t data_read(C54xState *s, uint16_t addr)
             return s->api_ram[addr - C54X_API_BASE];
     }
 
+    /* Debug: log DARAM reads in low area during first frames */
+    static int daram_log = 0;
+    if (addr >= 0x0020 && addr < 0x0800 && s->data[addr] != 0 && daram_log < 50) {
+        C54_LOG("DARAM read [0x%04x] = 0x%04x PC=0x%04x", addr, s->data[addr], s->pc);
+        daram_log++;
+    }
+
     return s->data[addr];
 }
 
@@ -267,6 +274,16 @@ static int c54x_exec_one(C54xState *s)
     switch (hi4) {
     case 0xF:
         /* 0xF --- large group: branches, misc, short immediates */
+        if (op == 0xF495) return consumed;  /* NOP */
+        if (op == 0xF4E4) {
+            static int idle_log = 0;
+            if (idle_log < 3)
+                C54_LOG("IDLE @0x%04x INTM=%d IMR=0x%04x SP=0x%04x insns=%u",
+                        s->pc, !!(s->st1 & ST1_INTM), s->imr, s->sp, s->insn_count);
+            idle_log++;
+            s->idle = true;
+            return consumed;
+        } /* IDLE */
         if (hi8 == 0xF4) {
             /* F4xx: unconditional branch/call */
             uint8_t sub = (op >> 4) & 0xF;
@@ -274,42 +291,92 @@ static int c54x_exec_one(C54xState *s)
             consumed = 2;
             switch (sub) {
             case 0x0: /* B pmad */
+            case 0xE: /* BD pmad (delayed — simplified as immediate) */
                 s->pc = op2;
-                return 0; /* don't increment PC */
+                return 0;
+            case 0x2: /* BACC src — branch to accumulator */
+                s->pc = (uint16_t)(s->a & 0xFFFF);
+                return 0;
+            case 0x3: /* BACCD src */
+                s->pc = (uint16_t)(s->a & 0xFFFF);
+                return 0;
             case 0x6: /* CALL pmad */
-                s->sp--;
-                data_write(s, s->sp, (uint16_t)(s->pc + 2));
-                s->pc = op2;
-                return 0;
-            case 0xE: /* BD pmad (delayed branch) */
-                /* Execute 2 more instructions then branch */
-                /* Simplified: just branch */
-                s->pc = op2;
-                return 0;
             case 0x8: /* CALLD pmad */
                 s->sp--;
                 data_write(s, s->sp, (uint16_t)(s->pc + 2));
+                s->pc = op2;
+                return 0;
+            case 0x7: /* CALA src — call to accumulator */
+                s->sp--;
+                data_write(s, s->sp, (uint16_t)(s->pc + 1));
+                s->pc = (uint16_t)(s->a & 0xFFFF);
+                return 0;
+            case 0x9: /* F49x: B pmad with other forms */
+            case 0xD: /* F4Dx: FBACC, FBACCD */
+            case 0xF: /* F4Fx: FCALL/FCALLD */
+                /* Various branch/call — treat based on low bits */
+                if (sub == 0x9 || sub == 0xD) {
+                    s->pc = op2;
+                } else {
+                    s->sp--;
+                    data_write(s, s->sp, (uint16_t)(s->pc + 2));
+                    s->pc = op2;
+                }
+                return 0;
+            case 0xA: /* F4Ax: BANZ with indirect */
+            case 0xB: /* F4Bx */
+            case 0xC: /* F4Cx */
                 s->pc = op2;
                 return 0;
             default:
                 goto unimpl;
             }
         }
-        if (hi8 == 0xF0) {
-            /* F07x: RET variants */
-            uint8_t sub = op & 0xFF;
-            switch (sub) {
-            case 0x73: /* NOP (actually F073 = RET in some encodings) */
-                /* Check: F073 could be FRET or other */
-                {
-                    uint16_t ret_addr = data_read(s, s->sp);
-                    s->sp++;
-                    s->pc = ret_addr;
-                    return 0;
-                }
-            default:
-                break;
+        if (hi8 == 0xF0 || hi8 == 0xF1) {
+            /* F073: RET */
+            if (op == 0xF073) {
+                uint16_t ra = data_read(s, s->sp); s->sp++;
+                s->pc = ra; return 0;
             }
+            /* F074: RETE */
+            if (op == 0xF074) {
+                uint16_t ra = data_read(s, s->sp); s->sp++;
+                s->st1 &= ~ST1_INTM;
+                s->pc = ra; return 0;
+            }
+            /* F072: FRET (far return) — same as RET for 16-bit mode */
+            if (op == 0xF072) {
+                uint16_t ra = data_read(s, s->sp); s->sp++;
+                s->pc = ra; return 0;
+            }
+            /* F07x: other control flow */
+            if ((op & 0xFFF0) == 0xF070) {
+                /* F075: RETD, F076: RETED, etc. — treat as RET */
+                uint16_t ra = data_read(s, s->sp); s->sp++;
+                s->pc = ra; return 0;
+            }
+            /* F0Bx/F1Bx: RSBX/SSBX */
+            if ((op & 0x00F0) == 0x00B0) {
+                int bit = op & 0x0F;
+                int set = (op >> 8) & 1;
+                int st = (op >> 5) & 1;
+                if (st == 0) { if (set) s->st0 |= (1<<bit); else s->st0 &= ~(1<<bit); }
+                else         { if (set) s->st1 |= (1<<bit); else s->st1 &= ~(1<<bit); }
+                return consumed;
+            }
+            /* F0xx Smem: various single-operand ops */
+            if ((op & 0xFF00) == 0xF000) {
+                /* F0xx with Smem: could be NORM, etc. */
+                addr = resolve_smem(s, op, &ind);
+                op2 = prog_read(s, s->pc + 1);
+                consumed = 2;
+                /* Treat as RET/branch to op2 (many F0xx are control flow with 2 words) */
+                s->pc = op2;
+                return 0;
+            }
+            /* F010: NOP or TRAP */
+            if (op == 0xF010) return consumed;
+            goto unimpl;
         }
         if (op == 0xF495) {
             /* NOP */
@@ -389,10 +456,137 @@ static int c54x_exec_one(C54xState *s)
             s->rpt_active = true;
             return consumed;
         }
-        /* FB/FC: short LD #k */
-        if (hi8 >= 0xF8) {
-            /* Various short forms */
+        /* F2xx: various — NORM, CMPS, etc. */
+        if (hi8 == 0xF2) {
+            uint8_t sub = (op >> 4) & 0xF;
+            if (sub == 0x7) {
+                /* F27x: RET/RETE variants with condition */
+                op2 = prog_read(s, s->pc + 1);
+                consumed = 2;
+                uint16_t ret_addr = data_read(s, s->sp);
+                s->sp++;
+                s->pc = ret_addr;
+                return 0;
+            }
             goto unimpl;
+        }
+        /* F3xx: various */
+        if (hi8 == 0xF3) {
+            /* LD #k9, DP or LD #k9, ARP etc */
+            uint16_t k9 = op & 0x1FF;
+            s->st0 = (s->st0 & ~ST0_DP_MASK) | k9;
+            return consumed;
+        }
+        /* F6xx: various — LD/ST acc-acc, ABDST, SACCD, etc. */
+        if (hi8 == 0xF6) {
+            uint8_t sub = (op >> 4) & 0xF;
+            if (sub == 0x2) {
+                /* F62x: LD A, dst_shift, B or LD B, dst_shift, A */
+                int dst = op & 1;
+                if (dst) s->b = s->a; else s->a = s->b;
+                return consumed;
+            }
+            if (sub == 0x6) {
+                /* F66x: LD A/B with shift to other acc */
+                int dst = op & 1;
+                if (dst) s->b = s->a; else s->a = s->b;
+                return consumed;
+            }
+            /* Other F6xx: treat as NOP for now */
+            return consumed;
+        }
+        /* F5xx: RPT #k (short immediate, k in low byte) */
+        if (hi8 == 0xF5) {
+            s->rpt_count = op & 0xFF;
+            s->rpt_pc = (uint16_t)(s->pc + 1);
+            s->rpt_active = true;
+            return consumed;
+        }
+        /* F7xx: LD/ST #k to various registers */
+        if (hi8 == 0xF7) {
+            uint8_t sub = (op >> 4) & 0xF;
+            uint16_t k = op & 0xFF;
+            switch (sub) {
+            case 0x0: /* F70x: LD #k8, ASM */
+                s->st1 = (s->st1 & ~ST1_ASM_MASK) | (k & ST1_ASM_MASK);
+                break;
+            case 0x1: /* F71x: LD #k8, AR0 */
+                s->ar[0] = k; break;
+            case 0x2: /* F72x: LD #k8, AR1 */
+                s->ar[1] = k; break;
+            case 0x3: s->ar[2] = k; break;
+            case 0x4: s->ar[3] = k; break;
+            case 0x5: s->ar[4] = k; break;
+            case 0x6: s->ar[5] = k; break;
+            case 0x7: s->ar[6] = k; break;
+            case 0x8: /* F78x: LD #k8, T */
+                s->t = (s->st1 & ST1_SXM) ? (uint16_t)(int8_t)k : k; break;
+            case 0x9: /* F79x: LD #k8, DP */
+                s->st0 = (s->st0 & ~ST0_DP_MASK) | (k & ST0_DP_MASK); break;
+            case 0xA: /* F7Ax: LD #k8, ARP */
+                s->st0 = (s->st0 & ~ST0_ARP_MASK) | ((k & 7) << ST0_ARP_SHIFT); break;
+            case 0xB: s->ar[7] = k; break;
+            case 0xC: s->bk = k; break;
+            case 0xD: s->sp = k; break;
+            case 0xE: /* F7Ex: LD #k8, BRC */
+                s->brc = k; break;
+            case 0xF: /* F7Fx: LD #k8, ... */
+                break;
+            }
+            return consumed;
+        }
+        /* F9xx: RPT #lk (16-bit immediate) */
+        if (hi8 == 0xF9) {
+            op2 = prog_read(s, s->pc + 1);
+            consumed = 2;
+            s->rpt_count = op2;
+            s->rpt_pc = (uint16_t)(s->pc + 2);
+            s->rpt_active = true;
+            return consumed;
+        }
+        /* FAxx: RPT Smem or conditional ops */
+        if (hi8 == 0xFA) {
+            /* FA3x: BC with delay, FA4x: conditional etc. */
+            op2 = prog_read(s, s->pc + 1);
+            consumed = 2;
+            /* Simplified: treat as delayed branch */
+            s->pc = op2;
+            return 0;
+        }
+        /* FBxx: LD #k, 16, A/B (short immediate shift 16) */
+        if (hi8 == 0xFB) {
+            int8_t k = (int8_t)(op & 0xFF);
+            int64_t v = (int64_t)k << 16;
+            s->a = sext40(v);
+            return consumed;
+        }
+        /* FCxx: LD #k, 16, B */
+        if (hi8 == 0xFC) {
+            int8_t k = (int8_t)(op & 0xFF);
+            int64_t v = (int64_t)k << 16;
+            s->b = sext40(v);
+            return consumed;
+        }
+        /* FDxx: LD #k, A (no shift) */
+        if (hi8 == 0xFD) {
+            int8_t k = (int8_t)(op & 0xFF);
+            s->a = sext40((int64_t)k);
+            return consumed;
+        }
+        /* FExx: LD #k, B (no shift) */
+        if (hi8 == 0xFE) {
+            int8_t k = (int8_t)(op & 0xFF);
+            s->b = sext40((int64_t)k);
+            return consumed;
+        }
+        /* FFxx: ADD/SUB short immediate */
+        if (hi8 == 0xFF) {
+            int8_t k = (int8_t)(op & 0x7F);
+            int dst = (op >> 7) & 1;
+            /* Typically ADD #k, A or SUB */
+            if (dst) s->b = sext40(s->b + ((int64_t)k << 16));
+            else     s->a = sext40(s->a + ((int64_t)k << 16));
+            return consumed;
         }
         goto unimpl;
 
@@ -441,16 +635,154 @@ static int c54x_exec_one(C54xState *s)
             return consumed;
         }
         if (hi8 == 0xE5) {
-            /* E5xx: MVMM ARx, ARy or similar */
+            /* E5xx: MVMM mmr, mmr */
             int src = (op >> 4) & 0xF;
             int dst = op & 0xF;
-            /* Map src/dst to register: 0-7=AR0-AR7, 8=SP */
             uint16_t val;
-            if (src >= 0x10 && src <= 0x17) val = s->ar[src - 0x10];
-            else if (src == 0x18) val = s->sp;
-            else val = 0;
-            if (dst >= 0x10 && dst <= 0x17) s->ar[dst - 0x10] = val;
-            else if (dst == 0x18) s->sp = val;
+            if (src >= 0 && src <= 7) val = s->ar[src];
+            else if (src == 8) val = s->sp;
+            else val = data_read(s, src + 0x10);
+            if (dst >= 0 && dst <= 7) s->ar[dst] = val;
+            else if (dst == 8) s->sp = val;
+            else data_write(s, dst + 0x10, val);
+            return consumed;
+        }
+        if (hi8 == 0xE4) {
+            /* E4xx: BITF Smem, #lk (2-word) or BIT Smem, bit */
+            addr = resolve_smem(s, op, &ind);
+            op2 = prog_read(s, s->pc + 1);
+            consumed = 2;
+            uint16_t val = data_read(s, addr);
+            s->st0 = (val & op2) ? (s->st0 | ST0_TC) : (s->st0 & ~ST0_TC);
+            return consumed;
+        }
+        if (hi8 == 0xE7) {
+            /* E7xx: ST #k, Smem or LD #k,16, dst (short immediate) */
+            addr = resolve_smem(s, op, &ind);
+            op2 = prog_read(s, s->pc + 1);
+            consumed = 2;
+            data_write(s, addr, op2);
+            return consumed;
+        }
+        if (hi8 == 0xE9) {
+            /* E9xx: CC pmad, cond (conditional call, 2 words) */
+            op2 = prog_read(s, s->pc + 1);
+            consumed = 2;
+            uint8_t cond = op & 0xFF;
+            bool take = false;
+            if (cond == 0x03) take = (s->a == 0);
+            else if (cond == 0x0B) take = (s->b == 0);
+            else if (cond == 0x02) take = (s->a != 0);
+            else if (cond == 0x0A) take = (s->b != 0);
+            else if (cond == 0x00) take = (s->a < 0);
+            else if (cond == 0x08) take = (s->b < 0);
+            else if (cond == 0x04) take = (s->a > 0);
+            else if (cond == 0x0C) take = (s->b > 0);
+            else if (cond == 0x40) take = (s->st0 & ST0_TC) != 0;
+            else if (cond == 0x41) take = !(s->st0 & ST0_TC);
+            else if (cond == 0x20) take = (s->st0 & ST0_C) != 0;
+            else if (cond == 0x21) take = !(s->st0 & ST0_C);
+            else take = true;
+            if (take) {
+                s->sp--;
+                data_write(s, s->sp, (uint16_t)(s->pc + 2));
+                s->pc = op2;
+                return 0;
+            }
+            return consumed;
+        }
+        if (hi8 == 0xE1) {
+            /* E1xx: single-word acc ops — NEG, ABS, CMPL, SAT, EXP, etc. */
+            uint8_t sub = op & 0xFF;
+            switch (sub) {
+            case 0xE0: s->a = ~s->a; s->a = sext40(s->a); break;  /* CMPL A */
+            case 0xE1: s->b = ~s->b; s->b = sext40(s->b); break;  /* CMPL B */
+            case 0xE2: s->a = -s->a; s->a = sext40(s->a); break;  /* NEG A */
+            case 0xE3: s->b = -s->b; s->b = sext40(s->b); break;  /* NEG B */
+            case 0xE4: /* SAT A */ if (s->st0 & ST0_OVA) s->a = (s->a < 0) ? (int64_t)0xFF80000000LL : 0x7FFFFFFFLL; break;
+            case 0xE5: /* SAT B */ if (s->st0 & ST0_OVB) s->b = (s->b < 0) ? (int64_t)0xFF80000000LL : 0x7FFFFFFFLL; break;
+            case 0xE8: /* ABS A */ s->a = (s->a < 0) ? -s->a : s->a; s->a = sext40(s->a); break;
+            case 0xE9: /* ABS B */ s->b = (s->b < 0) ? -s->b : s->b; s->b = sext40(s->b); break;
+            case 0xEA: /* ROR A */ { uint16_t c = s->st0 & ST0_C ? 1 : 0; if (s->a & 1) s->st0 |= ST0_C; else s->st0 &= ~ST0_C; s->a = (s->a >> 1) | ((int64_t)c << 39); s->a = sext40(s->a); } break;
+            case 0xEB: /* ROL A */ { uint16_t c = s->st0 & ST0_C ? 1 : 0; if (s->a & ((int64_t)1<<39)) s->st0 |= ST0_C; else s->st0 &= ~ST0_C; s->a = (s->a << 1) | c; s->a = sext40(s->a); } break;
+            default:
+                /* EXP A/B etc — return 0 for now */
+                break;
+            }
+            return consumed;
+        }
+        if (hi8 == 0xE6) {
+            /* E6xx: SFTA/SFTL acc, #shift (single-word immediate shift) */
+            int shift = op & 0x1F;
+            if (shift & 0x10) shift |= ~0x1F;  /* sign extend 5-bit */
+            int dst = (op >> 5) & 1;
+            int logical = (op >> 6) & 1;
+            int64_t *acc = dst ? &s->b : &s->a;
+            if (logical) {
+                uint64_t u = (uint64_t)(*acc) & 0xFFFFFFFFFFULL;
+                if (shift >= 0) *acc = sext40((int64_t)(u << shift));
+                else            *acc = sext40((int64_t)(u >> (-shift)));
+            } else {
+                if (shift >= 0) *acc = sext40(*acc << shift);
+                else            *acc = sext40(*acc >> (-shift));
+            }
+            return consumed;
+        }
+        if (hi8 == 0xEE) {
+            /* EExx: BCD pmad, cond (conditional delayed branch, 2 words) */
+            op2 = prog_read(s, s->pc + 1);
+            consumed = 2;
+            uint8_t cond = op & 0xFF;
+            bool take = false;
+            if (cond == 0x03) take = (s->a == 0);
+            else if (cond == 0x0B) take = (s->b == 0);
+            else if (cond == 0x02) take = (s->a != 0);
+            else if (cond == 0x0A) take = (s->b != 0);
+            else if (cond == 0x00) take = (s->a < 0);
+            else if (cond == 0x08) take = (s->b < 0);
+            else if (cond == 0x04) take = (s->a > 0);
+            else if (cond == 0x0C) take = (s->b > 0);
+            else if (cond == 0x40) take = (s->st0 & ST0_TC) != 0;
+            else if (cond == 0x41) take = !(s->st0 & ST0_TC);
+            else if (cond == 0x20) take = (s->st0 & ST0_C) != 0;
+            else if (cond == 0x21) take = !(s->st0 & ST0_C);
+            else if ((cond & 0x3A) == 0x3A) take = true; /* unconditional-ish */
+            else take = true;
+            if (take) { s->pc = op2; return 0; }
+            return consumed;
+        }
+        if (hi8 == 0xED) {
+            /* EDxx: BCD pmad, cond (conditional branch delayed, 2 words) */
+            op2 = prog_read(s, s->pc + 1);
+            consumed = 2;
+            uint8_t cond = op & 0xFF;
+            bool take = false;
+            if (cond == 0x00) take = (s->a < 0);
+            else if (cond == 0x08) take = (s->b < 0);
+            else if (cond == 0x02) take = (s->a != 0);
+            else if (cond == 0x0A) take = (s->b != 0);
+            else if (cond == 0x03) take = (s->a == 0);
+            else if (cond == 0x0B) take = (s->b == 0);
+            else if (cond == 0x04) take = (s->a > 0);
+            else if (cond == 0x0C) take = (s->b > 0);
+            else if (cond == 0x40) take = (s->st0 & ST0_TC) != 0;
+            else if (cond == 0x41) take = !(s->st0 & ST0_TC);
+            else take = true;
+            if (take) { s->pc = op2; return 0; }
+            return consumed;
+        }
+        if (hi8 == 0xE8) {
+            /* E8xx: CMPR cond, ARn */
+            int cmp_cond = (op >> 4) & 3;
+            int n = arp(s);
+            bool result = false;
+            switch (cmp_cond) {
+            case 0: result = (s->ar[n] == s->ar[0]); break;
+            case 1: result = (s->ar[n] < s->ar[0]); break;
+            case 2: result = (s->ar[n] > s->ar[0]); break;
+            case 3: result = (s->ar[n] != s->ar[0]); break;
+            }
+            if (result) s->st0 |= ST0_TC; else s->st0 &= ~ST0_TC;
             return consumed;
         }
         goto unimpl;
@@ -532,19 +864,51 @@ static int c54x_exec_one(C54xState *s)
         return consumed;
 
     case 0x2:
-        /* 2xxx: MPY, SQUR, etc. */
-        if ((op & 0xFC00) == 0x2000) {
-            /* MPY Smem, dst */
+        /* 2xxx: MPY, SQUR, MAS, MAC variants */
+        {
+            int sub = (op >> 8) & 0xF;
             addr = resolve_smem(s, op, &ind);
             uint16_t val = data_read(s, addr);
-            int64_t product = (int64_t)(int16_t)s->t * (int64_t)(int16_t)val;
-            if (s->st1 & ST1_FRCT) product <<= 1;
-            int dst = (op >> 8) & 1;
-            if (dst) s->b = sext40(product);
-            else     s->a = sext40(product);
-            return consumed;
+            int64_t product;
+            int dst;
+            switch (sub) {
+            case 0x0: case 0x1: /* MPY Smem, A/B */
+                product = (int64_t)(int16_t)s->t * (int64_t)(int16_t)val;
+                if (s->st1 & ST1_FRCT) product <<= 1;
+                if (sub & 1) s->b = sext40(product);
+                else         s->a = sext40(product);
+                return consumed;
+            case 0x4: case 0x5: /* SQUR Smem, A/B */
+                product = (int64_t)(int16_t)val * (int64_t)(int16_t)val;
+                if (s->st1 & ST1_FRCT) product <<= 1;
+                s->t = val;
+                if (sub & 1) s->b = sext40(product);
+                else         s->a = sext40(product);
+                return consumed;
+            case 0x8: case 0x9: /* MPYA Smem (A = T * Smem, B += A) or variants */
+                product = (int64_t)(int16_t)s->t * (int64_t)(int16_t)val;
+                if (s->st1 & ST1_FRCT) product <<= 1;
+                if (sub & 1) { s->a += s->b; s->b = sext40(product); }
+                else         { s->b += s->a; s->a = sext40(product); }
+                return consumed;
+            case 0xA: case 0xB: /* MACA[R] Smem, A/B (A += B * Smem then B = T * Smem) */
+                dst = sub & 1;
+                product = (int64_t)(int16_t)s->t * (int64_t)(int16_t)val;
+                if (s->st1 & ST1_FRCT) product <<= 1;
+                if (dst) { s->a = sext40(s->a + s->b); s->b = sext40(product); }
+                else     { s->b = sext40(s->b + s->a); s->a = sext40(product); }
+                s->t = val;
+                return consumed;
+            default:
+                /* MAS variants and others */
+                product = (int64_t)(int16_t)s->t * (int64_t)(int16_t)val;
+                if (s->st1 & ST1_FRCT) product <<= 1;
+                dst = sub & 1;
+                if (dst) s->b = sext40(s->b - product);
+                else     s->a = sext40(s->a - product);
+                return consumed;
+            }
         }
-        goto unimpl;
 
     case 0x4:
         /* 4xxx: AND, OR, XOR */
@@ -570,20 +934,41 @@ static int c54x_exec_one(C54xState *s)
         return consumed;
 
     case 0x5:
-        /* 5xxx: shifts */
-        if ((op & 0xFC00) == 0x5000) {
-            /* SFTA src, shift */
+        /* 5xxx: shifts — SFTA, SFTL, various forms */
+        {
             int dst = (op >> 8) & 1;
-            int shift = asm_shift(s);
             int64_t *acc = dst ? &s->b : &s->a;
-            if (shift >= 0) *acc = sext40(*acc << shift);
-            else            *acc = sext40(*acc >> (-shift));
-            return consumed;
+            int sub = (op >> 9) & 0x7;
+            if (sub <= 1) {
+                /* 50xx/51xx: SFTA src, ASM shift */
+                int shift = asm_shift(s);
+                if (shift >= 0) *acc = sext40(*acc << shift);
+                else            *acc = sext40(*acc >> (-shift));
+            } else if (sub == 2 || sub == 3) {
+                /* 54xx/55xx: SFTA src, #shift (immediate in Smem) */
+                addr = resolve_smem(s, op, &ind);
+                int shift = (int16_t)data_read(s, addr);
+                if (shift >= 0) *acc = sext40(*acc << shift);
+                else            *acc = sext40(*acc >> (-shift));
+            } else if (sub == 4 || sub == 5) {
+                /* 58xx/59xx: SFTL src, ASM shift (logical) */
+                int shift = asm_shift(s);
+                uint64_t u = (uint64_t)(*acc) & 0xFFFFFFFFFFULL;
+                if (shift >= 0) *acc = sext40((int64_t)(u << shift));
+                else            *acc = sext40((int64_t)(u >> (-shift)));
+            } else if (sub == 6 || sub == 7) {
+                /* 5Cxx/5Dxx/5Exx/5Fxx: SFTL with Smem or other */
+                addr = resolve_smem(s, op, &ind);
+                int shift = (int16_t)data_read(s, addr);
+                uint64_t u = (uint64_t)(*acc) & 0xFFFFFFFFFFULL;
+                if (shift >= 0) *acc = sext40((int64_t)(u << shift));
+                else            *acc = sext40((int64_t)(u >> (-shift)));
+            }
         }
-        goto unimpl;
+        return consumed;
 
     case 0x8: case 0x9:
-        /* Memory moves: MVDK, MVKD, MVDD, etc. */
+        /* 8xxx/9xxx: Memory moves, PORTR/PORTW */
         if (hi8 == 0x8A) {
             /* MVDK Smem, dmad */
             addr = resolve_smem(s, op, &ind);
@@ -600,16 +985,179 @@ static int c54x_exec_one(C54xState *s)
             data_write(s, addr, data_read(s, op2));
             return consumed;
         }
+        if (hi8 == 0x88 || hi8 == 0x80) {
+            /* MVDD Smem, Smem (data→data) — 2 address forms */
+            addr = resolve_smem(s, op, &ind);
+            op2 = prog_read(s, s->pc + 1);
+            consumed = 2;
+            data_write(s, op2, data_read(s, addr));
+            return consumed;
+        }
+        if (hi8 == 0x8C) {
+            /* MVPD pmad, Smem (prog→data) */
+            addr = resolve_smem(s, op, &ind);
+            op2 = prog_read(s, s->pc + 1);
+            consumed = 2;
+            data_write(s, addr, prog_read(s, op2));
+            return consumed;
+        }
+        if (hi8 == 0x8E) {
+            /* MVDP Smem, pmad (data→prog) */
+            addr = resolve_smem(s, op, &ind);
+            op2 = prog_read(s, s->pc + 1);
+            consumed = 2;
+            prog_write(s, op2, data_read(s, addr));
+            return consumed;
+        }
+        if (hi8 == 0x8F) {
+            /* PORTR PA, Smem — read I/O port */
+            addr = resolve_smem(s, op, &ind);
+            op2 = prog_read(s, s->pc + 1);
+            consumed = 2;
+            /* PA=0xF430: BSP data register — return next burst sample */
+            if (op2 == 0xF430 && s->bsp_pos < s->bsp_len) {
+                data_write(s, addr, s->bsp_buf[s->bsp_pos++]);
+            } else {
+                data_write(s, addr, 0);
+            }
+            /* Log first PORTR calls */
+            {
+                static int portr_log = 0;
+                if (portr_log < 20) {
+                    C54_LOG("PORTR PA=0x%04x → [0x%04x] bsp=%d/%d PC=0x%04x",
+                            op2, addr, s->bsp_pos, s->bsp_len, s->pc);
+                    portr_log++;
+                }
+            }
+            return consumed;
+        }
+        if (hi8 == 0x9F) {
+            /* PORTW Smem, PA — write I/O port */
+            addr = resolve_smem(s, op, &ind);
+            op2 = prog_read(s, s->pc + 1);
+            consumed = 2;
+            /* I/O ports: ignore (stub) */
+            (void)data_read(s, addr);
+            return consumed;
+        }
+        /* 85xx: MVPD pmad, Smem (prog→data, different encoding) */
+        if (hi8 == 0x85) {
+            addr = resolve_smem(s, op, &ind);
+            op2 = prog_read(s, s->pc + 1);
+            consumed = 2;
+            data_write(s, addr, prog_read(s, op2));
+            return consumed;
+        }
+        /* 86xx: MVDM dmad, MMR */
+        if (hi8 == 0x86) {
+            op2 = prog_read(s, s->pc + 1);
+            consumed = 2;
+            uint16_t mmr = op & 0x1F;
+            data_write(s, mmr, data_read(s, op2));
+            return consumed;
+        }
+        /* 87xx: MVMD MMR, dmad */
+        if (hi8 == 0x87) {
+            op2 = prog_read(s, s->pc + 1);
+            consumed = 2;
+            uint16_t mmr = op & 0x1F;
+            data_write(s, op2, data_read(s, mmr));
+            return consumed;
+        }
+        /* 81xx: STL src, ASM, Smem (store with shift) */
+        if (hi8 == 0x81) {
+            addr = resolve_smem(s, op, &ind);
+            int shift = asm_shift(s);
+            int64_t v = s->a;
+            if (shift >= 0) v <<= shift; else v >>= (-shift);
+            data_write(s, addr, (uint16_t)(v & 0xFFFF));
+            return consumed;
+        }
+        /* 82xx: STH src, ASM, Smem */
+        if (hi8 == 0x82) {
+            addr = resolve_smem(s, op, &ind);
+            int shift = asm_shift(s);
+            int64_t v = s->a;
+            if (shift >= 0) v <<= shift; else v >>= (-shift);
+            data_write(s, addr, (uint16_t)((v >> 16) & 0xFFFF));
+            return consumed;
+        }
+        /* 89xx: ST src, Smem with shift or MVDK variants */
+        if (hi8 == 0x89) {
+            addr = resolve_smem(s, op, &ind);
+            op2 = prog_read(s, s->pc + 1);
+            consumed = 2;
+            data_write(s, op2, data_read(s, addr));
+            return consumed;
+        }
+        /* 8Bxx: MVDK with long address */
+        if (hi8 == 0x8B) {
+            addr = resolve_smem(s, op, &ind);
+            op2 = prog_read(s, s->pc + 1);
+            consumed = 2;
+            data_write(s, op2, data_read(s, addr));
+            return consumed;
+        }
+        /* 8Dxx: MVDD Smem, Smem */
+        if (hi8 == 0x8D) {
+            addr = resolve_smem(s, op, &ind);
+            op2 = prog_read(s, s->pc + 1);
+            consumed = 2;
+            data_write(s, op2, data_read(s, addr));
+            return consumed;
+        }
+        /* 83xx: WRITA Smem (write A to prog), 84xx: READA Smem */
+        if (hi8 == 0x83) {
+            addr = resolve_smem(s, op, &ind);
+            prog_write(s, (uint16_t)(s->a & 0xFFFF), data_read(s, addr));
+            return consumed;
+        }
+        if (hi8 == 0x84) {
+            addr = resolve_smem(s, op, &ind);
+            data_write(s, addr, prog_read(s, (uint16_t)(s->a & 0xFFFF)));
+            return consumed;
+        }
+        /* 91xx: MVKD dmad, Smem (another encoding) */
+        if (hi8 == 0x91) {
+            addr = resolve_smem(s, op, &ind);
+            op2 = prog_read(s, s->pc + 1);
+            consumed = 2;
+            data_write(s, addr, data_read(s, op2));
+            return consumed;
+        }
+        /* 95xx: ST #lk, Smem (another encoding) */
+        if (hi8 == 0x95) {
+            addr = resolve_smem(s, op, &ind);
+            op2 = prog_read(s, s->pc + 1);
+            consumed = 2;
+            data_write(s, addr, op2);
+            return consumed;
+        }
+        /* ST #lk, Smem (2-word) */
+        if (hi8 == 0x96 || hi8 == 0x97) {
+            addr = resolve_smem(s, op, &ind);
+            op2 = prog_read(s, s->pc + 1);
+            consumed = 2;
+            data_write(s, addr, op2);
+            return consumed;
+        }
         goto unimpl;
 
     case 0xA: case 0xB:
-        /* Axx: STLM, LDMM, PSHM, POPM, etc. */
+        /* Axx/Bxx: STLM, LDMM, misc accumulator ops */
         if (hi8 == 0xAA) {
             /* STLM src, MMR */
             int src_acc = (op >> 4) & 1;
             uint16_t mmr = op & 0x1F;
             int64_t acc = src_acc ? s->b : s->a;
             data_write(s, mmr, (uint16_t)(acc & 0xFFFF));
+            return consumed;
+        }
+        if (hi8 == 0xBD) {
+            /* BDxx: POPM / delayed branch variants */
+            uint16_t mmr = op & 0x1F;
+            data_write(s, mmr, data_read(s, s->sp));
+            s->sp++;
             return consumed;
         }
         if (hi8 == 0xBA) {
@@ -621,10 +1169,78 @@ static int c54x_exec_one(C54xState *s)
             else     s->a = sext40(v << 16);
             return consumed;
         }
+        if (hi8 == 0xA8 || hi8 == 0xA9) {
+            /* A8xx/A9xx: AND #lk, src[, dst] (2-word) */
+            op2 = prog_read(s, s->pc + 1);
+            consumed = 2;
+            int dst = op & 1;
+            int64_t *acc = dst ? &s->b : &s->a;
+            *acc = sext40(*acc & ((int64_t)op2 << 16));
+            return consumed;
+        }
+        if (hi8 == 0xA0) {
+            /* A0xx: LD src, dst (accumulator to accumulator) or NEG/ABS/NOT */
+            uint8_t sub = op & 0xFF;
+            if (sub == 0x00) { s->a = s->b; }
+            else if (sub == 0x01) { s->b = s->a; }
+            else if (sub == 0x08) { s->a = -s->a; } /* NEG A */
+            else if (sub == 0x09) { s->b = -s->b; } /* NEG B */
+            else if (sub == 0x0A) { s->a = (s->a < 0) ? -s->a : s->a; } /* ABS A */
+            else if (sub == 0x0B) { s->b = (s->b < 0) ? -s->b : s->b; } /* ABS B */
+            return consumed;
+        }
+        if (hi8 == 0xA5) {
+            /* CMPS src, Smem — compare and select (Viterbi) */
+            addr = resolve_smem(s, op, &ind);
+            uint16_t val = data_read(s, addr);
+            int src = (op >> 4) & 1;
+            int64_t acc = src ? s->b : s->a;
+            int64_t cmp = (int64_t)(int16_t)val << 16;
+            /* TRN shift left, TC set based on comparison */
+            s->trn <<= 1;
+            if (acc >= cmp) {
+                s->st0 |= ST0_TC;
+                s->trn |= 1;
+            } else {
+                s->st0 &= ~ST0_TC;
+                if (src) s->b = cmp; else s->a = cmp;
+            }
+            return consumed;
+        }
+        if (hi8 == 0xB3) {
+            /* LD #lk, dst (long immediate, 2 words) */
+            op2 = prog_read(s, s->pc + 1);
+            consumed = 2;
+            int dst = (op >> 0) & 1;
+            int64_t v = (s->st1 & ST1_SXM) ? (int16_t)op2 : op2;
+            if (dst) s->b = sext40(v << 16);
+            else     s->a = sext40(v << 16);
+            return consumed;
+        }
+        /* ADD #lk, src[, dst] */
+        if (hi8 == 0xA2) {
+            op2 = prog_read(s, s->pc + 1);
+            consumed = 2;
+            int dst = op & 1;
+            int64_t v = (s->st1 & ST1_SXM) ? (int16_t)op2 : op2;
+            if (dst) s->b = sext40(s->b + (v << 16));
+            else     s->a = sext40(s->a + (v << 16));
+            return consumed;
+        }
+        /* SUB #lk */
+        if (hi8 == 0xA3) {
+            op2 = prog_read(s, s->pc + 1);
+            consumed = 2;
+            int dst = op & 1;
+            int64_t v = (s->st1 & ST1_SXM) ? (int16_t)op2 : op2;
+            if (dst) s->b = sext40(s->b - (v << 16));
+            else     s->a = sext40(s->a - (v << 16));
+            return consumed;
+        }
         goto unimpl;
 
     case 0xC: case 0xD:
-        /* C/Dxxx: PSHM, POPM, RPT, FRAME, etc. */
+        /* C/Dxxx: PSHM, POPM, PSHD, POPD, RPT, FRAME, etc. */
         if (hi8 == 0xC5) {
             /* PSHM MMR */
             uint16_t mmr = op & 0x1F;
@@ -643,6 +1259,62 @@ static int c54x_exec_one(C54xState *s)
             /* FRAME #k (signed 8-bit) */
             int8_t k = (int8_t)(op & 0xFF);
             s->sp += k;
+            return consumed;
+        }
+        if (hi8 == 0xC4) {
+            /* C4xx: PSHD dmad (push data from absolute addr) */
+            op2 = prog_read(s, s->pc + 1);
+            consumed = 2;
+            s->sp--;
+            data_write(s, s->sp, data_read(s, op2));
+            return consumed;
+        }
+        if (hi8 == 0xC0 || hi8 == 0xC1) {
+            /* PSHD Smem / RPT Smem variants */
+            addr = resolve_smem(s, op, &ind);
+            if (hi8 == 0xC0) {
+                /* PSHD Smem */
+                s->sp--;
+                data_write(s, s->sp, data_read(s, addr));
+            } else {
+                /* RPT Smem */
+                s->rpt_count = data_read(s, addr);
+                s->rpt_pc = (uint16_t)(s->pc + consumed);
+                s->rpt_active = true;
+            }
+            return consumed;
+        }
+        if (hi8 == 0xCC) {
+            /* PSHD dmad (2-word) or other CC variants */
+            op2 = prog_read(s, s->pc + 1);
+            consumed = 2;
+            s->sp--;
+            data_write(s, s->sp, data_read(s, op2));
+            return consumed;
+        }
+        if (hi8 == 0xDA) {
+            /* DAxx: RPTBD pmad (block repeat delayed, 2 words) */
+            op2 = prog_read(s, s->pc + 1);
+            consumed = 2;
+            s->rea = op2;
+            s->rsa = (uint16_t)(s->pc + 4); /* delayed: skip 2 delay slots */
+            s->rptb_active = true;
+            s->st1 |= ST1_BRAF;
+            return consumed;
+        }
+        if (hi8 == 0xDD) {
+            /* POPD Smem */
+            addr = resolve_smem(s, op, &ind);
+            data_write(s, addr, data_read(s, s->sp));
+            s->sp++;
+            return consumed;
+        }
+        if (hi8 == 0xDE) {
+            /* DExx: POPD dmad (2-word) */
+            op2 = prog_read(s, s->pc + 1);
+            consumed = 2;
+            data_write(s, op2, data_read(s, s->sp));
+            s->sp++;
             return consumed;
         }
         goto unimpl;
@@ -760,8 +1432,24 @@ int c54x_load_rom(C54xState *s, const char *path)
                 /* DROM/PDROM: data memory */
                 if (addr < C54X_DATA_SIZE) s->data[addr] = word;
             } else {
-                /* PROM: program memory */
+                /* PROM: program memory.
+                 * The dump uses extended addresses (XPC pages):
+                 *   PROM0: 0x07000-0x0DFFF → prog space 0x7000-0xDFFF
+                 *   PROM1: 0x18000-0x1FFFF → prog space 0x8000-0xFFFF (page 1)
+                 *   PROM2: 0x28000-0x2FFFF → prog space 0x8000-0xFFFF (page 2)
+                 *   PROM3: 0x38000-0x39FFF → prog space 0xF800-0xFFFF (page 3)
+                 * For 16-bit PC access, map all PROM to lower 64K too.
+                 * PROM0 is already at 0x7000. For PROM1-3, also mirror
+                 * to the 16-bit alias (0x8000-0xFFFF). */
                 if (addr < C54X_PROG_SIZE) s->prog[addr] = word;
+                /* Mirror PROM1 (page 1: 0x18000-0x1FFFF) to 16-bit space 0x8000-0xFFFF.
+                 * PROM1 contains the interrupt vectors at 0xFF80.
+                 * Don't mirror PROM2/PROM3 — they overlap and would overwrite. */
+                if (section == 4) {  /* PROM1 only */
+                    uint16_t addr16 = addr & 0xFFFF;
+                    if (addr16 >= 0x8000)
+                        s->prog[addr16] = word;
+                }
             }
             addr++;
             total_words++;
@@ -814,7 +1502,8 @@ void c54x_reset(C54xState *s)
     uint16_t iptr = (s->pmst >> PMST_IPTR_SHIFT) & 0x1FF;
     s->pc = iptr * 0x80;  /* 0xFF80 for default PMST */
 
-    C54_LOG("Reset: PC=0x%04x PMST=0x%04x SP=0x%04x", s->pc, s->pmst, s->sp);
+    C54_LOG("Reset: PC=0x%04x PMST=0x%04x SP=0x%04x prog[PC]=0x%04x",
+            s->pc, s->pmst, s->sp, s->prog[s->pc]);
 }
 
 void c54x_interrupt(C54xState *s, int irq)
@@ -833,14 +1522,41 @@ void c54x_interrupt(C54xState *s, int irq)
 
         /* Jump to vector */
         uint16_t iptr = (s->pmst >> PMST_IPTR_SHIFT) & 0x1FF;
-        s->pc = (iptr * 0x80) + irq * 2;
+        s->pc = (iptr * 0x80) + irq * 4;
 
         /* Wake from IDLE */
         s->idle = false;
+    } else if (s->idle && (s->imr & (1 << irq))) {
+        /* IDLE wakes on any unmasked interrupt even if INTM is set */
+        s->idle = false;
+        s->ifr &= ~(1 << irq);
+
+        s->sp--;
+        data_write(s, s->sp, (uint16_t)s->pc);
+        s->st1 |= ST1_INTM;
+
+        uint16_t iptr = (s->pmst >> PMST_IPTR_SHIFT) & 0x1FF;
+        s->pc = (iptr * 0x80) + irq * 4;
+    }
+
+    /* Log first few interrupts */
+    static int int_log_count = 0;
+    if (int_log_count < 5) {
+        C54_LOG("IRQ %d: INTM=%d IMR=0x%04x IFR=0x%04x idle=%d PC=0x%04x",
+                irq, !!(s->st1 & ST1_INTM), s->imr, s->ifr, s->idle, s->pc);
+        int_log_count++;
     }
 }
 
 void c54x_wake(C54xState *s)
 {
     s->idle = false;
+}
+
+void c54x_bsp_load(C54xState *s, const uint16_t *samples, int n)
+{
+    if (n > 160) n = 160;
+    memcpy(s->bsp_buf, samples, n * sizeof(uint16_t));
+    s->bsp_len = n;
+    s->bsp_pos = 0;
 }
