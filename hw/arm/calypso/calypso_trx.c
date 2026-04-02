@@ -131,16 +131,7 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
         else if (value == DSP_DL_STATUS_READY) {
             s->dsp_ram[DSP_API_VER_ADDR/2] = DSP_API_VERSION;
             s->dsp_ram[DSP_API_VER2_ADDR/2] = 0;
-            /* Unmask API IRQ (IRQ15) in INTH — firmware should do this
-             * via irq_enable(IRQ_API) but our init timing may miss it.
-             * INTH MASK_IT_REG1 is at 0xFFFFFA08, bit 15 = API IRQ. */
-            {
-                uint16_t mask;
-                cpu_physical_memory_read(0xFFFFFA08, &mask, 2);
-                mask &= ~(1 << 15);  /* unmask IRQ15 */
-                cpu_physical_memory_write(0xFFFFFA08, &mask, 2);
-                TRX_LOG("DSP ready — unmasked API IRQ (mask=0x%04x)", mask);
-            }
+            TRX_LOG("DSP ready");
             /* Boot C54x — ARM has finished DSP init */
             if (s->dsp) {
                 c54x_reset(s->dsp);
@@ -181,13 +172,17 @@ static void calypso_dsp_done(void *opaque) {
             uint16_t page = s->dsp_ram[0x01A8/2] & 1;
             uint16_t *wp = page ?
                 &s->dsp_ram[DSP_API_W_PAGE1/2] : &s->dsp_ram[DSP_API_W_PAGE0/2];
+            /* Copy d_dsp_page to DARAM 0x0584 (frame sync header) */
+            s->dsp->data[0x0584] = s->dsp_ram[0x01A8/2]; /* d_dsp_page */
+            s->dsp->data[0x0585] = s->fn & 0xFFFF;       /* frame number */
+            /* Copy write page to DARAM 0x0586 */
             for (int i = 0; i < 20; i++)
                 s->dsp->data[0x0586 + i] = wp[i];
         }
 
         /* TPU scenario done — send SINT17 and run */
         c54x_interrupt(s->dsp, C54X_INT_SINT17);
-        int ran = c54x_run(s->dsp, 100000);
+        int ran = c54x_run(s->dsp, 500000);
 
         uint16_t dsp_page = s->dsp_ram[0x01A8/2]; /* d_dsp_page */
         static int done_log = 0;
@@ -198,7 +193,8 @@ static void calypso_dsp_done(void *opaque) {
         }
     }
 
-    /* Don't raise API IRQ here — let the scheduler flow naturally */
+    /* No API IRQ — OsmocomBB layer1 doesn't use it.
+     * All scheduling is done via TPU_FRAME ISR + TDMA scheduler. */
 }
 static void calypso_tdma_start(CalypsoTRX *s);
 

@@ -63,6 +63,18 @@ static inline int asm_shift(C54xState *s)
 
 static uint16_t data_read(C54xState *s, uint16_t addr)
 {
+    /* Timer registers (extended MMR 0x0024-0x0026) */
+    if (addr == 0x0024) {
+        /* TIM — decrement on each read. Fire TINT0 when reaches 0. */
+        if (s->data[0x0024] > 0)
+            s->data[0x0024]--;
+        if (s->data[0x0024] == 0 && s->data[0x0025] > 0) {
+            s->data[0x0024] = s->data[0x0025]; /* reload from PRD */
+            s->ifr |= (1 << 5); /* TINT0 = interrupt 5 */
+        }
+        return s->data[0x0024];
+    }
+
     /* MMR region */
     if (addr < 0x20) {
         switch (addr) {
@@ -109,17 +121,12 @@ static uint16_t data_read(C54xState *s, uint16_t addr)
         }
     }
 
-    /* Trace unique read addresses during 3rd DSP run */
-    if (s->insn_count >= 200000 && s->insn_count < 400000 && addr >= 0x0020) {
-        static uint8_t seen3[65536/8];
-        static int init4 = 0, read_log3 = 0;
-        if (!init4) { memset(seen3, 0, sizeof(seen3)); init4 = 1; }
-        if (!(seen3[addr/8] & (1 << (addr%8)))) {
-            seen3[addr/8] |= (1 << (addr%8));
-            if (read_log3 < 300) {
-                C54_LOG("F_RD [0x%04x]=0x%04x PC=0x%04x", addr, s->data[addr], s->pc);
-                read_log3++;
-            }
+    /* Log reads when PC is in the polling loop area */
+    if (s->pc >= 0x2C30 && s->pc <= 0x2C50 && addr >= 0x0020) {
+        static int poll_log = 0;
+        if (poll_log < 20) {
+            C54_LOG("POLL [0x%04x]=0x%04x PC=0x%04x", addr, s->data[addr], s->pc);
+            poll_log++;
         }
     }
 
@@ -183,19 +190,32 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
 
 static uint16_t prog_read(C54xState *s, uint32_t addr)
 {
-    addr &= (C54X_PROG_SIZE - 1);
-    /* OVLY: DARAM also visible in program space */
-    if ((s->pmst & PMST_OVLY) && addr < 0x8000 && addr >= 0x80)
-        return s->data[addr];
-    return s->prog[addr];
+    uint16_t addr16 = addr & 0xFFFF;
+    /* OVLY: DARAM visible in program space for 0x0080-0x7FFF */
+    if ((s->pmst & PMST_OVLY) && addr16 < 0x8000 && addr16 >= 0x80)
+        return s->data[addr16];
+    /* For addresses >= 0x8000: use XPC to select extended page.
+     * Extended address = (XPC << 16) | addr16.
+     * PROM1 at 0x18000, PROM2 at 0x28000, PROM3 at 0x38000. */
+    if (addr16 >= 0x8000) {
+        uint32_t ext = ((uint32_t)s->xpc << 16) | addr16;
+        ext &= (C54X_PROG_SIZE - 1);
+        return s->prog[ext];
+    }
+    return s->prog[addr16];
 }
 
 static void __attribute__((unused)) prog_write(C54xState *s, uint32_t addr, uint16_t val)
 {
-    addr &= (C54X_PROG_SIZE - 1);
-    if ((s->pmst & PMST_OVLY) && addr < 0x8000 && addr >= 0x80)
-        s->data[addr] = val;
-    s->prog[addr] = val;
+    uint16_t addr16 = addr & 0xFFFF;
+    if ((s->pmst & PMST_OVLY) && addr16 < 0x8000 && addr16 >= 0x80)
+        s->data[addr16] = val;
+    if (addr16 >= 0x8000) {
+        uint32_t ext = ((uint32_t)s->xpc << 16) | addr16;
+        ext &= (C54X_PROG_SIZE - 1);
+        s->prog[ext] = val;
+    }
+    s->prog[addr16] = val;
 }
 
 /* ================================================================
@@ -304,6 +324,11 @@ static int c54x_exec_one(C54xState *s)
     uint8_t hi4 = (op >> 12) & 0xF;
     uint8_t hi8 = (op >> 8) & 0xFF;
 
+    /* Log every 100000th instruction to see where the DSP spends time */
+    if (s->insn_count > 0 && (s->insn_count % 100000) == 0) {
+        C54_LOG("SAMPLE PC=0x%04x op=0x%04x insn=%u", s->pc, op, s->insn_count);
+    }
+
     switch (hi4) {
     case 0xF:
         /* 0xF --- large group: branches, misc, short immediates */
@@ -344,18 +369,31 @@ static int c54x_exec_one(C54xState *s)
                 data_write(s, s->sp, (uint16_t)(s->pc + 1));
                 s->pc = (uint16_t)(s->a & 0xFFFF);
                 return 0;
-            case 0x9: /* F49x: B pmad with other forms */
-            case 0xD: /* F4Dx: FBACC, FBACCD */
-            case 0xF: /* F4Fx: FCALL/FCALLD */
-                /* Various branch/call — treat based on low bits */
-                if (sub == 0x9 || sub == 0xD) {
-                    s->pc = op2;
-                } else {
-                    s->sp--;
-                    data_write(s, s->sp, (uint16_t)(s->pc + 2));
-                    s->pc = op2;
-                }
+            case 0x9: /* F49x: BD pmad (delayed branch) */
+                s->pc = op2;
                 return 0;
+            case 0xD: /* F4Dx: FB/FBACC — far branch (set XPC + PC) */
+            {
+                uint16_t new_xpc = op2;
+                uint16_t new_pc = prog_read(s, s->pc + 2);
+                consumed = 3;
+                s->xpc = new_xpc;
+                s->pc = new_pc;
+                return 0;
+            }
+            case 0xF: /* F4Fx: FCALL/FCALLD — far call (set XPC + push PC + branch) */
+            {
+                uint16_t new_xpc = op2;
+                uint16_t new_pc = prog_read(s, s->pc + 2);
+                consumed = 3;
+                s->sp--;
+                data_write(s, s->sp, (uint16_t)(s->pc + 3));
+                s->sp--;
+                data_write(s, s->sp, s->xpc);
+                s->xpc = new_xpc;
+                s->pc = new_pc;
+                return 0;
+            }
             case 0xA: /* F4Ax: BANZ with indirect */
             case 0xB: /* F4Bx */
             case 0xC: /* F4Cx */
@@ -377,8 +415,9 @@ static int c54x_exec_one(C54xState *s)
                 s->st1 &= ~ST1_INTM;
                 s->pc = ra; return 0;
             }
-            /* F072: FRET (far return) — same as RET for 16-bit mode */
+            /* F072: FRET (far return) — restore XPC then PC from stack */
             if (op == 0xF072) {
+                s->xpc = data_read(s, s->sp); s->sp++;
                 uint16_t ra = data_read(s, s->sp); s->sp++;
                 s->pc = ra; return 0;
             }
@@ -1415,11 +1454,30 @@ int c54x_run(C54xState *s, int n_insns)
             s->pc += consumed;
         /* consumed == 0 means PC was set by branch */
 
+        /* Timer tick — decrement TIM every instruction */
+        if (s->data[0x0024] > 0) {
+            s->data[0x0024]--;
+            if (s->data[0x0024] == 0) {
+                if (s->data[0x0025] > 0)
+                    s->data[0x0024] = s->data[0x0025]; /* reload from PRD */
+                s->ifr |= (1 << 5); /* TINT0 */
+                /* Check if TINT0 is unmasked and interrupts enabled */
+                if (!(s->st1 & ST1_INTM) && (s->imr & (1 << 5))) {
+                    s->ifr &= ~(1 << 5);
+                    s->sp--;
+                    data_write(s, s->sp, (uint16_t)s->pc);
+                    s->st1 |= ST1_INTM;
+                    uint16_t iptr = (s->pmst >> PMST_IPTR_SHIFT) & 0x1FF;
+                    s->pc = (iptr * 0x80) + 5 * 4; /* TINT0 vector */
+                    s->idle = false;
+                }
+            }
+        }
+
         s->cycles++;
+        s->insn_count++;
         executed++;
     }
-
-    s->insn_count += executed;
     return executed;
 }
 
