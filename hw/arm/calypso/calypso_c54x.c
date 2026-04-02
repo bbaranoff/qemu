@@ -418,12 +418,12 @@ static int c54x_exec_one(C54xState *s)
             case 0x9: /* F49x: BD pmad (delayed branch) */
                 s->pc = op2;
                 return 0;
-            case 0xD: /* F4Dx: FB pmad — far branch (delayed, no XPC change) */
+            case 0xD: /* F4Dx: BD pmad — branch delayed (2 words, no XPC change) */
             {
                 s->pc = op2;
                 return 0;
             }
-            case 0xF: /* F4Fx: FCALL pmad — far call (delayed, no XPC change) */
+            case 0xF: /* F4Fx: CALLD pmad — call delayed (2 words, no XPC change) */
             {
                 s->sp--;
                 data_write(s, s->sp, (uint16_t)(s->pc + 2));
@@ -456,9 +456,8 @@ static int c54x_exec_one(C54xState *s)
                 rete_log++;
                 s->pc = ra; return 0;
             }
-            /* F072: FRET (far return) — restore XPC then PC from stack */
+            /* F072: FRET — on Calypso ROM, used as regular RET (no XPC push/pop) */
             if (op == 0xF072) {
-                s->xpc = data_read(s, s->sp) & 0x7F; s->sp++;
                 uint16_t ra = data_read(s, s->sp); s->sp++;
                 s->pc = ra; return 0;
             }
