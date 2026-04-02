@@ -94,20 +94,32 @@ static uint16_t data_read(C54xState *s, uint16_t addr)
 
     /* API RAM (shared with ARM) */
     if (addr >= C54X_API_BASE && addr < C54X_API_BASE + C54X_API_SIZE) {
-        if (s->api_ram)
-            return s->api_ram[addr - C54X_API_BASE];
+        if (s->api_ram) {
+            uint16_t val = s->api_ram[addr - C54X_API_BASE];
+            /* Log task reads: d_dsp_page at 0x08D4, d_task_md at 0x0804 */
+            if (addr == 0x08D4 || addr == 0x0804 || addr == 0x0800) {
+                static int task_read_log = 0;
+                if (task_read_log < 20) {
+                    C54_LOG("TASK READ [0x%04x] = %d PC=0x%04x insn=%u",
+                            addr, val, s->pc, s->insn_count);
+                    task_read_log++;
+                }
+            }
+            return val;
+        }
     }
 
-    /* Log unique DARAM read addresses during frame processing */
-    if (addr >= 0x0020 && addr < 0x0800 && s->insn_count > 100000) {
-        static uint8_t seen[0x0800];
-        static int init = 0;
-        static int daram_log = 0;
-        if (!init) { memset(seen, 0, sizeof(seen)); init = 1; }
-        if (!seen[addr] && daram_log < 200) {
-            C54_LOG("DARAM [0x%04x] = 0x%04x PC=0x%04x", addr, s->data[addr], s->pc);
-            seen[addr] = 1;
-            daram_log++;
+    /* Trace unique read addresses during 3rd DSP run */
+    if (s->insn_count >= 200000 && s->insn_count < 400000 && addr >= 0x0020) {
+        static uint8_t seen3[65536/8];
+        static int init4 = 0, read_log3 = 0;
+        if (!init4) { memset(seen3, 0, sizeof(seen3)); init4 = 1; }
+        if (!(seen3[addr/8] & (1 << (addr%8)))) {
+            seen3[addr/8] |= (1 << (addr%8));
+            if (read_log3 < 300) {
+                C54_LOG("F_RD [0x%04x]=0x%04x PC=0x%04x", addr, s->data[addr], s->pc);
+                read_log3++;
+            }
         }
     }
 
@@ -149,11 +161,20 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
     if (addr >= C54X_API_BASE && addr < C54X_API_BASE + C54X_API_SIZE) {
         if (s->api_ram)
             s->api_ram[addr - C54X_API_BASE] = val;
-        /* Log non-zero API writes */
+        /* Log API writes with context */
         static int api_log = 0;
-        if (val != 0 && api_log < 30) {
-            C54_LOG("API WRITE [0x%04x] = 0x%04x PC=0x%04x", addr, val, s->pc);
+        if (api_log < 50) {
+            C54_LOG("API WR [0x%04x] = 0x%04x PC=0x%04x insn=%u", addr, val, s->pc, s->insn_count);
             api_log++;
+        }
+    }
+
+    /* Log DARAM writes during boot — find DMA buffer address */
+    if (addr >= 0x0020 && addr < 0x0800 && val != 0) {
+        static int dw_log = 0;
+        if (dw_log < 50) {
+            C54_LOG("DARAM WR [0x%04x] = 0x%04x PC=0x%04x", addr, val, s->pc);
+            dw_log++;
         }
     }
 
@@ -1032,12 +1053,12 @@ static int c54x_exec_one(C54xState *s)
             } else {
                 data_write(s, addr, 0);
             }
-            /* Log first PORTR calls */
+            /* Log PORTR calls */
             {
                 static int portr_log = 0;
-                if (portr_log < 20) {
-                    C54_LOG("PORTR PA=0x%04x → [0x%04x] bsp=%d/%d PC=0x%04x",
-                            op2, addr, s->bsp_pos, s->bsp_len, s->pc);
+                if (portr_log < 50) {
+                    C54_LOG("PORTR PA=0x%04x → [0x%04x] val=0x%04x PC=0x%04x",
+                            op2, addr, data_read(s, addr), s->pc);
                     portr_log++;
                 }
             }
@@ -1048,8 +1069,15 @@ static int c54x_exec_one(C54xState *s)
             addr = resolve_smem(s, op, &ind);
             op2 = prog_read(s, s->pc + 1);
             consumed = 2;
-            /* I/O ports: ignore (stub) */
-            (void)data_read(s, addr);
+            /* Log I/O port writes */
+            {
+                uint16_t wval = data_read(s, addr);
+                static int portw_log = 0;
+                if (portw_log < 30) {
+                    C54_LOG("PORTW PA=0x%04x val=0x%04x PC=0x%04x", op2, wval, s->pc);
+                    portw_log++;
+                }
+            }
             return consumed;
         }
         /* 85xx: MVPD pmad, Smem (prog→data, different encoding) */

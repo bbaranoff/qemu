@@ -52,6 +52,7 @@ typedef struct CalypsoTRX {
     uint32_t     fn;
     bool         tdma_running;
     bool         fw_patched;
+    bool         tpu_en_pending;  /* set by TPU_CTRL_EN, cleared by dsp_done */
 
     /* C54x DSP emulator */
     C54xState   *dsp;
@@ -114,7 +115,14 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
     else if (size == 4) { s->dsp_ram[offset/2] = value; s->dsp_ram[offset/2+1] = value >> 16; }
     else ((uint8_t *)s->dsp_ram)[offset] = value;
 
-    /* Pure write — C54x DSP reads tasks from shared API RAM */
+    /* Log ALL writes to d_dsp_page offset (0x01A8), any value */
+    if (offset == 0x01A8) {
+        static int page_wr_log = 0;
+        if (page_wr_log < 20) {
+            TRX_LOG("d_dsp_page WR = 0x%04x (sz=%d fn=%u)", (unsigned)value, size, s->fn);
+            page_wr_log++;
+        }
+    }
     /* DSP page */
     if (offset == DSP_API_NDB) s->dsp_page = value & 1;
     /* DSP status */
@@ -153,26 +161,44 @@ static const MemoryRegionOps calypso_dsp_ops = {
 /* ---- TPU ---- */
 static void calypso_dsp_done(void *opaque) {
     CalypsoTRX *s = opaque;
+
+    /* This fires either from:
+     * 1. TPU_CTRL_EN (1ns later) — firmware wrote tasks + d_dsp_page
+     * 2. TDMA heartbeat (2ms later) — just API IRQ, no C54x
+     * Check if TPU_CTRL_EN was the trigger (tpu_regs has EN bit) */
+    /* tpu_en_pending is set by TPU_CTRL_EN write handler */
+    int from_tpu_en = s->tpu_en_pending;
+    s->tpu_en_pending = false;
+
+    /* Clear TPU EN + set IDLE — scenario done */
     s->tpu_regs[TPU_CTRL/2] &= ~TPU_CTRL_EN;
+    s->tpu_regs[TPU_CTRL/2] &= ~TPU_CTRL_IDLE;  /* 0 = idle */
 
-    /* Read current tasks before C54x runs */
-    uint16_t *wp = s->dsp_page ?
-        &s->dsp_ram[DSP_API_W_PAGE1/2] : &s->dsp_ram[DSP_API_W_PAGE0/2];
-    uint16_t td = wp[0], tu = wp[2], tmd = wp[4];
+    if (from_tpu_en && s->dsp) {
+        /* Hardware DMA emulation: copy API write page to DSP DARAM 0x0586.
+         * The real Calypso does this during TPU scenario execution. */
+        {
+            uint16_t page = s->dsp_ram[0x01A8/2] & 1;
+            uint16_t *wp = page ?
+                &s->dsp_ram[DSP_API_W_PAGE1/2] : &s->dsp_ram[DSP_API_W_PAGE0/2];
+            for (int i = 0; i < 20; i++)
+                s->dsp->data[0x0586 + i] = wp[i];
+        }
 
-    /* Run C54x DSP NOW — firmware just wrote TPU_CTRL_EN meaning tasks are ready */
-    if (s->dsp) {
+        /* TPU scenario done — send SINT17 and run */
         c54x_interrupt(s->dsp, C54X_INT_SINT17);
-        int ran = c54x_run(s->dsp, 20000);
+        int ran = c54x_run(s->dsp, 100000);
+
+        uint16_t dsp_page = s->dsp_ram[0x01A8/2]; /* d_dsp_page */
         static int done_log = 0;
-        if (done_log < 20 && (td || tu || tmd)) {
-            TRX_LOG("DSP_DONE: td=%d tu=%d tmd=%d ran=%d bsp=%d/%d idle=%d",
-                    td, tu, tmd, ran, s->dsp->bsp_pos, s->dsp->bsp_len, s->dsp->idle);
+        if (done_log < 30) {
+            TRX_LOG("DSP_DONE: page=0x%04x ran=%d PC=0x%04x idle=%d IMR=0x%04x",
+                    dsp_page, ran, s->dsp->pc, s->dsp->idle, s->dsp->imr);
             done_log++;
         }
     }
 
-    qemu_irq_raise(s->irqs[CALYPSO_IRQ_API]);
+    /* Don't raise API IRQ here — let the scheduler flow naturally */
 }
 static void calypso_tdma_start(CalypsoTRX *s);
 
@@ -182,11 +208,20 @@ static uint64_t calypso_tpu_read(void *o, hwaddr off, unsigned sz) {
 }
 static void calypso_tpu_write(void *o, hwaddr off, uint64_t val, unsigned sz) {
     CalypsoTRX *s=o; if (off/2<CALYPSO_TPU_SIZE/2) s->tpu_regs[off/2]=val;
-    if (off==TPU_CTRL && (val&TPU_CTRL_EN)) {
-        s->tpu_regs[TPU_CTRL/2] &= ~(TPU_CTRL_EN|TPU_CTRL_IDLE);
-        timer_mod_ns(s->dsp_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)+1);
-        static int tpu_en_log = 0;
-        if (tpu_en_log < 10) { TRX_LOG("TPU_CTRL_EN! fn=%u", s->fn); tpu_en_log++; }
+    if (off==TPU_CTRL) {
+        uint16_t reg = (uint16_t)val;
+        { static int ctrl_log = 0; if (ctrl_log < 20) { TRX_LOG("TPU_CTRL write 0x%04x", reg); ctrl_log++; } }
+        if (reg & TPU_CTRL_EN) {
+            /* Don't clear EN immediately — firmware polls for EN set.
+             * Clear IDLE to indicate TPU is running.
+             * EN will be cleared in dsp_done when "scenario finishes". */
+            s->tpu_regs[TPU_CTRL/2] &= ~TPU_CTRL_IDLE;
+            s->tpu_en_pending = true;
+            timer_mod_ns(s->dsp_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)+1);
+            static int tpu_en_log = 0;
+            if (tpu_en_log < 10) { TRX_LOG("TPU_CTRL_EN fn=%u", s->fn); tpu_en_log++; }
+        }
+        /* DSP_EN handled by dsp_done via SINT17 */
     }
     if (off==TPU_INT_CTRL && !(val&ICTRL_MCU_FRAME) && !s->tdma_running) calypso_tdma_start(s);
     if (off==TPU_IT_DSP_PG) s->dsp_page=val&1;
@@ -230,7 +265,7 @@ static void calypso_tdma_tick(void *opaque) {
     CalypsoTRX *s = opaque;
     s->fn = (s->fn+1) % GSM_HYPERFRAME;
     if (g_uart_modem) { calypso_uart_poll_backend(g_uart_modem); calypso_uart_kick_rx(g_uart_modem); calypso_uart_kick_tx(g_uart_modem); }
-    /* C54x DSP handles all PM/FB/SB/NB results via shared API RAM */
+    /* No heartbeat API IRQ — let TPU_CTRL_EN trigger dsp_done only */
     /* Check for UL burst to send */
     calypso_trx_tx_burst_poll();
 
