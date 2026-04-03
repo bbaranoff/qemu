@@ -201,27 +201,27 @@ static void l1ctl_client_readable(void *opaque)
     memcpy(&s->lp_buf[s->lp_len], tmp, n);
     s->lp_len += (int)n;
 
-    /* Parse complete L1CTL messages */
-    while (s->lp_len >= 2) {
+    /* Parse ONE L1CTL message per callback — let ARM CPU process before next */
+    if (s->lp_len >= 2) {
         int msglen = (s->lp_buf[0] << 8) | s->lp_buf[1];
-        if (s->lp_len < 2 + msglen) break;  /* incomplete */
+        if (s->lp_len >= 2 + msglen) {
+            uint8_t *payload = &s->lp_buf[2];
 
-        uint8_t *payload = &s->lp_buf[2];
+            /* Wrap in sercomm and inject into UART RX */
+            uint8_t frame[1024];
+            int flen = sercomm_wrap(SERCOMM_DLCI_L1CTL, payload, msglen,
+                                    frame, sizeof(frame));
+            if (flen > 0 && s->uart) {
+                L1CTL_LOG("RX←mobile: len=%d type=0x%02x → sercomm %d bytes",
+                          msglen, payload[0], flen);
+                calypso_uart_inject_raw(s->uart, frame, flen);
+            }
 
-        /* Wrap in sercomm and inject into UART RX */
-        uint8_t frame[1024];
-        int flen = sercomm_wrap(SERCOMM_DLCI_L1CTL, payload, msglen,
-                                frame, sizeof(frame));
-        if (flen > 0 && s->uart) {
-            L1CTL_LOG("RX←mobile: len=%d type=0x%02x → sercomm %d bytes",
-                      msglen, payload[0], flen);
-            calypso_uart_inject_raw(s->uart, frame, flen);
+            /* Consume from buffer */
+            int consumed = 2 + msglen;
+            memmove(s->lp_buf, &s->lp_buf[consumed], s->lp_len - consumed);
+            s->lp_len -= consumed;
         }
-
-        /* Consume from buffer */
-        int consumed = 2 + msglen;
-        memmove(s->lp_buf, &s->lp_buf[consumed], s->lp_len - consumed);
-        s->lp_len -= consumed;
     }
 }
 

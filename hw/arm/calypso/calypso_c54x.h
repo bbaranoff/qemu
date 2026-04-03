@@ -117,12 +117,8 @@
  *                  Vec 23: DMAC0 (IMR bit 7)
  *                  Vec 24: DMAC1 (IMR bit 8)
  * Formula: vec = imr_bit + 16 */
-#define C54X_INT_FRAME_VEC   2   /* SINT17: vector 2 — TPU frame interrupt to DSP */
-#define C54X_INT_FRAME_BIT   1   /* IMR bit 1 — SINT17 enable */
-#define C54X_INT_TINT0_VEC   20  /* TINT0: vector 20 */
-#define C54X_INT_TINT0       4   /* IMR bit 4 */
-#define C54X_INT_HINT_VEC    22  /* BXINT0: vector 22 */
-#define C54X_INT_HINT        6   /* IMR bit 6 */
+#define C54X_INT_FRAME_VEC   2   /* SINT17 (IMR bit 1) — enters boot code which dispatches frames */
+#define C54X_INT_FRAME_BIT   1   /* IMR bit 1 */
 #define C54X_NUM_INTS        16
 
 typedef struct C54xState {

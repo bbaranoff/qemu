@@ -63,12 +63,14 @@ static inline int asm_shift(C54xState *s)
 
 static uint16_t data_read(C54xState *s, uint16_t addr)
 {
-    /* Log reads from frame sync area (0x0580-0x05A0) */
-    if (addr >= 0x0580 && addr <= 0x05A0) {
-        static int fr_log = 0;
-        if (fr_log < 30) {
-            C54_LOG("FRAME_RD [0x%04x] = 0x%04x PC=0x%04x", addr, s->data[addr], s->pc);
-            fr_log++;
+    /* Log reads from API RAM at 0x08D4 (d_dsp_page) */
+    if (addr == 0x08D4) {
+        static int dsp_page_log = 0;
+        if (dsp_page_log < 50) {
+            C54_LOG("d_dsp_page RD = 0x%04x PC=0x%04x insn=%u SP=0x%04x",
+                    s->api_ram ? s->api_ram[addr - 0x0800] : s->data[addr],
+                    s->pc, s->insn_count, s->sp);
+            dsp_page_log++;
         }
     }
     /* Timer registers (0x0024-0x0026) — read returns current value */
@@ -214,13 +216,16 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
         }
     }
 
-    /* Log DARAM writes during boot — find DMA buffer address */
-    if (addr >= 0x0020 && addr < 0x0800 && val != 0) {
-        static int dw_log = 0;
-        if (dw_log < 50) {
-            C54_LOG("DARAM WR [0x%04x] = 0x%04x PC=0x%04x", addr, val, s->pc);
-            dw_log++;
+    /* Log DARAM writes to code target area and count total */
+    if (addr >= 0x0020 && addr < 0x0800) {
+        static int dw_total = 0;
+        dw_total++;
+        if (addr >= 0x1200 && addr <= 0x1240) {
+            C54_LOG("DARAM WR [0x%04x] = 0x%04x PC=0x%04x insn=%u",
+                    addr, val, s->pc, s->insn_count);
         }
+        if (dw_total == 1 || dw_total == 100 || dw_total == 1000 || dw_total == 10000)
+            C54_LOG("DARAM write count: %d (last: [0x%04x]=0x%04x)", dw_total, addr, val);
     }
 
     s->data[addr] = val;
@@ -351,6 +356,10 @@ static uint16_t resolve_smem(C54xState *s, uint16_t opcode, bool *indirect)
  * ================================================================ */
 
 /* Execute one instruction. Returns number of words consumed (1 or 2). */
+/* PC ring buffer for pre-IDLE trace */
+static uint16_t pc_ring[256];
+static int pc_ring_idx = 0;
+
 static int c54x_exec_one(C54xState *s)
 {
     uint16_t op = prog_read(s, s->pc);
@@ -376,6 +385,70 @@ static int c54x_exec_one(C54xState *s)
     case 0xF:
         /* 0xF --- large group: branches, misc, short immediates */
         if (op == 0xF495) return consumed;  /* NOP */
+
+        /* XC n, cond — Execute Conditionally (SPRU172C p.4-198)
+         * Opcode: 1111 11N1 CCCCCCCC
+         * 0xFDxx = XC 1, cond (N=0, execute next 1 instruction)
+         * 0xFFxx = XC 2, cond (N=1, execute next 2 instructions)
+         * If condition true: execute normally. If false: skip n instructions. */
+        if (hi8 == 0xFD || hi8 == 0xFF) {
+            int n_insns = (hi8 == 0xFF) ? 2 : 1;
+            uint8_t cc = op & 0xFF;
+            bool cond = false;
+            /* Evaluate condition code per SPRU172C condition table */
+            /* Conditions can be combined (OR'd bits), but common single conditions: */
+            if (cc == 0x00)      cond = true;                          /* UNC */
+            else if (cc == 0x0C) cond = (s->st0 & ST0_C) != 0;       /* C */
+            else if (cc == 0x08) cond = !(s->st0 & ST0_C);            /* NC */
+            else if (cc == 0x30) cond = (s->st0 & ST0_TC) != 0;       /* TC */
+            else if (cc == 0x20) cond = !(s->st0 & ST0_TC);           /* NTC */
+            else if (cc == 0x45) cond = (sext40(s->a) == 0);          /* AEQ */
+            else if (cc == 0x44) cond = (sext40(s->a) != 0);          /* ANEQ */
+            else if (cc == 0x46) cond = (sext40(s->a) > 0);           /* AGT */
+            else if (cc == 0x42) cond = (sext40(s->a) >= 0);          /* AGEQ */
+            else if (cc == 0x43) cond = (sext40(s->a) < 0);           /* ALT */
+            else if (cc == 0x47) cond = (sext40(s->a) <= 0);          /* ALEQ */
+            else if (cc == 0x4D) cond = (sext40(s->b) == 0);          /* BEQ */
+            else if (cc == 0x4C) cond = (sext40(s->b) != 0);          /* BNEQ */
+            else if (cc == 0x4E) cond = (sext40(s->b) > 0);           /* BGT */
+            else if (cc == 0x4A) cond = (sext40(s->b) >= 0);          /* BGEQ */
+            else if (cc == 0x4B) cond = (sext40(s->b) < 0);           /* BLT */
+            else if (cc == 0x4F) cond = (sext40(s->b) <= 0);          /* BLEQ */
+            else if (cc == 0x70) cond = (s->st0 & ST0_OVA) != 0;     /* AOV */
+            else if (cc == 0x60) cond = !(s->st0 & ST0_OVA);          /* ANOV */
+            else if (cc == 0x78) cond = (s->st0 & ST0_OVB) != 0;     /* BOV */
+            else if (cc == 0x68) cond = !(s->st0 & ST0_OVB);          /* BNOV */
+            else {
+                /* Combined conditions: OR the individual condition bits */
+                cond = false;
+                if (cc & 0x0C) cond |= ((cc & 0x04) ? (s->st0 & ST0_C) != 0 : !(s->st0 & ST0_C));
+                if (cc & 0x30) cond |= ((cc & 0x10) ? (s->st0 & ST0_TC) != 0 : !(s->st0 & ST0_TC));
+                if (cc & 0x40) {
+                    int64_t acc = (cc & 0x08) ? s->b : s->a;
+                    int c3 = cc & 0x07;
+                    switch (c3) {
+                    case 0x5: cond |= (sext40(acc) == 0); break;
+                    case 0x4: cond |= (sext40(acc) != 0); break;
+                    case 0x6: cond |= (sext40(acc) > 0); break;
+                    case 0x2: cond |= (sext40(acc) >= 0); break;
+                    case 0x3: cond |= (sext40(acc) < 0); break;
+                    case 0x7: cond |= (sext40(acc) <= 0); break;
+                    default: cond = true; break;
+                    }
+                }
+                if (cc & 0x70 && !(cc & 0x40)) {
+                    if (cc & 0x08) cond |= (s->st0 & ST0_OVB) != 0;
+                    else           cond |= (s->st0 & ST0_OVA) != 0;
+                }
+            }
+            if (!cond) {
+                /* Skip n instructions — count consumed words for skipped insns */
+                /* Each skipped insn is 1 word (simplified — multi-word insns rare after XC) */
+                return 1 + n_insns;
+            }
+            return consumed;  /* condition true: just advance past XC, execute next normally */
+        }
+
         /* F4E2 = RSBX INTM (enable interrupts), F4E3 = SSBX INTM (disable interrupts) */
         if (op == 0xF4E2) { s->st1 &= ~ST1_INTM; return consumed; }
         if (op == 0xF4E3) { s->st1 |= ST1_INTM; return consumed; }
@@ -385,8 +458,26 @@ static int c54x_exec_one(C54xState *s)
                 C54_LOG("IDLE @0x%04x INTM=%d IMR=0x%04x SP=0x%04x insns=%u XPC=%d",
                         s->pc, !!(s->st1 & ST1_INTM), s->imr, s->sp, s->insn_count, s->xpc);
             idle_log++;
+            /* TDMA slot table (0x8000-0x8020): skip IDLE, continue next slot.
+             * All other IDLEs: halt. Wake behavior decided by calypso_trx. */
+            if (s->pc >= 0x8000 && s->pc < 0x8020) {
+                return consumed;
+            }
+            static int idle_total = 0;
+            idle_total++;
+            if (idle_total <= 10) {
+                C54_LOG("IDLE#%d @0x%04x SP=0x%04x stack=[0x%04x] insn=%u",
+                        idle_total, s->pc, s->sp, s->data[s->sp], s->insn_count);
+                /* Dump last 10 PCs before this IDLE */
+                C54_LOG("  trail: %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x",
+                        pc_ring[(pc_ring_idx-10)&15], pc_ring[(pc_ring_idx-9)&15],
+                        pc_ring[(pc_ring_idx-8)&15], pc_ring[(pc_ring_idx-7)&15],
+                        pc_ring[(pc_ring_idx-6)&15], pc_ring[(pc_ring_idx-5)&15],
+                        pc_ring[(pc_ring_idx-4)&15], pc_ring[(pc_ring_idx-3)&15],
+                        pc_ring[(pc_ring_idx-2)&15], pc_ring[(pc_ring_idx-1)&15]);
+            }
             s->idle = true;
-            return 0;  /* Don't advance PC — ISR return re-executes IDLE */
+            return 0;
         } /* IDLE */
         if (hi8 == 0xF4) {
             /* F4xx: unconditional branch/call */
@@ -418,16 +509,25 @@ static int c54x_exec_one(C54xState *s)
             case 0x9: /* F49x: BD pmad (delayed branch) */
                 s->pc = op2;
                 return 0;
-            case 0xD: /* F4Dx: BD pmad — branch delayed (2 words, no XPC change) */
+            case 0xD: /* F4Dx: FB extpmad — far branch (2 words) per SPRU172C */
             {
-                s->pc = op2;
+                /* op2 = 7-bit XPC:16-bit pmad packed, or just pmad with XPC in low bits */
+                /* Format: word2 has bits 22-16 = XPC, stored as: XPC in high bits?
+                 * Actually FB extpmad is 2 words: word2 = pmad(15:0), XPC from low nibble of opcode
+                 * Per doc: pmad(22-16) = 7-bit constant in word1, pmad(15-0) = word2 */
+                s->pc = op2;  /* pmad(15:0) */
+                /* XPC not changed by BD — only FB changes XPC */
                 return 0;
             }
-            case 0xF: /* F4Fx: CALLD pmad — call delayed (2 words, no XPC change) */
+            case 0xF: /* F4Fx: FCALL extpmad — far call (2 words) per SPRU172C p.4-57 */
             {
+                /* Push PC+2 then XPC (2 pushes) */
                 s->sp--;
                 data_write(s, s->sp, (uint16_t)(s->pc + 2));
-                s->pc = op2;
+                s->sp--;
+                data_write(s, s->sp, s->xpc);
+                s->pc = op2;  /* pmad(15:0) */
+                /* XPC set from bits in opcode or second word — depends on encoding variant */
                 return 0;
             }
             case 0xA: /* F4Ax: BANZ with indirect */
@@ -456,8 +556,9 @@ static int c54x_exec_one(C54xState *s)
                 rete_log++;
                 s->pc = ra; return 0;
             }
-            /* F072: FRET — on Calypso ROM, used as regular RET (no XPC push/pop) */
+            /* F072: FRET — pop XPC then PC (2 pops) per SPRU172C p.4-61 */
             if (op == 0xF072) {
+                s->xpc = data_read(s, s->sp); s->sp++;
                 uint16_t ra = data_read(s, s->sp); s->sp++;
                 s->pc = ra; return 0;
             }
@@ -499,7 +600,7 @@ static int c54x_exec_one(C54xState *s)
         if (op == 0xF4E4) {
             /* IDLE */
             s->idle = true;
-            return 0;  /* Don't advance PC — ISR return re-executes IDLE */
+            return consumed;  /* Advance PC past IDLE */
         }
         /* FXXX short immediates and misc */
         if (hi8 == 0xF0 || hi8 == 0xF1) {
@@ -563,7 +664,7 @@ static int c54x_exec_one(C54xState *s)
                 s->rpt_active = true;
                 return consumed;
             }
-            /* F8xx Smem: RPT Smem */
+            /* F80x-F83x fallthrough: RPT Smem */
             addr = resolve_smem(s, op, &ind);
             s->rpt_count = data_read(s, addr);
             s->rpt_pc = (uint16_t)(s->pc + consumed);
@@ -707,7 +808,10 @@ static int c54x_exec_one(C54xState *s)
     case 0xE:
         /* Exxxx: single-word ALU, status, misc */
         if (hi8 == 0xEA) {
-            /* BANZ pmad, *ARn- */
+            /* BANZ pmad, Sind (2 words) — Calypso ROM uses 0xEA encoding.
+             * Per SPRU172C p.4-16, standard BANZ is 0x78xx but the Calypso
+             * DSP ROM uses 0xEA as an alternate BANZ encoding.
+             * if (AR[arp] != 0) then pmad→PC; AR always decremented */
             op2 = prog_read(s, s->pc + 1);
             consumed = 2;
             int n = arp(s);
@@ -912,7 +1016,9 @@ static int c54x_exec_one(C54xState *s)
             return consumed;
         }
         if ((op & 0xF800) == 0x7800) {
-            /* 78xx: STH src, Smem */
+            /* 78xx-7Fxx: STH src, Smem
+             * Note: BANZ (0x78xx per doc) shares this range but is handled
+             * via F84x (BANZ with condition) in the F8xx group. */
             int src_acc = (op >> 9) & 1;
             addr = resolve_smem(s, op, &ind);
             int64_t acc = src_acc ? s->b : s->a;
@@ -1462,11 +1568,24 @@ int c54x_run(C54xState *s, int n_insns)
 {
     int executed = 0;
 
+    /* Log first 10 instructions of each run (for 2nd cycle debug) */
+    static int run_num = 0;
+    run_num++;
+
     while (executed < n_insns && s->running && !s->idle) {
-        /* Full trace of first 30 instructions of post-boot runs */
-        static int trace_run = 0;
-        if (executed == 0 && s->insn_count > 28000) trace_run++;
-        if (trace_run >= 1 && trace_run <= 2 && executed < 30) {
+        /* Record PC in ring buffer */
+        pc_ring[pc_ring_idx & 255] = s->pc;
+        pc_ring_idx++;
+
+        /* Sample PC every 1M instructions to find stuck loops */
+        if (executed > 0 && (executed % 1000000) == 0) {
+            static int sample_log = 0;
+            if (sample_log < 20)
+                C54_LOG("@%dM: PC=0x%04x op=0x%04x SP=0x%04x insn=%u",
+                        executed/1000000, s->pc, prog_read(s, s->pc), s->sp, s->insn_count);
+            sample_log++;
+        }
+        if (0 && executed < 30) {
             C54_LOG("HDL[%d] PC=0x%04x op=0x%04x SP=0x%04x A=0x%08x%04x",
                     executed, s->pc, prog_read(s, s->pc), s->sp,
                     (uint32_t)(s->a >> 16), (uint16_t)(s->a & 0xFFFF));
@@ -1526,7 +1645,15 @@ int c54x_run(C54xState *s, int n_insns)
                 if (s->data[TIM_ADDR] == 0 && s->data[PRD_ADDR] > 0) {
                     /* TIM expired — reload from PRD, fire TINT0 */
                     s->data[TIM_ADDR] = s->data[PRD_ADDR];
-                    s->ifr |= (1 << C54X_INT_TINT0); /* TINT0 */
+                    s->ifr |= (1 << 4); /* TINT0 = IMR bit 4, vec 20 */
+
+                    /* Increment GSM frame number in DARAM (DSP-side FN counter) */
+                    uint16_t fn_lo = s->data[0x0585];
+                    uint16_t fn_hi = s->data[0x0584] & 0x00FF; /* upper bits of FN */
+                    uint32_t fn = ((uint32_t)fn_hi << 16) | fn_lo;
+                    fn = (fn + 1) % 2715648; /* GSM hyperframe */
+                    s->data[0x0585] = fn & 0xFFFF;
+                    s->data[0x0584] = (s->data[0x0584] & 0xFF00) | ((fn >> 16) & 0xFF);
                 }
             }
         }
@@ -1641,7 +1768,7 @@ void c54x_reset(C54xState *s)
     s->brc = 0; s->rsa = 0; s->rea = 0;
     s->st0 = 0;
     s->st1 = ST1_INTM;  /* interrupts disabled at reset */
-    s->pmst = 0xFFE0;   /* IPTR = 0x1FF (reset vector at 0xFF80), OVLY = 0 at reset */
+    s->pmst = 0xFFE0;   /* IPTR = 0x1FF, OVLY = 0 at reset */
     s->imr = 0;
     s->ifr = 0;
     s->xpc = 0;
@@ -1675,9 +1802,11 @@ void c54x_interrupt_ex(C54xState *s, int vec, int imr_bit)
     if (!(s->st1 & ST1_INTM) && (s->imr & (1 << imr_bit))) {
         s->ifr &= ~(1 << imr_bit);
 
-        /* Push PC, set INTM */
+        /* Push return address: PC+1 if waking from IDLE (resume after IDLE),
+         * PC if interrupting normal execution (resume at interrupted insn) */
+        uint16_t ret_addr = s->idle ? (uint16_t)(s->pc + 1) : (uint16_t)s->pc;
         s->sp--;
-        data_write(s, s->sp, (uint16_t)s->pc);
+        data_write(s, s->sp, ret_addr);
         s->st1 |= ST1_INTM;
 
         /* Jump to vector */
@@ -1694,7 +1823,7 @@ void c54x_interrupt_ex(C54xState *s, int vec, int imr_bit)
         s->idle = false;
         s->ifr &= ~(1 << imr_bit);
         s->sp--;
-        data_write(s, s->sp, (uint16_t)s->pc);
+        data_write(s, s->sp, (uint16_t)(s->pc + 1)); /* return AFTER IDLE */
         s->st1 |= ST1_INTM;
         uint16_t iptr = (s->pmst >> PMST_IPTR_SHIFT) & 0x1FF;
         s->pc = (iptr * 0x80) + vec * 4;

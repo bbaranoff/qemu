@@ -138,6 +138,8 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
                 int ran = c54x_run(s->dsp, 10000000);
                 TRX_LOG("C54x boot: ran=%d PC=0x%04x idle=%d IMR=0x%04x",
                         ran, s->dsp->pc, s->dsp->idle, s->dsp->imr);
+                /* Boot code overwrites API RAM including d_dsp_page — reset it */
+                s->dsp_ram[0x01A8/2] = 0;
             }
         }
     }
@@ -188,13 +190,20 @@ static void calypso_dsp_done(void *opaque) {
             }
         }
 
-        /* TPU scenario done — send frame interrupt to DSP.
-         * Only interrupt if DSP is idle. If busy, just set IFR pending. */
+        /* Re-write d_dsp_page into API RAM right before DSP runs.
+         * Boot code may have overwritten it during initialization. */
+        if (s->dsp->api_ram)
+            s->dsp->api_ram[0x08D4 - C54X_API_BASE] = s->dsp_ram[0x01A8/2];
+
+        /* Wake DSP from IDLE — jump to TDMA loop.
+         * Enable OVLY after boot (processing code branches into DARAM). */
         if (s->dsp->idle) {
-            c54x_interrupt_ex(s->dsp, C54X_INT_FRAME_VEC, C54X_INT_FRAME_BIT);
-        } else {
-            /* DSP still busy — just set IFR bit, don't push/branch */
-            s->dsp->ifr |= (1 << C54X_INT_FRAME_BIT);
+            s->dsp->idle = false;
+            if (!(s->dsp->pmst & PMST_OVLY)) {
+                s->dsp->pmst |= PMST_OVLY;
+                TRX_LOG("DSP: enabled OVLY (DARAM visible as program 0x80-0x7FFF)");
+            }
+            s->dsp->pc = 0x8000;
         }
         int ran = c54x_run(s->dsp, 10000000);
 
@@ -314,9 +323,10 @@ void calypso_trx_rx_burst(const uint8_t *data, int len)
     /* Sync FN */
     s->fn = fn % GSM_HYPERFRAME;
 
-    /* TRXD TX format: TN(1) FN(4) PWR(1) bits(148) — header=6 bytes */
-    int nbits = len - 6;
+    /* TRXD v0 DL format: TN(1) FN(4) RSSI(1) TOA(2) bits(148) — header=8 bytes */
+    int nbits = len - 8;
     if (nbits > 148) nbits = 148;
+    if (nbits < 0) nbits = 0;
 
     static int rx_log = 0;
     if (rx_log < 10) {
@@ -332,8 +342,10 @@ void calypso_trx_rx_burst(const uint8_t *data, int len)
     if (s->dsp) {
         uint16_t samples[160];
         for (int i = 0; i < nbits; i++) {
-            uint8_t bit = data[6 + i];
-            samples[i] = bit ? 0x8001 : 0x7FFF;
+            /* TRXD soft bits: 0=strong 1, 127=uncertain, 255=strong 0
+             * DSP expects 16-bit signed samples centered at 0 */
+            int8_t soft = (int8_t)(data[8 + i] ^ 0x80); /* unsigned→signed */
+            samples[i] = (uint16_t)(int16_t)(soft * 256); /* scale to 16-bit */
         }
         c54x_bsp_load(s->dsp, samples, nbits);
 
