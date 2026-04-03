@@ -96,6 +96,9 @@
 #define DSP_DL_STATUS_READY   0x0002
 #define DSP_API_VERSION       0x3606
 
+/* DSP power measurement — raw value for strong signal (P2 fix: shared define) */
+#define PM_RAW_STRONG         4864
+
 void calypso_trx_init(MemoryRegion *sysmem, qemu_irq *irqs);
 void calypso_fw_patch_apply(void);
 

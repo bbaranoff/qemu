@@ -14,10 +14,10 @@
 #define TYPE_CALYPSO_UART "calypso-uart"
 OBJECT_DECLARE_SIMPLE_TYPE(CalypsoUARTState, CALYPSO_UART)
 
-/*
- * Large RX FIFO to tolerate Compal/sercomm bursts.
- */
 #define CALYPSO_UART_RX_FIFO_SIZE 8192
+
+/* Sercomm DLCI RX parser state — per-UART instance (not static!) */
+#define CALYPSO_SC_BUF_SIZE 512
 
 typedef struct CalypsoUARTState {
     SysBusDevice parent_obj;
@@ -45,7 +45,7 @@ typedef struct CalypsoUARTState {
     uint8_t dlh;
     uint8_t mdr1;
 
-    /* Extended/banked registers used by Calypso loader/uart driver */
+    /* Extended/banked registers */
     uint8_t efr;
     uint8_t xon1;
     uint8_t xon2;
@@ -63,15 +63,16 @@ typedef struct CalypsoUARTState {
     /* TX empty fires once per THR transition */
     bool thr_empty_pending;
 
-    /* TX burst drain: count consecutive IIR(TX_EMPTY) reads without
-     * a THR write.  Allows firmware ISR to loop and drain multiple
-     * bytes per invocation.  Clear pending only after 2 reads without
-     * a write (ISR has nothing left to send). */
+    /* TX burst drain counter */
     uint8_t tx_empty_reads;
 
-    /* Periodic RX poll timer — works around QEMU not delivering
-     * chardev input while the CPU runs in a tight loop. */
+    /* RX poll timer */
     QEMUTimer *rx_poll_timer;
+
+    /* Sercomm DLCI RX parser (per-instance, NOT static) — P2 fix */
+    uint8_t sc_buf[CALYPSO_SC_BUF_SIZE];
+    int     sc_len;
+    int     sc_state;  /* 0=idle, 1=in_frame, 2=escape */
 
 } CalypsoUARTState;
 
@@ -79,18 +80,16 @@ typedef struct CalypsoUARTState {
 int calypso_uart_can_receive(void *opaque);
 void calypso_uart_receive(void *opaque, const uint8_t *buf, int size);
 
-/* Inject bytes directly into RX FIFO, bypassing sercomm DLCI parser.
- * Used by l1ctl_sock to avoid interference with bridge DLCI 4 parsing. */
+/* Inject bytes directly into RX FIFO, bypassing sercomm DLCI parser */
 void calypso_uart_inject_raw(CalypsoUARTState *s, const uint8_t *buf, int size);
 
 /* Force IRQ re-evaluation if RX data is pending */
 void calypso_uart_kick_rx(CalypsoUARTState *s);
 
-/* Tell the chardev backend we can accept more data. */
+/* Tell the chardev backend we can accept more data */
 void calypso_uart_poll_backend(CalypsoUARTState *s);
 
-/* Nudge TX: if TX_EMPTY IRQ is enabled, set pending to trigger ISR.
- * This ensures queued sercomm data gets drained even without console output. */
+/* Nudge TX */
 void calypso_uart_kick_tx(CalypsoUARTState *s);
 void calypso_uart_force_init(CalypsoUARTState *s);
 

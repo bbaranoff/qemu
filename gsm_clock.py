@@ -2,24 +2,13 @@
 """
 gsm_clock.py — Master GSM TDMA clock for the Calypso QEMU stack.
 
-Single source of truth for frame number (FN). Sends air bursts to both
-QEMU instances (BTS TRX + Mobile layer1) at GSM cadence so they stay
-synchronized.  Every component derives timing from this clock.
+Single source of truth for frame number (FN). Sends air bursts to all
+targets at GSM cadence so they stay synchronized.
 
-Architecture:
-  gsm_clock.py  --UDP air burst-->  QEMU TRX  (port 4800)
-                --UDP air burst-->  QEMU MS   (port 4801)
-                --UDP air burst-->  bridge    (port 4901)
-
-Burst format (same as QEMU air interface):
-  byte 0      : TN (timeslot)
-  bytes 1..4  : FN (big-endian uint32)
-  bytes 5..152: 148 hard bits (0/1)
+FIX P2: Real GSM 05.03 CRC for SCH (CRC-10) and L2 (fire code CRC-40).
 
 Usage:
-  python3 gsm_clock.py [-r RATE] [--trx-port 4800] [--ms-port 4801] [--bridge-port 4901]
-
-Rate: 1.0 = real GSM (4.615ms/frame), 0.1 = 10x slower (46.15ms, matches QEMU default)
+  python3 gsm_clock.py [-r RATE] [--bsic BSIC] [--arfcn ARFCN]
 """
 
 import argparse
@@ -30,28 +19,50 @@ import signal
 import sys
 
 GSM_HYPERFRAME = 2715648
-GSM_FRAME_US = 4615  # 4.615 ms in microseconds
+GSM_FRAME_US = 4615
 
-# 51-multiframe structure for TS0 (combined CCCH+SDCCH/4)
-# FCCH: 0,10,20,30,40  SCH: 1,11,21,31,41  BCCH: 2-5  CCCH: 6-9,12-15,16-19,...
 FCCH_FN51 = {0, 10, 20, 30, 40}
 SCH_FN51  = {1, 11, 21, 31, 41}
 
-# FCCH burst: all zeros (frequency correction)
 FCCH_BURST = bytes(148)
 
-# SCH training sequence (midamble bits 42..105)
 SCH_TRAIN = [
     1,0,1,1,1,0,0,1,0,1,1,0,0,0,1,0,0,0,0,0,0,1,0,0,0,0,0,0,1,1,1,1,
     0,0,1,0,1,1,0,1,0,1,0,0,0,1,0,1,0,1,1,1,0,1,1,0,0,0,0,1,1,0,1,1,
 ]
 
-# Normal burst fill pattern (idle CCCH = 2B padding)
 IDLE_L2 = bytes([0x03, 0x03, 0x01, 0x2B] + [0x2B] * 19)  # 23 bytes
 
 
+def gsm_crc10(bits):
+    """GSM 05.03 SCH CRC-10: g(D) = D^10+D^8+D^6+D^5+D^4+D^2+D+1 = 0x175 << shifted"""
+    # Polynomial: x^10 + x^8 + x^6 + x^5 + x^4 + x^2 + x + 1
+    poly = 0x537  # 10000101110111 — bit-reversed representation not needed, use shift register
+    reg = 0
+    for b in bits:
+        feedback = ((reg >> 9) ^ b) & 1
+        reg = ((reg << 1) & 0x3FF)
+        if feedback:
+            reg ^= 0x175  # generator polynomial without leading x^10
+    # Return 10 CRC bits (MSB first)
+    return [(reg >> (9 - i)) & 1 for i in range(10)]
+
+
+def gsm_fire_code_40(bits):
+    """GSM 05.03 fire code CRC-40: g(D) = D^40+D^26+D^23+D^17+D^3+1"""
+    # 40-bit shift register
+    poly = (1 << 26) | (1 << 23) | (1 << 17) | (1 << 3) | 1  # without D^40
+    reg = 0
+    for b in bits:
+        feedback = ((reg >> 39) ^ b) & 1
+        reg = ((reg << 1) & ((1 << 40) - 1))
+        if feedback:
+            reg ^= poly
+    return [(reg >> (39 - i)) & 1 for i in range(40)]
+
+
 def make_sch_burst(bsic, fn):
-    """Build a 148-bit SCH burst with encoded BSIC+FN."""
+    """Build a 148-bit SCH burst with proper CRC-10 (GSM 05.03)."""
     t1 = fn // (26 * 51)
     t2 = fn % 26
     t3 = fn % 51
@@ -68,8 +79,11 @@ def make_sch_burst(bsic, fn):
     for i in range(2, -1, -1):
         info.append((t3p >> i) & 1)
 
-    # CRC (10 bits) + tail (4 bits) — simplified: zeros
-    full = info + [0] * 10 + [0] * 4  # 39 bits
+    # CRC-10 (real GSM 05.03)
+    crc = gsm_crc10(info)
+
+    # 25 info + 10 CRC + 4 tail = 39 bits
+    full = info + crc + [0] * 4
 
     # Convolutional encode (rate 1/2, K=5)
     reg = 0
@@ -79,7 +93,6 @@ def make_sch_burst(bsic, fn):
         g0 = ((reg >> 0) ^ (reg >> 3) ^ (reg >> 4)) & 1
         g1 = ((reg >> 0) ^ (reg >> 1) ^ (reg >> 3) ^ (reg >> 4)) & 1
         coded.extend([g0, g1])
-    # 78 coded bits → split into 2x39
 
     # SCH burst: 3 tail + 39 coded + 64 train + 39 coded + 3 tail + guard
     burst = [0]*3 + coded[:39] + SCH_TRAIN + coded[39:78] + [0]*3
@@ -89,7 +102,6 @@ def make_sch_burst(bsic, fn):
 
 def make_normal_burst(data_bits_114, tsc=0):
     """Build a 148-bit normal burst from 114 coded data bits."""
-    # TSC midambles
     TSC_BITS = [
         [0,0,1,0,0,1,0,1,1,1,0,0,0,0,1,0,0,0,1,0,0,1,0,1,1,1],
         [0,0,1,0,1,1,0,1,1,1,0,1,1,1,1,0,0,0,1,0,1,1,0,1,1,1],
@@ -109,7 +121,7 @@ def make_normal_burst(data_bits_114, tsc=0):
 
 
 def encode_l2_to_coded(l2_bytes):
-    """Encode 23 L2 bytes → 456 coded bits (conv code), return 4x114 interleaved."""
+    """Encode 23 L2 bytes -> 456 coded bits with real fire code CRC-40."""
     # 184 info bits
     info = []
     for byte in l2_bytes[:23]:
@@ -117,10 +129,13 @@ def encode_l2_to_coded(l2_bytes):
             info.append((byte >> i) & 1)
     info = (info + [0]*184)[:184]
 
-    # + 40 parity (zeros simplified) + 4 tail
-    full = info + [0]*40 + [0]*4  # 228 bits
+    # Fire code CRC-40 (real GSM 05.03)
+    parity = gsm_fire_code_40(info)
 
-    # Conv encode
+    # 184 info + 40 parity + 4 tail = 228 bits
+    full = info + parity + [0]*4
+
+    # Convolutional encode (rate 1/2, K=5)
     reg = 0
     coded = []
     for b in full:
@@ -142,15 +157,12 @@ class GSMClock:
         self.bsic = bsic
         self.arfcn = arfcn
         self.fn = 0
-        self.targets = targets  # list of (ip, port)
+        self.targets = targets
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.running = True
-
-        # Pre-encode idle CCCH burst data (4 bursts per block)
         self.idle_bursts_114 = encode_l2_to_coded(IDLE_L2)
 
     def send_burst(self, tn, fn, burst_bytes):
-        """Send air burst to all targets."""
         pkt = struct.pack(">BI", tn, fn) + burst_bytes[:148]
         for target in self.targets:
             try:
@@ -159,12 +171,12 @@ class GSMClock:
                 pass
 
     def run(self):
-        frame_ns = GSM_FRAME_US * 1000  # nanoseconds
+        frame_ns = GSM_FRAME_US * 1000
         if self.rate != 1.0:
             frame_ns = int(frame_ns / self.rate)
 
         print(f"gsm-clock: BSIC={self.bsic} ARFCN={self.arfcn}", flush=True)
-        print(f"gsm-clock: rate={self.rate}x → {frame_ns/1e6:.3f}ms/frame", flush=True)
+        print(f"gsm-clock: rate={self.rate}x -> {frame_ns/1e6:.3f}ms/frame", flush=True)
         print(f"gsm-clock: targets={self.targets}", flush=True)
         print(f"gsm-clock: starting TDMA...", flush=True)
 
@@ -175,40 +187,32 @@ class GSMClock:
             fn = self.fn
             fn51 = fn % 51
 
-            # TS0: generate appropriate burst based on 51-multiframe position
             if fn51 in FCCH_FN51:
                 self.send_burst(0, fn, FCCH_BURST)
             elif fn51 in SCH_FN51:
                 sch = make_sch_burst(self.bsic, fn)
                 self.send_burst(0, fn, sch)
             else:
-                # BCCH (2-5) or CCCH (6-9, 12-15, ...) or idle
-                # Determine burst index within 4-burst block
                 block_starts = [2, 6, 12, 16, 22, 26, 32, 36, 42, 46]
                 burst_idx = None
                 for start in block_starts:
                     if start <= fn51 < start + 4:
                         burst_idx = fn51 - start
                         break
-
                 if burst_idx is not None:
                     coded_114 = self.idle_bursts_114[burst_idx]
                     nb = make_normal_burst(coded_114, tsc=self.bsic & 0x7)
                     self.send_burst(0, fn, nb)
-                # else: idle frame (50), send nothing
 
-            # Advance FN
             self.fn = (self.fn + 1) % GSM_HYPERFRAME
             frames_sent += 1
 
-            # Log periodically
             if frames_sent <= 5 or frames_sent % 5000 == 0:
                 elapsed_s = (time.monotonic_ns() - t_start) / 1e9
                 fps = frames_sent / elapsed_s if elapsed_s > 0 else 0
                 print(f"gsm-clock: FN={fn} frames={frames_sent} "
                       f"elapsed={elapsed_s:.1f}s fps={fps:.1f}", flush=True)
 
-            # Precise sleep: target absolute time for next frame
             target_ns = t_start + frames_sent * frame_ns
             now_ns = time.monotonic_ns()
             sleep_ns = target_ns - now_ns
@@ -218,20 +222,15 @@ class GSMClock:
 
 def main():
     ap = argparse.ArgumentParser(description="Master GSM TDMA clock")
-    ap.add_argument("-r", "--rate", type=float, default=0.1,
-                    help="Clock rate (1.0=real GSM, 0.1=10x slow for QEMU, default: 0.1)")
-    ap.add_argument("--bsic", type=int, default=63,
-                    help="BSIC (default: 63)")
-    ap.add_argument("--arfcn", type=int, default=100,
-                    help="ARFCN (default: 100)")
-    ap.add_argument("--ip", default="127.0.0.1",
-                    help="Target IP (default: 127.0.0.1)")
+    ap.add_argument("-r", "--rate", type=float, default=0.1)
+    ap.add_argument("--bsic", type=int, default=63)
+    ap.add_argument("--arfcn", type=int, default=100)
+    ap.add_argument("--ip", default="127.0.0.1")
     args = ap.parse_args()
 
-    # Standard port scheme only: 6700 (transceiver MS-side), 6800 (bridge/mobile)
     targets = [
-        (args.ip, 6700),  # transceiver MS-side air → CLK IND → 5800
-        (args.ip, 6800),  # bridge/mobile DL air
+        (args.ip, 6700),
+        (args.ip, 6800),
     ]
 
     clock = GSMClock(args.rate, args.bsic, args.arfcn, targets)
