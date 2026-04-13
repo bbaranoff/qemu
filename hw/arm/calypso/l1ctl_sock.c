@@ -27,7 +27,7 @@
 #define SERCOMM_DLCI_L1CTL 5
 
 /* L1CTL socket path */
-#define L1CTL_SOCK_PATH    "/tmp/osmocom_l2_tmp"
+#define L1CTL_SOCK_PATH    "/tmp/osmocom_l2"
 
 #define L1CTL_LOG(fmt, ...) \
     fprintf(stderr, "[l1ctl-sock] " fmt "\n", ##__VA_ARGS__)
@@ -186,8 +186,18 @@ static void l1ctl_client_readable(void *opaque)
     L1CTLSock *s = (L1CTLSock *)opaque;
 
     uint8_t tmp[4096];
-    ssize_t n = recv(s->cli_fd, tmp, sizeof(tmp), 0);
-    if (n <= 0) {
+    ssize_t n = recv(s->cli_fd, tmp, sizeof(tmp), MSG_DONTWAIT);
+    if (n < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+            return;  /* no data available yet */
+        L1CTL_LOG("client recv error: %s", strerror(errno));
+        qemu_set_fd_handler(s->cli_fd, NULL, NULL, NULL);
+        close(s->cli_fd);
+        s->cli_fd = -1;
+        s->lp_len = 0;
+        return;
+    }
+    if (n == 0) {
         L1CTL_LOG("client disconnected");
         qemu_set_fd_handler(s->cli_fd, NULL, NULL, NULL);
         close(s->cli_fd);
@@ -217,6 +227,14 @@ static void l1ctl_client_readable(void *opaque)
         if (flen > 0 && s->uart) {
             L1CTL_LOG("RX←mobile: len=%d type=0x%02x → sercomm %d bytes",
                       msglen, payload[0], flen);
+            /* Hex dump of sercomm frame being injected */
+            {
+                fprintf(stderr, "[l1ctl-sock] INJECT %d bytes:", flen);
+                for (int j = 0; j < flen && j < 32; j++)
+                    fprintf(stderr, " %02x", frame[j]);
+                if (flen > 32) fprintf(stderr, " ...");
+                fprintf(stderr, "\n");
+            }
             calypso_uart_receive(s->uart, frame, flen);
         }
 
@@ -303,4 +321,36 @@ void l1ctl_sock_init(CalypsoUARTState *uart, const char *path)
 
     qemu_set_fd_handler(s->srv_fd, l1ctl_accept_cb, NULL, s);
     L1CTL_LOG("listening on %s", path);
+}
+
+/* ---- Manual poll (called from TDMA tick) ---- */
+
+void l1ctl_sock_poll(void)
+{
+    L1CTLSock *s = &g_l1ctl;
+
+    /* Try to accept a pending client */
+    if (s->srv_fd >= 0 && s->cli_fd < 0) {
+        int fd = accept(s->srv_fd, NULL, NULL);
+        if (fd >= 0) {
+            int flags = fcntl(fd, F_GETFL);
+            fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+            s->cli_fd = fd;
+            s->lp_len = 0;
+            s->sc_state = SC_IDLE;
+            s->sc_len = 0;
+            qemu_set_fd_handler(fd, l1ctl_client_readable, NULL, s);
+            L1CTL_LOG("client connected via poll (fd=%d)", fd);
+        }
+    }
+
+    /* Try to read from connected client */
+    if (s->cli_fd >= 0) {
+        l1ctl_client_readable(s);
+    }
+}
+
+bool l1ctl_client_active(void)
+{
+    return g_l1ctl.cli_fd >= 0;
 }

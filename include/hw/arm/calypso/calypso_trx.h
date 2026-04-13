@@ -83,8 +83,8 @@
 #define ULPD_GAUGING_CTRL     0x24
 #define ULPD_GSM_TIMER        0x28
 
-/* GSM timing — 10x slower for emulation */
-#define GSM_TDMA_NS           46150000
+/* GSM timing — real 4.615ms TDMA frame period */
+#define GSM_TDMA_NS           4615000
 #define GSM_HYPERFRAME        2715648
 
 /* DSP boot */

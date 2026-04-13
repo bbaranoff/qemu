@@ -224,7 +224,7 @@ static void calypso_soc_realize(DeviceState *dev, Error **errp)
         /* L1CTL socket: sercomm↔L1CTL relay for OsmocomBB mobile */
         {
             const char *l1ctl_path = getenv("L1CTL_SOCK");
-            l1ctl_sock_init(&s->uart_modem, l1ctl_path ? l1ctl_path : "/tmp/osmocom_l2_1");
+            l1ctl_sock_init(&s->uart_modem, l1ctl_path ? l1ctl_path : "/tmp/osmocom_l2");
         }
     }
 

@@ -13,7 +13,14 @@
 #include "hw/arm/calypso/calypso_trx.h"
 #include "hw/arm/calypso/calypso_uart.h"
 #include "hw/arm/calypso/calypso_c54x.h"
+#include "hw/arm/calypso/calypso_bsp.h"
+#include "hw/arm/calypso/calypso_iota.h"
 #include "chardev/char-fe.h"
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 extern CalypsoUARTState *g_uart_modem;
 
@@ -26,7 +33,7 @@ extern CalypsoUARTState *g_uart_modem;
 #define DB_W_D_TASK_D    0
 #define DB_W_D_TASK_U    2
 #define DB_W_D_TASK_MD   4
-#define PM_RAW_STRONG    4864
+/* No PM/FB/SB stubs — the DSP handles everything via shared API RAM */
 
 typedef struct CalypsoTRX {
     qemu_irq *irqs;
@@ -52,13 +59,16 @@ typedef struct CalypsoTRX {
     QEMUTimer   *dsp_timer;
     uint32_t     fn;
     bool         tdma_running;
-    uint32_t     fb_tasks;
-    uint32_t     sb_tasks;
     uint8_t      sync_bsic;
     bool         fw_patched;
 
     /* C54x DSP emulator */
     C54xState   *dsp;
+    bool         dsp_init_done;  /* DSP reached first IDLE after boot */
+
+    /* CLK UDP: send each TDMA tick to bridge so it's clock-slave */
+    int          clk_fd;
+    struct sockaddr_in clk_peer;
 } CalypsoTRX;
 
 static CalypsoTRX *g_trx;
@@ -84,6 +94,11 @@ static void calypso_fw_patch(CalypsoTRX *s)
     if (val == 0xeafffffe) { uint32_t p[2] = {0xe121f008, 0xeaffffdf}; cpu_physical_memory_write(0x0082c34c, p, 8); TRX_LOG("FW: talloc retry"); }
     cpu_physical_memory_read(0x00821f98, &val, 4);
     if (val == 0xeafffffe) { uint32_t v = 0xe321f000; cpu_physical_memory_write(0x00821f94, &v, 4); TRX_LOG("FW: abort irqs"); }
+    /* sim_handler (0x0082266c) blocks the main loop waiting for SIM
+     * responses that never come in our emulation. Patch it to return
+     * immediately (BX LR) so l1a_l23_handler() can process L1CTL. */
+    cpu_physical_memory_read(0x0082266c, &val, 4);
+    if (val && val != bx_lr) { cpu_physical_memory_write(0x0082266c, &bx_lr, 4); TRX_LOG("FW: sim_handler nop"); }
 }
 void calypso_fw_patch_apply(void) { if (g_trx) calypso_fw_patch(g_trx); }
 
@@ -95,7 +110,7 @@ static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
     uint64_t val = (size == 2) ? s->dsp_ram[offset/2] :
                    (size == 4) ? (s->dsp_ram[offset/2] | ((uint32_t)s->dsp_ram[offset/2+1] << 16)) :
                    ((uint8_t *)s->dsp_ram)[offset];
-    /* DSP boot */
+    /* DSP boot handshake: firmware polls DL_STATUS until it reads BOOT */
     if (offset == DSP_DL_STATUS_ADDR && !s->dsp_booted) {
         if (++s->boot_frame > 3) {
             s->dsp_ram[DSP_DL_STATUS_ADDR/2] = DSP_DL_STATUS_BOOT;
@@ -106,12 +121,8 @@ static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
             val = DSP_DL_STATUS_BOOT;
         }
     }
-    /* PM done flags */
-    if (offset == 0x003E || offset == 0x0016) val = 1;
-    /* d_fb_det */
-    if (offset == 0x01F0 && s->fb_tasks >= 1) val = 1;
-    /* PM level */
-    if (offset == 0x01AA && s->dsp_booted) val = PM_RAW_STRONG;
+    /* No stubs — the DSP writes results into dsp_ram (shared API RAM)
+     * and the firmware reads them directly. No intercepts. */
     return val;
 }
 
@@ -123,52 +134,29 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
     else if (size == 4) { s->dsp_ram[offset/2] = value; s->dsp_ram[offset/2+1] = value >> 16; }
     else ((uint8_t *)s->dsp_ram)[offset] = value;
 
-    /* Intercept DSP tasks */
-    {
-        hwaddr w0 = DSP_API_W_PAGE0 + DB_W_D_TASK_MD * 2;
-        hwaddr w1 = DSP_API_W_PAGE1 + DB_W_D_TASK_MD * 2;
-        hwaddr w0d = DSP_API_W_PAGE0 + DB_W_D_TASK_D * 2;
-        hwaddr w1d = DSP_API_W_PAGE1 + DB_W_D_TASK_D * 2;
-        if ((offset == w0 || offset == w1 || offset == w0d || offset == w1d) && value != 0) {
-            uint16_t pm = PM_RAW_STRONG;
-            if (value == 5) {
-                s->dsp_ram[0x01F0/2] = 1;
-                s->dsp_ram[0x01F4/2] = 0;
-                s->dsp_ram[0x01F6/2] = pm;
-                s->dsp_ram[0x01F8/2] = 0;
-                s->dsp_ram[0x01FA/2] = 100;
-                s->fb_tasks++;
-            } else if (value == 6) {
-                uint16_t *rp = s->dsp_page ? &s->dsp_ram[0x0078/2] : &s->dsp_ram[0x0050/2];
-                uint32_t fn = s->fn;
-                uint8_t bsic = s->sync_bsic;
-                uint32_t t1 = fn / (26*51), t2 = fn % 26, t3 = fn % 51;
-                uint32_t t3p = (t3 >= 1) ? (t3-1)/10 : 0;
-                uint32_t sb = ((uint32_t)(bsic&0x3F)<<2)|((t2&0x1F)<<18)|((t1&1)<<23)|(((t1>>1)&0xFF)<<8)|(((t1>>9)&1)<<0)|(((t1>>10)&1)<<1)|((t3p&1)<<24)|(((t3p>>1)&1)<<16)|(((t3p>>2)&1)<<17);
-                rp[15]=0; rp[16]=0; rp[17]=0; rp[18]=sb&0xFFFF; rp[19]=sb>>16;
-                s->dsp_ram[0x01F4/2]=0; s->dsp_ram[0x01F6/2]=pm; s->dsp_ram[0x01F8/2]=0; s->dsp_ram[0x01FA/2]=100;
-                s->sb_tasks++;
-            }
-            s->dsp_ram[0x0060/2]=pm; s->dsp_ram[0x0062/2]=pm; s->dsp_ram[0x0064/2]=pm;
-            s->dsp_ram[0x0088/2]=pm; s->dsp_ram[0x008A/2]=pm; s->dsp_ram[0x008C/2]=pm;
+    /* Debug: log task-related writes to write pages (d_task_d/u/md/ra) */
+    if ((offset == 0x0000 || offset == 0x0004 || offset == 0x0008 ||
+         offset == 0x000E || offset == 0x0028 || offset == 0x002C ||
+         offset == 0x0030 || offset == 0x0036) && value != 0) {
+        static int wp_log = 0;
+        if (++wp_log <= 100)
+            TRX_LOG("DSP WR [0x%04x] = 0x%04x (sz=%d) fn=%u",
+                    (unsigned)offset, (unsigned)value, size, s->fn);
+    }
 
-            /* NB downlink: fill a_cd in NDB with dummy decoded L2 frame.
-             * From si4-working: a_cd[0] = NDB + 252 words = ARM 0x03A0
-             * a_cd[0]=status, a_cd[2]=biterr, a_cd[3..14]=23 bytes L2 (1 byte/word) */
-            if (offset == w0d || offset == w1d) {
-                #define NDB_A_CD  (0x03A0/2)
-                s->dsp_ram[NDB_A_CD + 0] = 0;  /* status: no fire error */
-                s->dsp_ram[NDB_A_CD + 1] = 0;
-                s->dsp_ram[NDB_A_CD + 2] = 0;  /* biterr = 0 */
-                /* 23 bytes L2: dummy fill frame (GSM idle) */
-                static const uint8_t idle_frame[23] = {
-                    0x03, 0x03, 0x01, 0x2B, 0x2B, 0x2B, 0x2B, 0x2B,
-                    0x2B, 0x2B, 0x2B, 0x2B, 0x2B, 0x2B, 0x2B, 0x2B,
-                    0x2B, 0x2B, 0x2B, 0x2B, 0x2B, 0x2B, 0x2B
-                };
-                for (int j = 0; j < 23; j++)
-                    s->dsp_ram[NDB_A_CD + 3 + j] = idle_frame[j];
-            }
+    /* Log task writes for debugging — no interception, no faking.
+     * The DSP handles all tasks via shared API RAM. */
+    {
+        hwaddr w0_md = DSP_API_W_PAGE0 + DB_W_D_TASK_MD * 2;
+        hwaddr w1_md = DSP_API_W_PAGE1 + DB_W_D_TASK_MD * 2;
+        hwaddr w0_d  = DSP_API_W_PAGE0 + DB_W_D_TASK_D * 2;
+        hwaddr w1_d  = DSP_API_W_PAGE1 + DB_W_D_TASK_D * 2;
+        if ((offset == w0_md || offset == w1_md ||
+             offset == w0_d  || offset == w1_d) && value != 0) {
+            static int task_log = 0;
+            if (++task_log <= 100)
+                TRX_LOG("ARM TASK WR [0x%04x] = %u fn=%u",
+                        (unsigned)offset, (unsigned)value, s->fn);
         }
     }
     /* DSP page */
@@ -191,6 +179,7 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
             if (s->dsp) {
                 c54x_reset(s->dsp);
                 s->dsp->running = true;
+                s->dsp_init_done = false;
                 s->dsp_ram[0x01A8/2] = 0;
                 TRX_LOG("C54x DSP reset — boot via TDMA ticks");
             }
@@ -210,23 +199,79 @@ static void calypso_dsp_done(void *opaque) {
     s->tpu_regs[TPU_CTRL/2] &= ~TPU_CTRL_EN;
 
     /* Hardware DMA: copy API write page → DSP DARAM 0x0586.
-     * On real Calypso, TPU scenario triggers this DMA transfer. */
+     * Triggered by firmware writing TPU_CTRL with EN bit (dsp_end_scenario).
+     * This is the ONLY place DMA happens — same as real Calypso. */
     if (s->dsp && s->dsp_ram[0x01A8/2] != 0) {
         uint16_t page = s->dsp_ram[0x01A8/2] & 1;
         uint16_t *wp = page ?
             &s->dsp_ram[DSP_API_W_PAGE1/2] : &s->dsp_ram[DSP_API_W_PAGE0/2];
-        s->dsp->data[0x0584] = s->dsp_ram[0x01A8/2]; /* d_dsp_page */
-        s->dsp->data[0x0585] = s->fn & 0xFFFF;       /* frame number */
+
+        /* Log proof that ARM wrote tasks before DMA */
+        uint16_t task_d  = wp[DB_W_D_TASK_D];
+        uint16_t task_u  = wp[DB_W_D_TASK_U];
+        uint16_t task_md = wp[DB_W_D_TASK_MD];
+        if (task_d || task_u || task_md) {
+            static int dma_task_log = 0;
+            if (++dma_task_log <= 50)
+                TRX_LOG("DMA proof: ARM wrote task_d=%u task_u=%u task_md=%u page=%u fn=%u",
+                        task_d, task_u, task_md, page, s->fn);
+        }
+
+        s->dsp->data[0x0584] = s->dsp_ram[0x01A8/2];
+        s->dsp->data[0x0585] = s->fn & 0xFFFF;
         for (int i = 0; i < 20; i++)
             s->dsp->data[0x0586 + i] = wp[i];
-        /* Sync d_dsp_page in DSP API RAM view */
         if (s->dsp->api_ram)
             s->dsp->api_ram[0x08D4 - C54X_API_BASE] = s->dsp_ram[0x01A8/2];
     }
 
-    qemu_irq_pulse(s->irqs[CALYPSO_IRQ_API]);
+    /* Execute TPU RAM micro-instructions (TSP bus commands).
+     * The firmware wrote a TPU scenario into TPU RAM. We scan it for
+     * MOVE instructions that write to TSP registers. When we see
+     * TSP_CTRL2 with WR bit, we send the TX byte to IOTA. */
+    {
+        uint8_t tsp_tx1 = 0;
+        uint8_t tsp_ctrl1 = 0;
+        for (int i = 0; i < CALYPSO_TPU_RAM_SIZE / 2; i++) {
+            uint16_t insn = s->tpu_ram[i];
+            uint8_t opcode = (insn >> 13) & 0x7;
+            if (opcode == 0) break;  /* SLEEP — end of scenario */
+            if (opcode == 4) {
+                /* MOVE: addr = bits 4:0, data = bits 12:5 */
+                uint8_t addr = insn & 0x1F;
+                uint8_t data = (insn >> 5) & 0xFF;
+                if (addr == 0x04) tsp_tx1 = data;     /* TPUI_TX_1 */
+                if (addr == 0x00) tsp_ctrl1 = data;    /* TPUI_TSP_CTRL1 */
+                if (addr == 0x01 && (data & 0x02)) {   /* TPUI_TSP_CTRL2 WR bit */
+                    /* TSP write: send tsp_tx1 to the device.
+                     * Device 0 (TWL3025): 7-bit data = tsp_tx1.
+                     * This byte contains BDLON/BDLENA/BULENA bits. */
+                    uint8_t dev = (tsp_ctrl1 >> 5) & 0x07;
+                    if (dev == 0) {
+                        calypso_iota_tsp_write(tsp_tx1, 0);
+                    }
+                }
+            }
+        }
+    }
+
+    qemu_irq_raise(s->irqs[CALYPSO_IRQ_API]);
 }
 static void calypso_tdma_start(CalypsoTRX *s);
+
+/* Called by calypso_tint0.c on each TDMA frame tick.
+ * Forward declaration — actual tdma_tick is defined below. */
+static void calypso_tdma_tick(void *opaque);
+/* Prototype visible to tint0 (declared extern there) */
+void calypso_tint0_do_tick(uint32_t fn);
+void calypso_tint0_do_tick(uint32_t fn)
+{
+    if (!g_trx) return;
+    g_trx->fn = fn;
+    /* d_dsp_page is toggled by the DSP firmware itself (PC=0x1748),
+     * NOT by ARM or the emulator. Don't touch it here. */
+    calypso_tdma_tick(g_trx);
+}
 
 static uint64_t calypso_tpu_read(void *o, hwaddr off, unsigned sz) {
     CalypsoTRX *s=o; if (off==TPU_IT_DSP_PG) return s->dsp_page;
@@ -234,9 +279,19 @@ static uint64_t calypso_tpu_read(void *o, hwaddr off, unsigned sz) {
 }
 static void calypso_tpu_write(void *o, hwaddr off, uint64_t val, unsigned sz) {
     CalypsoTRX *s=o; if (off/2<CALYPSO_TPU_SIZE/2) s->tpu_regs[off/2]=val;
+    if (off==TPU_CTRL) {
+        static int tpu_log = 0;
+        if (++tpu_log <= 50)
+            TRX_LOG("TPU_CTRL WR val=0x%04x (EN=%d DSP_EN=%d) fn=%u",
+                    (unsigned)val, !!(val&TPU_CTRL_EN), !!(val&TPU_CTRL_DSP_EN), s->fn);
+    }
     if (off==TPU_CTRL && (val&TPU_CTRL_EN)) {
         s->tpu_regs[TPU_CTRL/2] &= ~(TPU_CTRL_EN|TPU_CTRL_IDLE);
-        timer_mod_ns(s->dsp_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)+1);
+        /* DMA immediately — no timer delay. The firmware has already
+         * finished writing the write page before setting TPU_CTRL_EN.
+         * A 1ns timer caused a race condition where the DMA would fire
+         * before the write page was fully populated. */
+        calypso_dsp_done(s);
     }
     if (off==TPU_INT_CTRL && !(val&ICTRL_MCU_FRAME) && !s->tdma_running) calypso_tdma_start(s);
     if (off==TPU_IT_DSP_PG) s->dsp_page=val&1;
@@ -279,39 +334,78 @@ static void calypso_frame_irq_lower(void *o){qemu_irq_lower(((CalypsoTRX*)o)->ir
 static void calypso_tdma_tick(void *opaque) {
     CalypsoTRX *s = opaque;
     s->fn = (s->fn+1) % GSM_HYPERFRAME;
-    if (g_uart_modem) { calypso_uart_poll_backend(g_uart_modem); calypso_uart_kick_rx(g_uart_modem); }
-    /* PM every frame — plant in read page a_pm only, NOT in NDB fb_det area */
-    { uint16_t pm=PM_RAW_STRONG;
-      for(int i=0;i<4;i++){s->dsp_ram[(0x0060+i*2)/2]=pm;s->dsp_ram[(0x0088+i*2)/2]=pm;}
-      s->dsp_ram[213]=pm; }
-    /* Bursts arrive via PTY sercomm DLCI 4 → calypso_uart_receive intercept */
-    /* Check for UL burst to send */
-    calypso_trx_tx_burst_poll();
 
-    /* Tick C54x DSP.
-     * SINT17 only fires when firmware set TPU_CTRL_DSP_EN.
-     * DSP runs only when not IDLE (boot or post-interrupt). */
-    if (s->dsp && s->dsp->running) {
-        bool was_active = !s->dsp->idle;
-        /* SINT17 raise: firmware set DSP_EN → wake DSP */
+    /* ── 0. Send CLK tick to bridge (QEMU is clock master) ── */
+    if (s->clk_fd >= 0) {
+        uint8_t pkt[4];
+        pkt[0] = (s->fn >> 24) & 0xFF;
+        pkt[1] = (s->fn >> 16) & 0xFF;
+        pkt[2] = (s->fn >>  8) & 0xFF;
+        pkt[3] =  s->fn        & 0xFF;
+        sendto(s->clk_fd, pkt, 4, 0,
+               (struct sockaddr *)&s->clk_peer, sizeof(s->clk_peer));
+    }
+
+    /* ── 1. UART poll: deliver pending chardev bytes to firmware ── */
+    if (g_uart_modem) {
+        calypso_uart_poll_backend(g_uart_modem);
+        calypso_uart_kick_rx(g_uart_modem);
+    }
+
+    /* ── 2. DSP boot phase ── */
+    if (s->dsp && s->dsp->running && !s->dsp_init_done) {
+        if (!s->dsp->idle)
+            c54x_run(s->dsp, 256000);
+        if (s->dsp->idle) {
+            s->dsp_init_done = true;
+            TRX_LOG("DSP init complete (first IDLE reached)");
+        }
+    }
+
+    /* ── 3. DMA is NOT done here ──
+     * On real Calypso, the TPU scenario triggers the DMA when the
+     * firmware writes TPU_CTRL with EN bit. This happens in
+     * calypso_dsp_done() (the TPU_CTRL_EN timer callback).
+     * Doing DMA here would copy a STALE write page because the
+     * firmware hasn't written the new tasks yet (it writes them
+     * in l1s_compl() which runs in the IRQ4 handler AFTER this tick). */
+
+    /* ── 4. DSP frame interrupt ──
+     * Send INT3 only when firmware requests it via TPU_CTRL_DSP_EN.
+     * Sending INT3 every frame causes stack overflow (CALLD loop). */
+    if (s->dsp && s->dsp->running && s->dsp_init_done) {
+        bool was_idle = s->dsp->idle;
+
         if (s->tpu_regs[TPU_CTRL/2] & TPU_CTRL_DSP_EN) {
-            c54x_interrupt(s->dsp, C54X_INT_SINT17);
+            c54x_interrupt_ex(s->dsp, C54X_INT_FRAME_VEC, C54X_INT_FRAME_BIT);
             s->tpu_regs[TPU_CTRL/2] &= ~TPU_CTRL_DSP_EN;
         }
-        /* Run DSP if active */
+
+        /* ── 5. Run DSP ── */
         if (!s->dsp->idle) {
-            c54x_run(s->dsp, 1000000);
+            c54x_run(s->dsp, 256000);
         }
-        /* API IRQ raise: DSP just went IDLE → signal ARM */
-        if (was_active && s->dsp->idle) {
+
+        /* Do NOT clear tasks here — the firmware's l1s_compl() does
+         * dsp_api_memset() on the write page at the start of each frame,
+         * before tdma_sched_execute() writes new tasks. Clearing here
+         * would erase tasks that the scheduler just programmed. */
+
+        /* Only pulse API IRQ when DSP naturally reaches IDLE. */
+        if (!was_idle && s->dsp->idle) {
             qemu_irq_raise(s->irqs[CALYPSO_IRQ_API]);
         }
     }
 
-    /* TPU FRAME raise: firmware TDMA scheduler */
+    /* ── 7. TPU FRAME IRQ → ARM L1 scheduler ── */
     qemu_irq_raise(s->irqs[CALYPSO_IRQ_TPU_FRAME]);
-    timer_mod_ns(s->frame_irq_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)+1000000);
-    if (s->tdma_running) timer_mod_ns(s->tdma_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)+GSM_TDMA_NS);
+    timer_mod_ns(s->frame_irq_timer,
+                 qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000);
+
+    /* ── 8. Re-arm TDMA timer ── */
+    if (s->tdma_running)
+        timer_mod_ns(s->tdma_timer,
+                     qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + GSM_TDMA_NS);
 }
 
 static void calypso_tdma_start(CalypsoTRX *s)
@@ -342,32 +436,13 @@ void calypso_trx_rx_burst(const uint8_t *data, int len)
     /* Sync FN */
     s->fn = fn % GSM_HYPERFRAME;
 
-    /* Store burst in read page for NB tasks.
-     * d_burst_d at word 1 of read page, burst data follows. */
-    uint16_t *rp = s->dsp_page ?
-        &s->dsp_ram[0x0078/2] : &s->dsp_ram[0x0050/2];
-
-    int nbits = len - 8;
-    if (nbits > 148) nbits = 148;
-
     static int rx_count = 0;
     if (++rx_count <= 5 || (rx_count % 1000) == 0)
         TRX_LOG("RX_BURST #%d TN=%d FN=%u len=%d", rx_count, tn, fn, len);
 
-    /* Convert soft bits to hard bits and store in NDB a_cd area */
-    uint16_t *ndb_cd = &s->dsp_ram[(0x01A8 + 0x1FC)/2]; /* NDB + a_cd offset */
-    /* Store burst count */
-    rp[1] = (uint16_t)(s->fn % 4); /* d_burst_d = burst index 0..3 */
-
-    /* a_serv_demod: TOA, PM, ANGLE, SNR */
-    rp[8]  = 0;              /* TOA */
-    rp[9]  = PM_RAW_STRONG;  /* PM */
-    rp[10] = 0;              /* ANGLE */
-    rp[11] = 100;            /* SNR */
-
+    /* No stubs — bursts go to BSP via UDP (calypso_bsp.c), not here.
+     * The DSP processes them and writes results to shared API RAM. */
     (void)tn;
-    (void)ndb_cd;
-    (void)nbits;
 }
 
 /* TX burst: send UL burst from DSP write page via UART TX as sercomm DLCI 4 */
@@ -444,6 +519,7 @@ void calypso_trx_init(MemoryRegion *sysmem, qemu_irq *irqs)
 {
     CalypsoTRX *s = g_new0(CalypsoTRX, 1);
     g_trx = s; s->irqs = irqs; s->sync_bsic = 7;
+    s->clk_fd = -1;
     TRX_LOG("=== Calypso hardware init ===");
 
     memory_region_init_io(&s->dsp_iomem,NULL,&calypso_dsp_ops,s,"calypso.dsp_api",CALYPSO_DSP_SIZE);
@@ -478,6 +554,7 @@ void calypso_trx_init(MemoryRegion *sysmem, qemu_irq *irqs)
             c54x_set_api_ram(s->dsp, s->dsp_ram);
             if (c54x_load_rom(s->dsp, rom_path) == 0) {
                 c54x_reset(s->dsp);
+                calypso_bsp_init(s->dsp);
                 TRX_LOG("C54x DSP loaded from %s", rom_path);
             } else {
                 TRX_LOG("C54x DSP ROM not found at %s", rom_path);
@@ -488,4 +565,19 @@ void calypso_trx_init(MemoryRegion *sysmem, qemu_irq *irqs)
     }
 
     TRX_LOG("=== Hardware ready ===");
+
+    /* CLK UDP: QEMU sends TDMA ticks to bridge on port 6700.
+     * Bridge is clock-slave — no independent timer. */
+    {
+        int fd = socket(AF_INET, SOCK_DGRAM, 0);
+        if (fd >= 0) {
+            fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+            s->clk_fd = fd;
+            memset(&s->clk_peer, 0, sizeof(s->clk_peer));
+            s->clk_peer.sin_family = AF_INET;
+            s->clk_peer.sin_port = htons(6700);
+            s->clk_peer.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            TRX_LOG("CLK UDP → bridge 127.0.0.1:6700");
+        }
+    }
 }

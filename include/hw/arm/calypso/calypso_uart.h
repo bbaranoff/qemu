@@ -97,5 +97,7 @@ void calypso_uart_force_init(CalypsoUARTState *s);
 /* L1CTL socket — sercomm↔L1CTL relay */
 void l1ctl_sock_init(CalypsoUARTState *uart, const char *path);
 void l1ctl_sock_uart_tx_byte(uint8_t byte);
+void l1ctl_sock_poll(void);
+bool l1ctl_client_active(void);
 
 #endif /* HW_CHAR_CALYPSO_UART_H */

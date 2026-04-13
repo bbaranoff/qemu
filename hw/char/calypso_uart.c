@@ -22,6 +22,7 @@
 #include "hw/qdev-properties-system.h"
 #include "hw/arm/calypso/calypso_uart.h"
 #include "hw/arm/calypso/calypso_trx.h"
+#include "hw/arm/calypso/sercomm_gate.h"
 
 /* Register offsets */
 #define REG_RBR_THR   0x00
@@ -169,12 +170,12 @@ static void calypso_uart_update_irq(CalypsoUARTState *s)
 
     s->iir = iir;
 
-    /* Level-sensitive: assert/deassert IRQ based on current state.
-     * The INTH tracks input levels directly. */
+    /* Force edge transition so INTH always sees the change.
+     * After IRQ_CTRL ack clears levels[n], a steady-high line
+     * needs a low→high pulse to re-register in the INTH. */
+    qemu_irq_lower(s->irq);
     if (want) {
         qemu_irq_raise(s->irq);
-    } else {
-        qemu_irq_lower(s->irq);
     }
 }
 
@@ -194,9 +195,21 @@ void calypso_uart_poll_backend(CalypsoUARTState *s)
 
 void calypso_uart_kick_tx(CalypsoUARTState *s)
 {
-    /* Do nothing — TX is driven by the firmware's sercomm_drv_start_tx.
-     * Forcing IER/pending from here causes an IER write storm. */
-    (void)s;
+    /* Re-check TX interrupt state — if THR is empty and IER TX enabled,
+     * fire the interrupt so firmware can write next byte. */
+    calypso_uart_update_irq(s);
+}
+
+void calypso_uart_inject_raw(CalypsoUARTState *s, const uint8_t *buf, int len)
+{
+    if (!s) return;
+    for (int i = 0; i < len; i++) {
+        fifo_push(s, buf[i]);
+    }
+    if (s->rx_count > 0) {
+        s->lsr |= LSR_DR;
+        calypso_uart_update_irq(s);
+    }
 }
 
 void calypso_uart_force_init(CalypsoUARTState *s)
@@ -235,7 +248,7 @@ static void calypso_uart_rx_poll(void *opaque)
               qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 50);
 }
 
-/* ---- Char backend callbacks ---- */
+/* ---- Control PTY callbacks ---- */
 
 int calypso_uart_can_receive(void *opaque)
 {
@@ -247,11 +260,17 @@ void calypso_uart_receive(void *opaque, const uint8_t *buf, int size)
 {
     CalypsoUARTState *s = (CalypsoUARTState *)opaque;
 
-    /* Debug: only log non-modem UART (modem is too verbose) */
-    if (!s->label || strcmp(s->label, "modem") != 0) {
+    /* RX = host → firmware. Modem UART tagged [PTY-MODEM-RX]
+     * (generic — actual DLCI dispatch is logged downstream by the
+     * sercomm parser, e.g. [gate] TRXC RX from PTY for DLCI 4). */
+    {
+        const char *tag = (s->label && !strcmp(s->label, "modem"))
+                          ? "PTY-MODEM-RX" : "UART";
+        const char *lbl = (s->label && !strcmp(s->label, "modem"))
+                          ? "" : s->label ? s->label : "?";
         fprintf(stderr,
-                "[UART:%s] <<<RX %d bytes from host (rx_count=%u free=%u):",
-                s->label ? s->label : "?",
+                "[%s%s%s] <<<RX %d bytes (rx_count=%u free=%u):",
+                tag, *lbl ? ":" : "", lbl,
                 size,
                 (unsigned)s->rx_count,
                 (unsigned)(CALYPSO_UART_RX_FIFO_SIZE - s->rx_count));
@@ -296,41 +315,11 @@ void calypso_uart_receive(void *opaque, const uint8_t *buf, int size)
         return;
     }
 
-    /* Sercomm DLCI routing on modem UART RX:
-     * DLCI 4 (burst data) -> calypso_trx DSP RAM injection
-     * Everything else -> FIFO for firmware */
-    if (s->label && !strcmp(s->label, "modem")) {
-        static uint8_t sc_buf[512];
-        static int sc_len = 0;
-        static int sc_state = 0;
-        for (int i = 0; i < size; i++) {
-            uint8_t b = buf[i];
-            if (sc_state == 0) {
-                if (b == 0x7E) { sc_state = 1; sc_len = 0; }
-                else { fifo_push(s, b); }
-            } else if (sc_state == 2) {
-                if (sc_len < (int)sizeof(sc_buf)) sc_buf[sc_len++] = b ^ 0x20;
-                sc_state = 1;
-            } else {
-                if (b == 0x7E) {
-                    if (sc_len >= 2 && sc_buf[0] == 4) {
-                        calypso_trx_rx_burst(&sc_buf[2], sc_len - 2);
-                    } else if (sc_len > 0) {
-                        fifo_push(s, 0x7E);
-                        for (int j = 0; j < sc_len; j++) fifo_push(s, sc_buf[j]);
-                        fifo_push(s, 0x7E);
-                    }
-                    sc_len = 0;
-                } else if (b == 0x7D) {
-                    sc_state = 2;
-                } else {
-                    if (sc_len < (int)sizeof(sc_buf)) sc_buf[sc_len++] = b;
-                }
-            }
-        }
-    } else {
-        for (int i = 0; i < size; i++) { fifo_push(s, buf[i]); }
-    }
+    /* Modem UART: parse sercomm and push every DLCI to the firmware
+     * UART RX FIFO (the firmware's own sercomm parser then dispatches
+     * by DLCI). TRXC is NOT handled here — bridge.py answers it
+     * locally on UDP 5701, QEMU never sees it. */
+    sercomm_gate_feed(s, buf, size);
 
     if (s->rx_count > 0) {
         s->lsr |= LSR_DR;
@@ -359,7 +348,15 @@ static uint64_t calypso_uart_read(void *opaque, hwaddr offset, unsigned size)
                 s->lsr &= ~LSR_DR;
             }
 
-            /* RBR debug: too verbose for modem, skip */
+            /* RBR debug: log bytes read by firmware from modem UART */
+            if (s->label && !strcmp(s->label, "modem")) {
+                static int rbr_log = 0;
+                if (rbr_log < 200) {
+                    fprintf(stderr, "[UART-RBR] pop=0x%02x rx_count=%u\n",
+                            (unsigned)(val & 0xFF), (unsigned)s->rx_count);
+                    rbr_log++;
+                }
+            }
 
             calypso_uart_update_irq(s);
         }
@@ -461,7 +458,15 @@ static void calypso_uart_write(void *opaque, hwaddr offset,
         } else {
             uint8_t ch = (uint8_t)value;
 
-            /* TX logging disabled to reduce noise */
+            /* TX trace: tag modem UART as L1CTL-PTY */
+            {
+                const char *tag = (s->label && !strcmp(s->label, "modem"))
+                                  ? "L1CTL-PTY" : "UART";
+                const char *lbl = (s->label && !strcmp(s->label, "modem"))
+                                  ? "" : s->label ? s->label : "?";
+                fprintf(stderr, "[%s%s%s] >>>TX %02x\n",
+                        tag, *lbl ? ":" : "", lbl, ch);
+            }
 
             if (s->label && !strcmp(s->label, "modem")) {
                 uart_log_raw("/tmp/qemu-modem-tx.raw", &ch, 1);
@@ -635,6 +640,7 @@ static void calypso_uart_realize(DeviceState *dev, Error **errp)
         timer_mod(s->rx_poll_timer,
                   qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 10);
     }
+
 }
 
 static void calypso_uart_reset_state(DeviceState *dev)
