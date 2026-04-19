@@ -135,6 +135,25 @@ static void sercomm_frame_complete(L1CTLSock *s)
 
     if (dlci == SERCOMM_DLCI_L1CTL && plen > 0) {
         L1CTL_LOG("TX→mobile: dlci=%d len=%d type=0x%02x", dlci, plen, payload[0]);
+        /* Full hex dump for L1CTL_DATA_IND (0x09, len≈204) and any
+         * payload large enough to matter. Rate-limited per type. */
+        if (plen >= 4) {
+            static unsigned tx_dump_hits[256] = {0};
+            unsigned *h = &tx_dump_hits[payload[0]];
+            if (*h < 10 || (*h % 500) == 0) {
+                char hex[3 * 256 + 1];
+                int off = 0;
+                int nd = plen < 256 ? plen : 256;
+                for (int i = 0; i < nd && off < (int)sizeof(hex) - 4; i++)
+                    off += snprintf(hex + off, sizeof(hex) - off,
+                                    "%02x ", payload[i]);
+                fprintf(stderr,
+                        "[l1ctl-sock] TX DUMP #%u type=0x%02x plen=%d: %s%s\n",
+                        *h, payload[0], plen, hex,
+                        plen > 256 ? "..." : "");
+            }
+            (*h)++;
+        }
         l1ctl_send_to_mobile(s, payload, plen);
     }
     /* Ignore other DLCIs (debug console, loader, etc.) */

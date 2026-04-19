@@ -35,6 +35,7 @@ extern CalypsoUARTState *g_uart_modem;
 #define DB_W_D_TASK_U    2
 #define DB_W_D_BURST_U   3
 #define DB_W_D_TASK_MD   4
+#define DB_W_D_TASK_RA   7
 /* No PM/FB/SB stubs — the DSP handles everything via shared API RAM */
 
 typedef struct CalypsoTRX {
@@ -71,6 +72,7 @@ typedef struct CalypsoTRX {
     /* CLK UDP: send each TDMA tick to bridge so it's clock-slave */
     int          clk_fd;
     struct sockaddr_in clk_peer;
+    int          clk_sync_fd;   /* RX from bridge (port 6701) */
 } CalypsoTRX;
 
 static CalypsoTRX *g_trx;
@@ -112,14 +114,24 @@ static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
     uint64_t val = (size == 2) ? s->dsp_ram[offset/2] :
                    (size == 4) ? (s->dsp_ram[offset/2] | ((uint32_t)s->dsp_ram[offset/2+1] << 16)) :
                    ((uint8_t *)s->dsp_ram)[offset];
-    /* DSP boot handshake: firmware polls DL_STATUS until it reads BOOT */
+    /* DSP boot handshake: the firmware polls DL_STATUS until it reads
+     * BOOT. Tie the transition to real TDMA frame progress rather than
+     * to the number of reads — a tight polling loop should not cause
+     * the DSP to "boot" in microseconds. We latch the TDMA fn at first
+     * read and release BOOT after a fixed number of frames. */
     if (offset == DSP_DL_STATUS_ADDR && !s->dsp_booted) {
-        if (++s->boot_frame > 3) {
+        if (s->boot_frame == 0) {
+            s->boot_frame = s->fn ? s->fn : 1;  /* 0 = "not started" */
+        }
+        uint32_t elapsed = s->fn - s->boot_frame;
+        /* ~4 TDMA frames ≈ 18 ms, close to real Calypso DSP boot delay */
+        if (elapsed > 3) {
             s->dsp_ram[DSP_DL_STATUS_ADDR/2] = DSP_DL_STATUS_BOOT;
             s->dsp_ram[DSP_API_VER_ADDR/2] = DSP_API_VERSION;
             s->dsp_ram[DSP_API_VER2_ADDR/2] = 0;
             s->dsp_booted = true;
-            TRX_LOG("DSP boot ver=0x%04x", DSP_API_VERSION);
+            TRX_LOG("DSP boot ver=0x%04x fn=%u (boot_fn=%u, elapsed=%u frames)",
+                    DSP_API_VERSION, s->fn, s->boot_frame, elapsed);
             val = DSP_DL_STATUS_BOOT;
         }
     }
@@ -140,10 +152,38 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
     if ((offset == 0x0000 || offset == 0x0004 || offset == 0x0008 ||
          offset == 0x000E || offset == 0x0028 || offset == 0x002C ||
          offset == 0x0030 || offset == 0x0036) && value != 0) {
-        static int wp_log = 0;
-        if (++wp_log <= 100)
-            TRX_LOG("DSP WR [0x%04x] = 0x%04x (sz=%d) fn=%u",
-                    (unsigned)offset, (unsigned)value, size, s->fn);
+        static unsigned wp_log = 0;
+        if (wp_log < 100 || (wp_log % 1000) == 0)
+            TRX_LOG("DSP WR #%u [0x%04x] = 0x%04x (sz=%d) fn=%u",
+                    wp_log, (unsigned)offset, (unsigned)value, size, s->fn);
+        wp_log++;
+    }
+
+    /* Diagnostic: when firmware writes d_task_ra (page0 @0x000E or page1 @0x0036)
+     * with a non-zero task code, dump the NDB region to locate d_rach.
+     * d_rach encoding: low byte = bsic<<2, high byte = ra. */
+    if ((offset == 0x000E || offset == 0x0036) && value != 0) {
+        static unsigned ra_dump = 0;
+        if (ra_dump < 4) {
+            TRX_LOG("RA DUMP #%u task_ra=0x%04x — scanning NDB 0x01A8..0x07F8 for non-zero",
+                    ra_dump, (unsigned)value);
+            for (unsigned off = 0x01A8; off < 0x0800; off += 2) {
+                uint16_t w = s->dsp_ram[off/2];
+                if (w != 0)
+                    TRX_LOG("  ndb[+0x%04x]=0x%04x", off - 0x01A8, w);
+            }
+            ra_dump++;
+        }
+    }
+
+    /* Also log any non-zero write within NDB range for d_rach hunting. */
+    if (offset >= 0x01A8 && offset < 0x0800 && value != 0) {
+        static unsigned ndb_w = 0;
+        if (ndb_w < 80) {
+            TRX_LOG("NDB WR #%u [+0x%04x] = 0x%04x fn=%u",
+                    ndb_w, (unsigned)(offset - 0x01A8), (unsigned)value, s->fn);
+            ndb_w++;
+        }
     }
 
     /* Log task writes for debugging — no interception, no faking.
@@ -155,10 +195,11 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
         hwaddr w1_d  = DSP_API_W_PAGE1 + DB_W_D_TASK_D * 2;
         if ((offset == w0_md || offset == w1_md ||
              offset == w0_d  || offset == w1_d) && value != 0) {
-            static int task_log = 0;
-            if (++task_log <= 100)
-                TRX_LOG("ARM TASK WR [0x%04x] = %u fn=%u",
-                        (unsigned)offset, (unsigned)value, s->fn);
+            static unsigned task_log = 0;
+            if (task_log < 100 || (task_log % 1000) == 0)
+                TRX_LOG("ARM TASK WR #%u [0x%04x] = %u fn=%u",
+                        task_log, (unsigned)offset, (unsigned)value, s->fn);
+            task_log++;
         }
     }
     /* DSP page */
@@ -213,10 +254,11 @@ static void calypso_dsp_done(void *opaque) {
         uint16_t task_u  = wp[DB_W_D_TASK_U];
         uint16_t task_md = wp[DB_W_D_TASK_MD];
         if (task_d || task_u || task_md) {
-            static int dma_task_log = 0;
-            if (++dma_task_log <= 50)
-                TRX_LOG("DMA proof: ARM wrote task_d=%u task_u=%u task_md=%u page=%u fn=%u",
-                        task_d, task_u, task_md, page, s->fn);
+            static unsigned dma_task_log = 0;
+            if (dma_task_log < 50 || (dma_task_log % 500) == 0)
+                TRX_LOG("DMA proof #%u: ARM wrote task_d=%u task_u=%u task_md=%u page=%u fn=%u",
+                        dma_task_log, task_d, task_u, task_md, page, s->fn);
+            dma_task_log++;
         }
 
         s->dsp->data[0x0584] = s->dsp_ram[0x01A8/2];
@@ -287,6 +329,26 @@ static void calypso_tdma_start(CalypsoTRX *s);
 /* Called by calypso_tint0.c on each TDMA frame tick.
  * Forward declaration — actual tdma_tick is defined below. */
 static void calypso_tdma_tick(void *opaque);
+
+extern void calypso_tint0_set_fn(uint32_t fn);
+
+/* ---- CLK sync RX from bridge (port 6701) ----
+ * The bridge is the real-time master clock. Each message is a 4-byte
+ * big-endian uint32 frame number. We forward it to TINT0 so QEMU's
+ * TDMA fn stays aligned with the bridge and BTS. */
+static void calypso_trx_clk_sync_cb(void *opaque)
+{
+    CalypsoTRX *s = opaque;
+    uint8_t pkt[4];
+    ssize_t n = recv(s->clk_sync_fd, pkt, sizeof(pkt), 0);
+    if (n != 4) return;
+    uint32_t fn = ((uint32_t)pkt[0] << 24) |
+                  ((uint32_t)pkt[1] << 16) |
+                  ((uint32_t)pkt[2] <<  8) |
+                   (uint32_t)pkt[3];
+    calypso_tint0_set_fn(fn);
+    s->fn = fn;
+}
 /* Prototype visible to tint0 (declared extern there) */
 void calypso_tint0_do_tick(uint32_t fn);
 void calypso_tint0_do_tick(uint32_t fn)
@@ -305,10 +367,11 @@ static uint64_t calypso_tpu_read(void *o, hwaddr off, unsigned sz) {
 static void calypso_tpu_write(void *o, hwaddr off, uint64_t val, unsigned sz) {
     CalypsoTRX *s=o; if (off/2<CALYPSO_TPU_SIZE/2) s->tpu_regs[off/2]=val;
     if (off==TPU_CTRL) {
-        static int tpu_log = 0;
-        if (++tpu_log <= 50)
-            TRX_LOG("TPU_CTRL WR val=0x%04x (EN=%d DSP_EN=%d) fn=%u",
-                    (unsigned)val, !!(val&TPU_CTRL_EN), !!(val&TPU_CTRL_DSP_EN), s->fn);
+        static unsigned tpu_log = 0;
+        if (tpu_log < 50 || (tpu_log % 500) == 0)
+            TRX_LOG("TPU_CTRL WR #%u val=0x%04x (EN=%d DSP_EN=%d) fn=%u",
+                    tpu_log, (unsigned)val, !!(val&TPU_CTRL_EN), !!(val&TPU_CTRL_DSP_EN), s->fn);
+        tpu_log++;
     }
     if (off==TPU_CTRL && (val&TPU_CTRL_EN)) {
         s->tpu_regs[TPU_CTRL/2] &= ~(TPU_CTRL_EN|TPU_CTRL_IDLE);
@@ -358,7 +421,9 @@ static void calypso_frame_irq_lower(void *o){qemu_irq_lower(((CalypsoTRX*)o)->ir
 
 static void calypso_tdma_tick(void *opaque) {
     CalypsoTRX *s = opaque;
-    s->fn = (s->fn+1) % GSM_HYPERFRAME;
+    /* s->fn is the authoritative frame counter, set by calypso_tint0_do_tick()
+     * from TINT0 (the ONE master timer). Do not increment here — that would
+     * double the frame rate vs the bridge/BTS side. */
 
     /* ── 0. Send CLK tick to bridge (QEMU is clock master) ── */
     if (s->clk_fd >= 0) {
@@ -395,7 +460,13 @@ static void calypso_tdma_tick(void *opaque) {
      * firmware hasn't written the new tasks yet (it writes them
      * in l1s_compl() which runs in the IRQ4 handler AFTER this tick). */
 
-    /* ── 4. DSP frame interrupt ──
+    /* ── 4. Deliver buffered DL bursts to DSP BEFORE running DSP ──
+     * On real hardware, BSP DMA fills DARAM with I/Q samples BEFORE the
+     * DSP frame interrupt fires. We must write samples first so the DSP
+     * sees them when it wakes from IDLE and runs the FB correlator. */
+    calypso_bsp_deliver_buffered();
+
+    /* ── 5. DSP frame interrupt ──
      * Send INT3 only when firmware requests it via TPU_CTRL_DSP_EN.
      * Sending INT3 every frame causes stack overflow (CALLD loop). */
     if (s->dsp && s->dsp->running && s->dsp_init_done) {
@@ -406,7 +477,7 @@ static void calypso_tdma_tick(void *opaque) {
             s->tpu_regs[TPU_CTRL/2] &= ~TPU_CTRL_DSP_EN;
         }
 
-        /* ── 5. Run DSP ── */
+        /* ── 6. Run DSP ── */
         if (!s->dsp->idle) {
             c54x_run(s->dsp, 256000);
         }
@@ -422,27 +493,35 @@ static void calypso_tdma_tick(void *opaque) {
         }
     }
 
-    /* ── 6. Deliver buffered DL bursts to DSP ──
-     * Bursts from BTS arrive via UDP in real time, but BDLENA windows
-     * open in virtual time (faster). This step pulls buffered bursts
-     * and delivers them when BDLENA windows are available. */
-    calypso_bsp_deliver_buffered();
-
     /* ── 6b. UL burst poll ──
-     * Check if the DSP wrote an UL task. If so, read bits from DSP
-     * DARAM 0x0900 and send via UDP to BTS. */
+     * Check if the DSP wrote an UL task (d_task_u for NB, d_task_ra for RACH).
+     * For RACH, encode the Access Burst from BSIC+RA via libosmocoding and
+     * send as TRXDv2 UL. For NB UL, fall back to the legacy bit-read hack. */
     {
         uint16_t *wp = s->dsp_page ?
             &s->dsp_ram[DSP_API_W_PAGE1 / 2] : &s->dsp_ram[DSP_API_W_PAGE0 / 2];
-        uint16_t task_u = wp[DB_W_D_TASK_U];
+        uint16_t task_u  = wp[DB_W_D_TASK_U];
+        uint16_t task_ra = wp[DB_W_D_TASK_RA];
+
+        /* RACH UL extraction from d_rach in NDB is not yet implemented
+         * (offset depends on DSP struct layout). Firmware writes
+         * task_ra + d_rach, the real DSP encodes the Access Burst and
+         * transmits via BSP. Faithful implementation requires reading
+         * d_rach at the correct NDB offset then calling
+         * calypso_bsp_send_rach(). Until then, RACH UL is not forwarded. */
+        if (task_ra != 0)
+            wp[DB_W_D_TASK_RA] = 0;  /* ack the task to keep FSM moving */
+
         if (task_u != 0 && s->dsp) {
             uint8_t tn = wp[DB_W_D_BURST_U] & 0x07;
             uint8_t bits[148];
             if (calypso_bsp_tx_burst(tn, s->fn, bits)) {
                 calypso_bsp_send_ul(tn, s->fn, bits);
-                static int ul_log = 0;
-                if (++ul_log <= 20)
-                    TRX_LOG("UL burst task=%u tn=%u fn=%u", task_u, tn, s->fn);
+                static unsigned ul_log = 0;
+                if (ul_log < 20 || (ul_log % 200) == 0)
+                    TRX_LOG("UL burst #%u task=%u tn=%u fn=%u",
+                            ul_log, task_u, tn, s->fn);
+                ul_log++;
             }
             wp[DB_W_D_TASK_U] = 0;
         }
@@ -453,19 +532,27 @@ static void calypso_tdma_tick(void *opaque) {
     timer_mod_ns(s->frame_irq_timer,
                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000);
 
-    /* ── 8. Re-arm TDMA timer ── */
-    if (s->tdma_running)
-        timer_mod_ns(s->tdma_timer,
-                     qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + GSM_TDMA_NS);
+    /* ── 8. No local timer re-arm ──
+     * TINT0 (calypso_tint0.c) is the ONE master timer driving everything.
+     * It calls calypso_tint0_do_tick() which forwards to calypso_tdma_tick().
+     * Running an independent s->tdma_timer in parallel would double the
+     * frame rate and desync QEMU vs BTS. */
 }
+
+/* TINT0 master clock entry point — declared in calypso_tint0.h. */
+extern void calypso_tint0_start(void);
 
 static void calypso_tdma_start(CalypsoTRX *s)
 {
     if (s->tdma_running) return;
     s->tdma_running = true;
     s->fn = 0;
-    TRX_LOG("TDMA started");
-    timer_mod_ns(s->tdma_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + GSM_TDMA_NS);
+    TRX_LOG("TDMA started (driven by TINT0 master timer)");
+    /* TINT0 is the ONE master timer driving everything. Start it here so
+     * that the 4.615ms TDMA frame ticks begin. It will call
+     * calypso_tint0_do_tick() which sets g_trx->fn and runs tdma_tick(). */
+    calypso_tint0_set_fn(0);
+    calypso_tint0_start();
 }
 
 /* ---- kick ---- */
@@ -571,6 +658,7 @@ void calypso_trx_init(MemoryRegion *sysmem, qemu_irq *irqs)
     CalypsoTRX *s = g_new0(CalypsoTRX, 1);
     g_trx = s; s->irqs = irqs; s->sync_bsic = 7;
     s->clk_fd = -1;
+    s->clk_sync_fd = -1;
     TRX_LOG("=== Calypso hardware init ===");
 
     memory_region_init_io(&s->dsp_iomem,NULL,&calypso_dsp_ops,s,"calypso.dsp_api",CALYPSO_DSP_SIZE);
@@ -629,6 +717,30 @@ void calypso_trx_init(MemoryRegion *sysmem, qemu_irq *irqs)
             s->clk_peer.sin_port = htons(6700);
             s->clk_peer.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
             TRX_LOG("CLK UDP → bridge 127.0.0.1:6700");
+        }
+    }
+
+    /* CLK sync RX: listen on 6701 for fn updates from the bridge.
+     * The bridge is the real-time master clock. Each message is a
+     * big-endian uint32 frame number; we forward it to TINT0 so
+     * QEMU's TDMA fn stays synchronized with the bridge and BTS. */
+    {
+        int fd = socket(AF_INET, SOCK_DGRAM, 0);
+        if (fd >= 0) {
+            int one = 1;
+            setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+            struct sockaddr_in a = { .sin_family = AF_INET,
+                                     .sin_port = htons(6701),
+                                     .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
+            if (bind(fd, (struct sockaddr *)&a, sizeof(a)) == 0) {
+                fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+                s->clk_sync_fd = fd;
+                qemu_set_fd_handler(fd, calypso_trx_clk_sync_cb, NULL, s);
+                TRX_LOG("CLK sync RX ← bridge on 127.0.0.1:6701");
+            } else {
+                close(fd);
+                s->clk_sync_fd = -1;
+            }
         }
     }
 }

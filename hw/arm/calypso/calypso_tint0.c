@@ -47,7 +47,7 @@ static void tint0_tick_cb(void *opaque)
     /* Re-arm timer */
     if (tint0.running) {
         timer_mod_ns(tint0.timer,
-                     qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + TINT0_PERIOD_NS);
+                     qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + TINT0_PERIOD_NS);
     }
 
     /* Kick ARM CPU to process pending IRQs */
@@ -61,7 +61,7 @@ void calypso_tint0_start(void)
     if (tint0.running) return;
 
     if (!tint0.timer) {
-        tint0.timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, tint0_tick_cb, NULL);
+        tint0.timer = timer_new_ns(QEMU_CLOCK_REALTIME, tint0_tick_cb, NULL);
     }
 
     tint0.running = true;
@@ -76,7 +76,7 @@ void calypso_tint0_start(void)
     TINT0_LOG("started (period=%.3f ms, IFR bit %d, vec %d) fn=%u",
               TINT0_PERIOD_NS / 1e6, TINT0_IFR_BIT, TINT0_VEC, tint0.fn);
     timer_mod_ns(tint0.timer,
-                 qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + TINT0_PERIOD_NS);
+                 qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + TINT0_PERIOD_NS);
 }
 
 void calypso_tint0_tpu_en(void)

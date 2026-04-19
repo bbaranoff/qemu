@@ -95,17 +95,47 @@ static void bsp_trxd_readable(void *opaque)
                 inet_ntoa(addr.sin_addr), ntohs(addr.sin_port));
     }
 
-    /* TRXDv0 DL: tn(1) fn(4) rssi(1) toa(2) bits(148) = 156 bytes */
-    uint8_t  tn  = buf[0] & 0x07;
-    uint32_t fn  = ((uint32_t)buf[1]<<24)|((uint32_t)buf[2]<<16)|
-                   ((uint32_t)buf[3]<<8)|buf[4];
-    bsp.last_att = (n > 5) ? buf[5] : 0;
+    /* DL TRXD: support v0 and v2 by inspecting the version field in byte[0].
+     *
+     * v0 (osmo-bts trx_if.c:1153-1158):
+     *   buf[0] = ((ver=0)<<4) | tn ; buf[1..4]=fn BE ; buf[5]=att ; buf[6..]=bits
+     *   header = 6 bytes
+     *
+     * v2 (osmo-bts trx_if.c:1141-1170, single-PDU non-batched):
+     *   buf[0] = ((ver=2)<<4) | tn        — bit 7 of byte[1] = batch.ind
+     *   buf[1] = (trxn & 0x3f) | (1<<7)   — batch indicator
+     *   buf[2] = MTS                      — modulation/training-seq
+     *   buf[3] = att (power)
+     *   buf[4] = scpir
+     *   buf[5..7] = spare
+     *   buf[8..11] = fn BE (only first PDU in batch)
+     *   buf[12..] = hard-bits
+     *   header = 12 bytes for first PDU. */
+    uint8_t  pdu_ver = buf[0] >> 4;
+    uint8_t  tn      = buf[0] & 0x07;
+    uint32_t fn;
+    int      hdr_len;
 
-    int nbits = (int)n - 8;  /* skip 8-byte header */
+    if (pdu_ver == 0) {
+        fn = ((uint32_t)buf[1]<<24)|((uint32_t)buf[2]<<16)|
+             ((uint32_t)buf[3]<<8)|buf[4];
+        bsp.last_att = (n > 5) ? buf[5] : 0;
+        hdr_len = 6;
+    } else if (pdu_ver == 2 && n >= 12) {
+        fn = ((uint32_t)buf[8]<<24)|((uint32_t)buf[9]<<16)|
+             ((uint32_t)buf[10]<<8)|buf[11];
+        bsp.last_att = buf[3];
+        hdr_len = 12;
+    } else {
+        /* Unknown version or short packet — drop. */
+        return;
+    }
+
+    int nbits = (int)n - hdr_len;
     if (nbits > 148) nbits = 148;
     if (nbits <= 0) return;
 
-    const uint8_t *bits = buf + 8;
+    const uint8_t *bits = buf + hdr_len;
 
     /* Log burst type: check if all-zero (FB) or mixed (NB/SB) */
     {
@@ -114,12 +144,17 @@ static void bsp_trxd_readable(void *opaque)
             if (bits[i] == 0) zeros++;
             else ones++;
         }
-        static int burst_log = 0;
-        if (burst_log < 20 || (burst_log % 10000) == 0) {
-            BSP_LOG("BURST fn=%u tn=%u zeros=%d ones=%d %s",
-                    fn, tn, zeros, ones,
+        static unsigned burst_log = 0;
+        if (burst_log < 20 || (burst_log % 500) == 0) {
+            BSP_LOG("BURST #%u fn=%u tn=%u nbits=%d zeros=%d ones=%d ver=%u att=%u %s "
+                    "b0..7=%d%d%d%d%d%d%d%d",
+                    burst_log, fn, tn, nbits, zeros, ones, pdu_ver, bsp.last_att,
                     zeros == nbits ? "*** FB ***" :
-                    ones > 100 ? "DUMMY/NB" : "SB/OTHER");
+                    ones > 100 ? "DUMMY/NB" : "SB/OTHER",
+                    nbits>0?bits[0]:0, nbits>1?bits[1]:0,
+                    nbits>2?bits[2]:0, nbits>3?bits[3]:0,
+                    nbits>4?bits[4]:0, nbits>5?bits[5]:0,
+                    nbits>6?bits[6]:0, nbits>7?bits[7]:0);
         }
         burst_log++;
     }
@@ -167,7 +202,10 @@ static void bsp_trxd_readable(void *opaque)
 void calypso_bsp_init(C54xState *dsp)
 {
     bsp.dsp = dsp;
-    bsp.daram_addr     = parse_uint_env("CALYPSO_BSP_DARAM_ADDR", 0x3fc0);
+    /* FB handler uses AR2/AR5 pointing to 0x2A13/0x2CC0 and 0x2D80/0x2D7F.
+     * The BSP DMA double-buffer appears to be at 0x2A13 and 0x2D80.
+     * Write I/Q at 0x2A13 (first buffer) — the DSP reads from there. */
+    bsp.daram_addr     = parse_uint_env("CALYPSO_BSP_DARAM_ADDR", 0x2A13);
     bsp.daram_len      = parse_uint_env("CALYPSO_BSP_DARAM_LEN",  296);
     bsp.bypass_bdlena  = parse_uint_env("CALYPSO_BSP_BYPASS_BDLENA", 0);
     bsp.bursts_seen = 0;
@@ -297,6 +335,21 @@ void calypso_bsp_deliver_buffered(void)
 {
     if (!bsp.dsp || bsp.daram_addr == 0) return;
 
+    /* DIAG: observe slot validity and pulse match once per N calls */
+    {
+        static unsigned diag_calls = 0;
+        diag_calls++;
+        if (diag_calls <= 20 || (diag_calls % 500) == 0) {
+            BSP_LOG("DELIVER call #%u valid[0..7]=%d%d%d%d%d%d%d%d bypass=%d",
+                    diag_calls,
+                    bsp.slot[0].valid, bsp.slot[1].valid,
+                    bsp.slot[2].valid, bsp.slot[3].valid,
+                    bsp.slot[4].valid, bsp.slot[5].valid,
+                    bsp.slot[6].valid, bsp.slot[7].valid,
+                    bsp.bypass_bdlena);
+        }
+    }
+
     /* For each TN with a pending BDLENA window and a buffered burst,
      * deliver the samples to the DSP. This handles the case where
      * BDLENA opened before the UDP burst arrived (timing mismatch). */
@@ -305,25 +358,39 @@ void calypso_bsp_deliver_buffered(void)
         if (!sl->valid) continue;
 
         /* Check if there's a BDLENA window for this TN */
-        if (!bsp.bypass_bdlena && !calypso_iota_take_bdl_pulse(tn))
+        if (!bsp.bypass_bdlena && !calypso_iota_take_bdl_pulse(tn)) {
+            static unsigned miss = 0;
+            miss++;
+            if (miss <= 10 || (miss % 200) == 0)
+                BSP_LOG("DELIVER miss #%u tn=%u valid=1 no pulse", miss, tn);
             continue;
+        }
 
-        /* Deliver the buffered burst (I/Q pairs) */
+        /* Deliver the buffered burst to the DSP sample buffer.
+         * Single canonical address — no shotgun write. */
         int n = sl->n < (int)bsp.daram_len ? sl->n : (int)bsp.daram_len;
+        if (n > 296) n = 296;
 
         uint16_t samples[296];
-        for (int i = 0; i < n && i < 296; i++)
+        for (int i = 0; i < n; i++)
             samples[i] = (uint16_t)sl->iq[i];
-        c54x_bsp_load(bsp.dsp, samples, n > 296 ? 296 : n);
+        c54x_bsp_load(bsp.dsp, samples, n);
 
+        /* BSP-TSP DMA to DARAM — real Calypso HW flow.
+         * The BSP serial port is wired through TSP DMA that writes
+         * samples directly into DSP DARAM at bsp.daram_addr. The DSP
+         * FB/SB handlers read from there via AR2/AR5 pointers. Without
+         * this, DARAM stays 0 and correlator never converges. */
         static unsigned woff = 0;
         for (int i = 0; i < n; i++) {
-            bsp.dsp->data[(uint16_t)(bsp.daram_addr + woff)] = (uint16_t)sl->iq[i];
+            bsp.dsp->data[(uint16_t)(bsp.daram_addr + woff)] = samples[i];
             woff++;
             if (woff >= bsp.daram_len) woff = 0;
         }
+
+        /* Consume the burst after delivery (no keep-valid hack). */
+        sl->valid = false;
         bsp.bursts_written++;
-        sl->valid = false;  /* consumed */
 
         if (bsp.bursts_written <= 10 || (bsp.bursts_written % 1000) == 0) {
             BSP_LOG("BUFFERED DMA tn=%u fn=%u n=%d total=%llu",
@@ -340,21 +407,65 @@ void calypso_bsp_deliver_buffered(void)
 
 /* ---- UL burst → UDP to BTS ---- */
 
+#include <osmocom/coding/gsm0503_coding.h>
+
+/* Encode a RACH (Access Burst) from RA + BSIC and send as TRXDv2 UL.
+ * Access Bursts need MTS byte = 0x30 so BTS routes to RACH decoder.
+ * We inline the v2 UL framing here instead of reusing calypso_bsp_send_ul()
+ * (which assumes Normal Burst MTS=0). */
+void calypso_bsp_send_rach(uint8_t tn, uint32_t fn, uint8_t ra, uint8_t bsic)
+{
+    if (bsp.trxd_fd < 0 || !bsp.trxd_peer_valid) return;
+
+    uint8_t ubits[148];
+    int n = gsm0503_rach_ext_encode(ubits, ra, bsic, false);
+    if (n < 0) return;
+
+    uint8_t pkt[12 + 148];
+    pkt[0] = (2 << 4) | (tn & 0x07);  /* ver=2, tn */
+    pkt[1] = 0;                       /* trxn=0, batch=0 */
+    pkt[2] = 0x30;                    /* MTS = GMSK Access Burst (AB), TSC=0 */
+    pkt[3] = 60;                      /* RSSI → -60 dBm */
+    pkt[4] = 0; pkt[5] = 0;           /* ToA256 = 0 */
+    pkt[6] = 0; pkt[7] = 0;           /* C/I = 0 */
+    pkt[8]  = (fn >> 24) & 0xff;
+    pkt[9]  = (fn >> 16) & 0xff;
+    pkt[10] = (fn >>  8) & 0xff;
+    pkt[11] =  fn        & 0xff;
+    for (int i = 0; i < 148; i++)
+        pkt[12 + i] = (ubits[i] & 1) ? 127 : (uint8_t)(-127);
+
+    sendto(bsp.trxd_fd, pkt, sizeof(pkt), 0,
+           (struct sockaddr *)&bsp.trxd_peer, sizeof(bsp.trxd_peer));
+}
+
 void calypso_bsp_send_ul(uint8_t tn, uint32_t fn, const uint8_t bits[148])
 {
     if (bsp.trxd_fd < 0 || !bsp.trxd_peer_valid) return;
 
-    /* TRXDv0 UL: tn(1) fn(4) rssi(1) toa(2) bits(148) = 156 bytes */
-    uint8_t pkt[8 + 148];
-    pkt[0] = tn & 0x07;
-    pkt[1] = (fn >> 24) & 0xff;
-    pkt[2] = (fn >> 16) & 0xff;
-    pkt[3] = (fn >>  8) & 0xff;
-    pkt[4] =  fn        & 0xff;
-    pkt[5] = 60;            /* RSSI → -60 dBm at the BTS */
-    pkt[6] = 0; pkt[7] = 0; /* ToA256 = 0 */
+    /* TRXDv2 UL (per trxd_proto.py PDUv2Rx, single non-batched PDU):
+     *   pkt[0] = (ver<<4) | tn         — version=2 in upper 4 bits
+     *   pkt[1] = (batch=0)|(shadow=0)|trxn(6)  — batch.ind=0 → last PDU
+     *   pkt[2] = MTS = nope(1)|mod(4)|tsc(3)   — GMSK NB: 0x00
+     *   pkt[3] = rssi  (positive byte = -dBm)
+     *   pkt[4..5] = toa256 BE int16
+     *   pkt[6..7] = cir BE int16 (carrier-to-interference)
+     *   pkt[8..11] = fn BE
+     *   pkt[12..] = 148 soft-bits (signed int8, ±127)
+     * Total = 12 + 148 = 160 bytes. */
+    uint8_t pkt[12 + 148];
+    pkt[0] = (2 << 4) | (tn & 0x07);  /* ver=2, tn */
+    pkt[1] = 0;                       /* trxn=0, batch=0 (single/last PDU) */
+    pkt[2] = 0;                       /* MTS: GMSK NB (mod=0, tsc=0) */
+    pkt[3] = 60;                      /* RSSI → -60 dBm */
+    pkt[4] = 0; pkt[5] = 0;           /* ToA256 = 0 */
+    pkt[6] = 0; pkt[7] = 0;           /* C/I = 0 */
+    pkt[8]  = (fn >> 24) & 0xff;
+    pkt[9]  = (fn >> 16) & 0xff;
+    pkt[10] = (fn >>  8) & 0xff;
+    pkt[11] =  fn        & 0xff;
     for (int i = 0; i < 148; i++)
-        pkt[8 + i] = bits[i] ? 127 : (uint8_t)(-127);
+        pkt[12 + i] = bits[i] ? 127 : (uint8_t)(-127);
 
     sendto(bsp.trxd_fd, pkt, sizeof(pkt), 0,
            (struct sockaddr *)&bsp.trxd_peer, sizeof(bsp.trxd_peer));
@@ -362,14 +473,11 @@ void calypso_bsp_send_ul(uint8_t tn, uint32_t fn, const uint8_t bits[148])
 
 bool calypso_bsp_tx_burst(uint8_t tn, uint32_t fn, uint8_t bits[148])
 {
-    if (!bsp.dsp || !bits) return false;
-
-    bool any = false;
-    for (int i = 0; i < 148; i++) {
-        uint16_t w = bsp.dsp->data[0x0900 + i];
-        bits[i] = (uint8_t)(w & 1);
-        if (bits[i]) any = true;
-    }
-
-    return any;
+    /* Placeholder — real UL burst extraction must read the proper DSP
+     * API location per burst type (d_rach for RACH, a_du_X for NB UL,
+     * etc.) and decode the packed format. The previous implementation
+     * read data[0x0900] LSB-only which is not a valid DSP API offset.
+     * Return false until a faithful extractor is implemented per type. */
+    (void)tn; (void)fn; (void)bits;
+    return false;
 }

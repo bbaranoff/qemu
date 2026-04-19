@@ -5,10 +5,11 @@
 #   push  = host → container
 #   check = compare only
 
-CONTAINER="osmo-operator-1"
+CONTAINER="trying"
 HOST_DIR="/home/nirvana/qemu-src"
 CONT_DIR="/opt/GSM/qemu-src"
 
+# C/H files live in qemu-src
 FILES=(
   hw/arm/calypso/calypso_trx.c
   hw/arm/calypso/calypso_c54x.c
@@ -24,6 +25,11 @@ FILES=(
   include/hw/arm/calypso/calypso_trx.h
   include/hw/arm/calypso/calypso_soc.h
   include/hw/arm/calypso/calypso_uart.h
+)
+
+# Scripts live in /opt/GSM (not qemu-src)
+GSM_DIR="/opt/GSM"
+GSM_FILES=(
   bridge.py
   run.sh
 )
@@ -31,12 +37,13 @@ FILES=(
 MODE="${1:-pull}"
 DIRTY=0
 
-for f in "${FILES[@]}"; do
-  h=$(md5sum "$HOST_DIR/$f" 2>/dev/null | cut -d' ' -f1)
-  c=$(docker exec "$CONTAINER" md5sum "$CONT_DIR/$f" 2>/dev/null | cut -d' ' -f1)
+sync_file() {
+  local f="$1" host_path="$2" cont_path="$3"
+  local h=$(md5sum "$host_path" 2>/dev/null | cut -d' ' -f1)
+  local c=$(docker exec "$CONTAINER" md5sum "$cont_path" 2>/dev/null | cut -d' ' -f1)
 
   if [ -z "$h" ] && [ -z "$c" ]; then
-    continue
+    return
   elif [ "$h" = "$c" ]; then
     echo "✅ $f"
   else
@@ -44,13 +51,23 @@ for f in "${FILES[@]}"; do
     if [ "$MODE" = "check" ]; then
       echo "❌ $f  host=${h:-MISSING} cont=${c:-MISSING}"
     elif [ "$MODE" = "pull" ]; then
-      docker cp "$CONTAINER:$CONT_DIR/$f" "$HOST_DIR/$f"
+      docker cp "$CONTAINER:$cont_path" "$host_path"
       echo "⬇️  $f  (pulled)"
     elif [ "$MODE" = "push" ]; then
-      docker cp "$HOST_DIR/$f" "$CONTAINER:$CONT_DIR/$f"
+      docker cp "$host_path" "$CONTAINER:$cont_path"
       echo "⬆️  $f  (pushed)"
     fi
   fi
+}
+
+# C/H sources in qemu-src
+for f in "${FILES[@]}"; do
+  sync_file "$f" "$HOST_DIR/$f" "$CONT_DIR/$f"
+done
+
+# Scripts in /opt/GSM
+for f in "${GSM_FILES[@]}"; do
+  sync_file "$f" "$HOST_DIR/$f" "$GSM_DIR/$f"
 done
 
 if [ "$DIRTY" = "0" ]; then
@@ -69,7 +86,7 @@ if [ "$MODE" = "push" ] && [ "$DIRTY" = "1" ]; then
     SNAP="/home/nirvana/ALL-QEMUs/qemu-calypso-${STAMP}"
   fi
   mkdir -p "$SNAP"
-  for f in "${FILES[@]}"; do
+  for f in "${FILES[@]}" "${GSM_FILES[@]}"; do
     mkdir -p "$SNAP/$(dirname $f)"
     cp "$HOST_DIR/$f" "$SNAP/$f" 2>/dev/null
   done

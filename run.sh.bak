@@ -1,0 +1,162 @@
+#!/bin/bash
+# run.sh — Calypso QEMU full pipeline in tmux.
+#
+# Topology (no UART/PTY bridge anymore):
+#   mobile L23 ──unix /tmp/osmocom_l2_1── QEMU l1ctl_sock (direct)
+#   osmo-bts-trx ──UDP 5700── bridge_clk
+#   osmo-bts-trx ──UDP 5701── bridge_trxc   (local stub + 5801 RSP path)
+#   osmo-bts-trx ──UDP 5702── bridge_orch_bursts ──UDP 6702── QEMU bsp
+#   QEMU bsp    ──UDP 6802── bridge_orch_bursts ──UDP 5802── osmo-bts-trx
+#   QEMU orchestrator bus : UDP 6920 (publish/subscribe)
+#
+# Usage:
+#   ./run.sh         start full stack in tmux 'calypso'
+#   ./run.sh kill    tear everything down
+set -uo pipefail
+
+SESSION="calypso"
+SRC_HOST="/home/nirvana/qemu-src"
+SRC_OPT="/opt/GSM/qemu-src"
+QEMU="$SRC_OPT/build/qemu-system-arm"
+FW="/opt/GSM/firmware/board/compal_e88/layer1.highram.elf"
+MOBILE_CFG="/root/.osmocom/bb/mobile_group1.cfg"
+L1CTL_SOCK="/tmp/osmocom_l2_1"
+QEMU_LOG="/tmp/qemu.log"
+
+VENV="/root/.env"
+[ -f "$VENV/bin/activate" ] && source "$VENV/bin/activate"
+
+# ── md5 sanity check: verify host sources match /opt/GSM copy ──────
+check_md5() {
+    local diff=0
+    for f in run.sh \
+             hw/arm/calypso/calypso_trx.c  hw/arm/calypso/calypso_bsp.c \
+             hw/arm/calypso/calypso_orch.c hw/arm/calypso/l1ctl_sock.c \
+             hw/arm/calypso/calypso_soc.c  hw/arm/calypso/calypso_fbsb.c; do
+        local a="$SRC_HOST/$f" b="$SRC_OPT/$f"
+        [ -f "$a" ] || continue
+        [ -f "$b" ] || { echo "  MISSING  $f (in $SRC_OPT)"; diff=1; continue; }
+        local ma mb
+        ma=$(md5sum "$a" | awk '{print $1}')
+        mb=$(md5sum "$b" | awk '{print $1}')
+        if [ "$ma" != "$mb" ]; then
+            echo "  DIFFER   $f  ($ma host ≠ $mb opt)"; diff=1
+        fi
+    done
+    if [ $diff -ne 0 ]; then
+        echo "[run.sh] md5 mismatch host↔opt — syncing…"
+        rsync -a "$SRC_HOST/hw/arm/calypso/"   "$SRC_OPT/hw/arm/calypso/"
+        rsync -a "$SRC_HOST/hw/char/calypso_uart.c" "$SRC_OPT/hw/char/"  2>/dev/null || true
+        rsync -a "$SRC_HOST/include/hw/arm/calypso/" "$SRC_OPT/include/hw/arm/calypso/" 2>/dev/null || true
+        rsync -a "$SRC_HOST/run.sh"            "$SRC_OPT/run.sh"
+        echo "[run.sh] sync done."
+    else
+        echo "[run.sh] md5 ok — host == opt"
+    fi
+}
+check_md5
+
+kill_all() {
+    tmux kill-session -t "$SESSION" 2>/dev/null || true
+    pkill -9 qemu-system-arm 2>/dev/null || true
+    pkill -9 -f osmo-bts-trx      2>/dev/null || true
+    pkill -9 -f '^mobile'         2>/dev/null || true
+    # Free any port we rely on in case a stale proc held it.
+    for p in 5700 5701 5702 5800 5801 5802 6702 6802 6920; do
+        fuser -k ${p}/udp 2>/dev/null || true
+    done
+    rm -f "$L1CTL_SOCK" /tmp/osmocom_l2_* /tmp/osmocom_l2_tmp /tmp/calypso_modem.sock
+    sleep 0.5
+}
+
+if [ "${1:-}" = "kill" ]; then
+    kill_all; echo "killed."; exit 0
+fi
+
+for f in "$QEMU" "$FW"; do
+    [ -e "$f" ] || { echo "FATAL: missing $f"; exit 1; }
+done
+
+kill_all
+trap 'echo "[run.sh] cleanup"; kill_all; exit 130' INT TERM
+
+# Archive previous qemu log to a timestamped file before the new run.
+if [ -s "$QEMU_LOG" ]; then
+    ts=$(date +%Y%m%d-%H%M%S)
+    mv "$QEMU_LOG" "${QEMU_LOG%.log}.${ts}.log"
+    echo "[run.sh] archived previous log → ${QEMU_LOG%.log}.${ts}.log"
+fi
+
+/etc/osmocom/status.sh stop  >/dev/null 2>&1 || true
+/etc/osmocom/osmo-start.sh   >/dev/null 2>&1 || true
+
+# ── tmux layout ─────────────────────────────────────────────────────
+# Each window sources the venv before its command so python3 picks up
+# the right interpreter (gnuradio, gsm_mod, etc).
+ACTIVATE="source /root/.env/bin/activate"
+
+tmux new-session -d -s "$SESSION" -n log
+tmux send-keys -t "$SESSION:log" "$ACTIVATE && : > $QEMU_LOG && tail -F $QEMU_LOG" C-m
+
+# All UDP plumbing lives inside QEMU now:
+#   l1ctl_sock.c   → /tmp/osmocom_l2_1 (mobile L1CTL)
+#   calypso_orch.c → 5700 CLK, 5701 TRXC, 6920 pub/sub bus
+#   calypso_bsp.c  → 5702 DATA (DL recv + UL send to 5802)
+
+# QEMU — DISCOVERY MODE
+#
+# CALYPSO_BSP_DARAM_ADDR=0  → BSP refuses to DMA bursts and only logs.
+#                             c54x.c emits "[c54x] DARAM RD HIST ..."
+#                             every 50k reads inside PC range
+#                             0xe25e..0xe27f (the new FB-det loop).
+# CALYPSO_BSP_BYPASS_BDLENA=1 → BSP ignores BDLENA gate (debug aid).
+# CALYPSO_DBG=all / DEBUG=ALL → all c54x/trx/uart logs.
+tmux new-window -t "$SESSION" -n qemu
+tmux send-keys -t "$SESSION:qemu" \
+    "$ACTIVATE && \
+     CALYPSO_BSP_DARAM_ADDR=0x3fc0 \
+     CALYPSO_BSP_DARAM_LEN=64 \
+     CALYPSO_BSP_BYPASS_BDLENA=1 \
+     CALYPSO_ORCH_PORT=6920 \
+         L1CTL_SOCK_PATH=$L1CTL_SOCK \
+     CALYPSO_DBG=all DEBUG=ALL \
+     $QEMU -M calypso -kernel $FW \
+        -chardev null,id=modem \
+        -serial chardev:modem -display none 2>&1 | tee $QEMU_LOG" C-m
+
+echo -n "waiting L1CTL socket"
+for i in $(seq 1 40); do
+    [ -S "$L1CTL_SOCK" ] && break
+    sleep 0.25; echo -n "."
+done
+echo
+
+tmux new-window -t "$SESSION" -n bts
+tmux send-keys -t "$SESSION:bts" \
+    "$ACTIVATE && sleep 2 && osmo-bts-trx -c /etc/osmocom/osmo-bts-trx.cfg" C-m
+
+tmux new-window -t "$SESSION" -n mobile
+tmux send-keys -t "$SESSION:mobile" \
+    "$ACTIVATE && sleep 6 && mobile -c $MOBILE_CFG" C-m
+
+# calypso_trx orchestrator view: all trx/uart/dsp/api/fbsb/bsp lines —
+# this is the central piece that owns the DSP↔ARM↔bridges flow.
+tmux new-window -t "$SESSION" -n calypso_trx
+tmux send-keys -t "$SESSION:calypso_trx" \
+    "$ACTIVATE && \
+     echo '── calypso_trx orchestrator (trx/uart/bsp/fbsb/api) ──' && \
+     tail -F $QEMU_LOG | grep --line-buffered -E '\\[trx\\]|\\[uart\\]|\\[bsp\\]|\\[fbsb\\]|\\[orch\\]|FBSB-PUBLISH|ARM WR d_task_md|PM-STUB|api_write'" C-m
+
+# Discovery helper window: tail the histogram lines so you can copy
+# the new DARAM address straight from the log.
+tmux new-window -t "$SESSION" -n discover
+tmux send-keys -t "$SESSION:discover" \
+    "$ACTIVATE && \
+     echo '── DARAM RD HIST (top cells read by PC e25e..e27f) ──' && \
+     tail -F $QEMU_LOG | grep --line-buffered 'DARAM RD HIST'" C-m
+
+tmux new-window -t "$SESSION" -n shell
+tmux send-keys -t "$SESSION:shell" "$ACTIVATE" C-m
+
+tmux select-window -t "$SESSION:discover"
+exec tmux attach -t "$SESSION"
