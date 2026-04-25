@@ -68,28 +68,6 @@ static uint16_t prog_read(C54xState *s, uint32_t addr);
 
 static uint16_t data_read(C54xState *s, uint16_t addr)
 {
-    /* Watch the mailbox slots that the firmware polls at PROM0 0xb41a
-     * (LDU *(0x0ffe), A then BACC A) and 0xb41c (CMPM *(0x0fff), 4).
-     * If these stay zero / 0x10 forever, ARM never wrote them. */
-    if (addr == 0x0ffe || addr == 0x0fff) {
-        static unsigned watch_count;
-        if (watch_count++ < 30) {
-            uint16_t v = s->data[addr];
-            fprintf(stderr,
-                    "[c54x] WATCH-READ data[0x%04x]=0x%04x PC=0x%04x insn=%u\n",
-                    addr, v, s->pc, s->insn_count);
-        }
-    }
-    /* d_fb_det watch (DSP DATA 0x01F0 = NDB + 0x48). FB-det handler
-     * writes 1 here when sync detected; mobile reads it via API RAM. */
-    if (addr == 0x01F0) {
-        static unsigned fb_read;
-        if (fb_read++ < 30) {
-            fprintf(stderr,
-                    "[c54x] WATCH-READ d_fb_det[0x01F0]=0x%04x PC=0x%04x insn=%u\n",
-                    s->data[0x01F0], s->pc, s->insn_count);
-        }
-    }
     /* === DARAM discovery histogram ===
      * Track ALL data reads from DARAM (addr < 0x4000) regardless of PC.
      * The FB handler runs from both PROM0 (0xBD47) and DARAM overlay,
@@ -251,18 +229,6 @@ static uint16_t data_read(C54xState *s, uint16_t addr)
 
 static void data_write(C54xState *s, uint16_t addr, uint16_t val)
 {
-    /* WATCH-WRITE on the same mailbox slots tracked in data_read.
-     * Whoever writes them — DSP or ARM via api_ram alias — gets logged
-     * so we can attribute the source of the value the firmware polls. */
-    if (addr == 0x0ffe || addr == 0x0fff || addr == 0x01F0) {
-        static unsigned wcount;
-        if (wcount++ < 30) {
-            fprintf(stderr,
-                    "[c54x] WATCH-WRITE data[0x%04x] <- 0x%04x  (was 0x%04x) "
-                    "PC=0x%04x insn=%u\n",
-                    addr, val, s->data[addr], s->pc, s->insn_count);
-        }
-    }
     /* Timer registers (0x0024-0x0026) — before MMR check */
     if (addr == TCR_ADDR) {
         /* TRB: write 1 → reload TIM from PRD, PSC from TDDR */
@@ -785,30 +751,14 @@ static int c54x_exec_one(C54xState *s)
             }
             s->pc = ra; return 0;
         }
-        /* 0xF4E4: per tic54x-opc.c this is FRET (far return). Treating it
-         * as FRET however breaks the ARM↔DSP cycle in our emulator: the
-         * DSP returns from 0x770c to 0xb41a, polls mem[0x0ffe] which is
-         * never written (ARM-side init bug separate from the opcode), then
-         * BACC A jumps to 0x10 (boot stub NOPs) and runs forever. The DSP
-         * never reaches IDLE → calypso_trx.c never raises CALYPSO_IRQ_API
-         * → ARM never sets TPU_CTRL_DSP_EN → no further INT3.
-         *
-         * Until the mailbox-init bug is fixed we keep the historical
-         * behaviour: 0xF4E4 is treated as IDLE so the DSP halts at 0x770c,
-         * ARM gets the API IRQ, the cycle proceeds (even if the INT3
-         * handler at PROM1 vec is garbage and FB-det never completes).
-         * The real IDLE 0xF4E1/F5E1/F6E1/F7E1 (mask 0xFCFF) is also
-         * handled below for the few sites that do use it. */
-        if (op == 0xF4E4 || (op & 0xFCFF) == 0xF4E1) {
-            int level = (op == 0xF4E4) ? -1 : ((op >> 8) & 0x3) + 1;
+        if (op == 0xF4E4) {
             static int idle_log = 0;
             if (idle_log < 20)
-                C54_LOG("IDLE%s @0x%04x INTM=%d IMR=0x%04x SP=0x%04x insns=%u XPC=%d",
-                        (level < 0) ? "(F4E4)" : "1",
-                        s->pc, !!(s->st1 & ST1_INTM),
-                        s->imr, s->sp, s->insn_count, s->xpc);
+                C54_LOG("IDLE @0x%04x INTM=%d IMR=0x%04x SP=0x%04x insns=%u XPC=%d",
+                        s->pc, !!(s->st1 & ST1_INTM), s->imr, s->sp, s->insn_count, s->xpc);
             idle_log++;
-            /* TDMA slot table (0x8000-0x8020): skip IDLE, continue next slot. */
+            /* TDMA slot table (0x8000-0x8020): skip IDLE, continue next slot.
+             * All other IDLEs: halt. Wake behavior decided by calypso_trx. */
             if (s->pc >= 0x8000 && s->pc < 0x8020) {
                 return consumed + s->lk_used;
             }
@@ -817,10 +767,17 @@ static int c54x_exec_one(C54xState *s)
             if (idle_total <= 10) {
                 C54_LOG("IDLE#%d @0x%04x SP=0x%04x stack=[0x%04x] insn=%u",
                         idle_total, s->pc, s->sp, s->data[s->sp], s->insn_count);
+                /* Dump last 10 PCs before this IDLE */
+                C54_LOG("  trail: %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x",
+                        pc_ring[(pc_ring_idx-10)&15], pc_ring[(pc_ring_idx-9)&15],
+                        pc_ring[(pc_ring_idx-8)&15], pc_ring[(pc_ring_idx-7)&15],
+                        pc_ring[(pc_ring_idx-6)&15], pc_ring[(pc_ring_idx-5)&15],
+                        pc_ring[(pc_ring_idx-4)&15], pc_ring[(pc_ring_idx-3)&15],
+                        pc_ring[(pc_ring_idx-2)&15], pc_ring[(pc_ring_idx-1)&15]);
             }
             s->idle = true;
-            return 0;
-        }
+            return 0;  /* PC stays on IDLE; wake code advances PC */
+        } /* IDLE */
         if (hi8 == 0xF4) {
             /* F4xx: unconditional branch/call and special instructions.
              * Some F4xx instructions are 1-word (FRET, FRETE, RETE, TRAP, NOP, etc.)
@@ -3242,26 +3199,6 @@ int c54x_run(C54xState *s, int n_insns)
                 C54_LOG("  AR0=%04x AR1=%04x AR2=%04x AR3=%04x AR4=%04x AR5=%04x AR6=%04x AR7=%04x",
                         s->ar[0], s->ar[1], s->ar[2], s->ar[3],
                         s->ar[4], s->ar[5], s->ar[6], s->ar[7]);
-            }
-        }
-
-        /* IRQ vec area trace: log every PC visit in 0xFFCC-0xFFE0
-         * (INT3 + TINT0 + BRINT0 vec slots). Captures the 3 actual
-         * 4-word handlers our IRQ INT3 dispatch lands on at IPTR=0x1ff.
-         * 80 unique PCs max, log first 4 visits each. */
-        if (s->pc >= 0xFFCC && s->pc < 0xFFE0 && !s->rpt_active) {
-            static uint8_t vec_visits[20];   /* index 0 = 0xffcc */
-            int idx = s->pc - 0xFFCC;
-            if (vec_visits[idx] < 4) {
-                vec_visits[idx]++;
-                C54_LOG("VEC-TRACE PC=0x%04x op=0x%04x SP=0x%04x A=0x%010llx "
-                        "B=0x%010llx TC=%d INTM=%d ar7=%04x",
-                        s->pc, prog_fetch(s, s->pc), s->sp,
-                        (unsigned long long)(s->a & 0xFFFFFFFFFFLL),
-                        (unsigned long long)(s->b & 0xFFFFFFFFFFLL),
-                        !!(s->st0 & ST0_TC),
-                        !!(s->st1 & ST1_INTM),
-                        s->ar[7]);
             }
         }
 
