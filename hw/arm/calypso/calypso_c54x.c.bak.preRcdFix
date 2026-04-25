@@ -1654,28 +1654,16 @@ static int c54x_exec_one(C54xState *s)
             else if ((cc & 0x0C) == 0x08) cond = !(s->st0 & ST0_C);      /* NC */
             else cond = true; /* unknown: take it */
             if (cond) {
-                /* RCD is *delayed*: per SPRU172C the next 2 instructions
-                 * after RCD execute before the return takes effect. The
-                 * old "skip delay slots" implementation broke FB-detection
-                 * because slots like `LD #0, B` at PROM0 0x75ea were never
-                 * run, leaving accumulator state stale and the dispatcher
-                 * at 0x7700 looping forever.
-                 *
-                 * Fix: arm the existing delayed_pc/delay_slots machinery —
-                 * pop the return address now, advance PC normally so the
-                 * next 2 instructions execute as delay slots, then the
-                 * main loop forces PC = delayed_pc. */
                 uint16_t ra = data_read(s, s->sp); s->sp++;
-                s->delayed_pc  = ra;
-                s->delay_slots = 2;
                 {
                     static int rcd_log = 0;
                     if (rcd_log < 50)
-                        C54_LOG("RCD/RETD PC=0x%04x cc=0x%02x -> ra=0x%04x SP=0x%04x (delayed)",
+                        C54_LOG("RCD/RETD PC=0x%04x cc=0x%02x -> ra=0x%04x SP=0x%04x",
                                 s->pc, cc, ra, s->sp);
                     rcd_log++;
                 }
-                return consumed + s->lk_used;
+                s->pc = ra;
+                return 0;
             }
             return consumed + s->lk_used;
         }
@@ -3334,18 +3322,6 @@ int c54x_run(C54xState *s, int n_insns)
             s->pc += consumed;
         s->pc &= 0xFFFF;  /* C54x has 16-bit PC (23-bit with XPC, but wrap at 16-bit) */
         /* consumed == 0 means PC was set by branch */
-
-        /* Delayed-branch slot countdown.
-         * RCD (and later CALLD/RETD/BD/CCD if extended) sets delayed_pc and
-         * delay_slots = 2. The two instructions following the RCD execute
-         * as normal pipeline slots; once both have completed the branch
-         * commits by forcing PC to delayed_pc. */
-        if (s->delay_slots > 0) {
-            s->delay_slots--;
-            if (s->delay_slots == 0) {
-                s->pc = s->delayed_pc;
-            }
-        }
 
         s->cycles++;
         s->insn_count++;

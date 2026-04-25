@@ -198,7 +198,6 @@ typedef struct C54xState {
     /* State */
     bool     running;
     bool     idle;       /* IDLE instruction executed */
-    bool     boot_done;  /* Set on first FRET — ends DSP init phase */
     uint64_t cycles;
     uint32_t insn_count;
 

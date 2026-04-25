@@ -63,9 +63,6 @@ static inline int asm_shift(C54xState *s)
  * Memory access
  * ================================================================ */
 
-/* Forward decl: used by data_write() VECDUMP at MMR_PMST. */
-static uint16_t prog_read(C54xState *s, uint32_t addr);
-
 static uint16_t data_read(C54xState *s, uint16_t addr)
 {
     /* === DARAM discovery histogram ===
@@ -279,38 +276,11 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
         case MMR_RSA:  s->rsa = val; return;
         case MMR_REA:  s->rea = val; return;
         case MMR_PMST:
-            {
-                static unsigned pmst_wr_attempts = 0;
-                if (pmst_wr_attempts++ < 100)
-                    C54_LOG("PMST WR attempt #%u: val=0x%04x cur=0x%04x PC=0x%04x insn=%u",
-                            pmst_wr_attempts, val, s->pmst, s->pc, s->insn_count);
-            }
             if (val != s->pmst) {
                 uint16_t old_iptr = (s->pmst >> PMST_IPTR_SHIFT) & 0x1FF;
                 uint16_t new_iptr = (val >> PMST_IPTR_SHIFT) & 0x1FF;
                 C54_LOG("PMST change 0x%04x → 0x%04x (IPTR=0x%03x→0x%03x OVLY=%d) PC=0x%04x SP=0x%04x insn=%u",
                         s->pmst, val, old_iptr, new_iptr, !!(val & PMST_OVLY), s->pc, s->sp, s->insn_count);
-
-                static uint16_t last_dumped_iptr = 0xFFFF;
-                if (new_iptr != last_dumped_iptr) {
-                    last_dumped_iptr = new_iptr;
-                    uint32_t base = (uint32_t)new_iptr << 7;
-                    uint16_t saved_pmst = s->pmst;
-                    s->pmst = val;
-                    C54_LOG("VECDUMP IPTR=0x%03x base=0x%04x (32 vectors):",
-                            new_iptr, (uint16_t)base);
-                    for (int vec = 0; vec < 32; vec++) {
-                        uint32_t a = base + vec * 4;
-                        uint16_t w0 = prog_read(s, a + 0);
-                        uint16_t w1 = prog_read(s, a + 1);
-                        uint16_t w2 = prog_read(s, a + 2);
-                        uint16_t w3 = prog_read(s, a + 3);
-                        fprintf(stderr,
-                                "[c54x] vec %2d @ 0x%04x : %04x %04x %04x %04x\n",
-                                vec, (uint16_t)a, w0, w1, w2, w3);
-                    }
-                    s->pmst = saved_pmst;
-                }
             }
             s->pmst = val; return;
         case MMR_XPC:
@@ -741,14 +711,6 @@ static int c54x_exec_one(C54xState *s)
             }
             uint16_t ra = data_read(s, s->sp); s->sp++;
             s->st1 &= ~ST1_INTM;
-            {
-                static uint64_t rete_count;
-                rete_count++;
-                if (rete_count <= 20 || (rete_count % 100) == 0)
-                    C54_LOG("RETE #%llu PC=0x%04x -> ra=0x%04x SP=0x%04x",
-                            (unsigned long long)rete_count,
-                            s->pc, ra, s->sp);
-            }
             s->pc = ra; return 0;
         }
         if (op == 0xF4E4) {
@@ -1279,9 +1241,46 @@ static int c54x_exec_one(C54xState *s)
             if ((op & 0x08) == 0) s->ar[yar_l]++; else s->ar[yar_l]--;
             return consumed + s->lk_used;
         }
+        if (op == 0xF495) {
+            /* NOP */
+            return consumed + s->lk_used;
+        }
+        /* F4E2 = BACC A, F5E2 = BACC B (per tic54x-opc.c, mask 0xFEFF) */
+        if (op == 0xF4E2) { s->pc = (uint16_t)(s->a & 0xFFFF); return 0; }
+        if (op == 0xF5E2) { s->pc = (uint16_t)(s->b & 0xFFFF); return 0; }
+        /* F4E3 = CALA A, F5E3 = CALA B — push next-PC, jump to acc low 16 bits */
+        if (op == 0xF4E3) {
+            uint16_t ret_pc = s->pc + 1;
+            s->sp = (s->sp - 1) & 0xFFFF;
+            data_write(s, s->sp, ret_pc);
+            s->pc = (uint16_t)(s->a & 0xFFFF);
+            return 0;
+        }
+        if (op == 0xF5E3) {
+            uint16_t ret_pc = s->pc + 1;
+            s->sp = (s->sp - 1) & 0xFFFF;
+            data_write(s, s->sp, ret_pc);
+            s->pc = (uint16_t)(s->b & 0xFFFF);
+            return 0;
+        }
+        if (op == 0xF4E4) {
+            /* IDLE */
+            s->idle = true;
+            return consumed + s->lk_used;  /* Advance PC past IDLE */
+        }
         /* F8xx: branches, RPT, BANZ, CALL, RET variants */
         if (hi8 == 0xF8) {
             uint8_t sub = (op >> 4) & 0xF;
+            if (sub == 0x0) {
+                /* F600/F601: ABS src[,dst] — absolute value of accumulator */
+                int src = op & 1;
+                int64_t *acc = src ? &s->b : &s->a;
+                int64_t val = sext40(*acc);
+                if (val < 0) val = -val;
+                *acc = sext40(val);
+                /* Set C if input was -2^39 (saturate), clear OVx if OVM */
+                return consumed + s->lk_used;
+            }
             if (sub == 0x2) {
                 /* F82x: RPTB pmad */
                 op2 = prog_fetch(s, s->pc + 1);
@@ -1383,6 +1382,16 @@ static int c54x_exec_one(C54xState *s)
         /* F6xx: various — LD/ST acc-acc, ABDST, SACCD, etc. */
         if (hi8 == 0xF6) {
             uint8_t sub = (op >> 4) & 0xF;
+            if (sub == 0x0) {
+                /* F600/F601: ABS src[,dst] — absolute value of accumulator */
+                int src = op & 1;
+                int64_t *acc = src ? &s->b : &s->a;
+                int64_t val = sext40(*acc);
+                if (val < 0) val = -val;
+                *acc = sext40(val);
+                /* Set C if input was -2^39 (saturate), clear OVx if OVM */
+                return consumed + s->lk_used;
+            }
             if (sub == 0x2) {
                 /* F62x: LD A, dst_shift, B or LD B, dst_shift, A */
                 int dst = op & 1;
@@ -1429,8 +1438,15 @@ static int c54x_exec_one(C54xState *s)
                 s->st0 |= (1 << bit);
                 return consumed + s->lk_used;
             }
-            /* Note: 0xF5E2/F5E3 (BACC B / CALA B) are handled earlier alongside
-             * their F4 counterparts, so they never reach this F5xx block. */
+            /* F5E2 = BACC B, F5E3 = CALA B (already handled above for F4 versions) */
+            if (op == 0xF5E2) { s->pc = (uint16_t)(s->b & 0xFFFF); return 0; }
+            if (op == 0xF5E3) {
+                uint16_t ret_pc = s->pc + 1;
+                s->sp = (s->sp - 1) & 0xFFFF;
+                data_write(s, s->sp, ret_pc);
+                s->pc = (uint16_t)(s->b & 0xFFFF);
+                return 0;
+            }
             /* RPT #k (short immediate) — kept as fallback, must advance PC. */
             s->rpt_count = op & 0xFF;
             s->rpt_active = true;
@@ -1440,6 +1456,16 @@ static int c54x_exec_one(C54xState *s)
         /* F7xx: LD/ST #k to various registers */
         if (hi8 == 0xF7) {
             uint8_t sub = (op >> 4) & 0xF;
+            if (sub == 0x0) {
+                /* F600/F601: ABS src[,dst] — absolute value of accumulator */
+                int src = op & 1;
+                int64_t *acc = src ? &s->b : &s->a;
+                int64_t val = sext40(*acc);
+                if (val < 0) val = -val;
+                *acc = sext40(val);
+                /* Set C if input was -2^39 (saturate), clear OVx if OVM */
+                return consumed + s->lk_used;
+            }
             uint16_t k = op & 0xFF;
             switch (sub) {
             case 0x0: /* F70x: LD #k8, ASM */
@@ -1654,28 +1680,16 @@ static int c54x_exec_one(C54xState *s)
             else if ((cc & 0x0C) == 0x08) cond = !(s->st0 & ST0_C);      /* NC */
             else cond = true; /* unknown: take it */
             if (cond) {
-                /* RCD is *delayed*: per SPRU172C the next 2 instructions
-                 * after RCD execute before the return takes effect. The
-                 * old "skip delay slots" implementation broke FB-detection
-                 * because slots like `LD #0, B` at PROM0 0x75ea were never
-                 * run, leaving accumulator state stale and the dispatcher
-                 * at 0x7700 looping forever.
-                 *
-                 * Fix: arm the existing delayed_pc/delay_slots machinery —
-                 * pop the return address now, advance PC normally so the
-                 * next 2 instructions execute as delay slots, then the
-                 * main loop forces PC = delayed_pc. */
                 uint16_t ra = data_read(s, s->sp); s->sp++;
-                s->delayed_pc  = ra;
-                s->delay_slots = 2;
                 {
                     static int rcd_log = 0;
                     if (rcd_log < 50)
-                        C54_LOG("RCD/RETD PC=0x%04x cc=0x%02x -> ra=0x%04x SP=0x%04x (delayed)",
+                        C54_LOG("RCD/RETD PC=0x%04x cc=0x%02x -> ra=0x%04x SP=0x%04x",
                                 s->pc, cc, ra, s->sp);
                     rcd_log++;
                 }
-                return consumed + s->lk_used;
+                s->pc = ra;
+                return 0;
             }
             return consumed + s->lk_used;
         }
@@ -3020,37 +3034,6 @@ int c54x_run(C54xState *s, int n_insns)
     run_num++;
 
     while (executed < n_insns && s->running && !s->idle) {
-        /* Replay any interrupt that fired while INTM=1.
-         * c54x_interrupt_ex sets IFR but does nothing else when INTM=1;
-         * the real C54x re-evaluates pending interrupts every cycle, so
-         * as soon as INTM clears (via RETE or RSBX INTM) a pending
-         * BRINT0/TINT0/... must dispatch. Without this, a BRINT0 that
-         * arrived inside another ISR is lost and the FB correlator never
-         * receives its I/Q samples (d_fb_det stays 0). */
-        if (!(s->st1 & ST1_INTM)) {
-            uint16_t pending = s->ifr & s->imr;
-            if (pending) {
-                int imr_bit = __builtin_ctz(pending);
-                int vec = imr_bit + 16;
-                s->ifr &= ~(1 << imr_bit);
-                s->sp--;
-                data_write(s, s->sp, s->pc);
-                if (s->pmst & PMST_APTS) {
-                    s->sp--;
-                    data_write(s, s->sp, s->xpc);
-                }
-                s->st1 |= ST1_INTM;
-                uint16_t iptr = (s->pmst >> PMST_IPTR_SHIFT) & 0x1FF;
-                s->pc = (iptr * 0x80) + vec * 4;
-                static int pending_log = 0;
-                if (pending_log < 20) {
-                    C54_LOG("PENDING IRQ replay vec=%d bit=%d PC->0x%04x SP=0x%04x insn=%u",
-                            vec, imr_bit, s->pc, s->sp, s->insn_count);
-                    pending_log++;
-                }
-            }
-        }
-
         /* Record PC in ring buffer */
         pc_ring[pc_ring_idx & 255] = s->pc;
         pc_ring_idx++;
@@ -3335,43 +3318,8 @@ int c54x_run(C54xState *s, int n_insns)
         s->pc &= 0xFFFF;  /* C54x has 16-bit PC (23-bit with XPC, but wrap at 16-bit) */
         /* consumed == 0 means PC was set by branch */
 
-        /* Delayed-branch slot countdown.
-         * RCD (and later CALLD/RETD/BD/CCD if extended) sets delayed_pc and
-         * delay_slots = 2. The two instructions following the RCD execute
-         * as normal pipeline slots; once both have completed the branch
-         * commits by forcing PC to delayed_pc. */
-        if (s->delay_slots > 0) {
-            s->delay_slots--;
-            if (s->delay_slots == 0) {
-                s->pc = s->delayed_pc;
-            }
-        }
-
         s->cycles++;
         s->insn_count++;
-
-        /* One-shot diagnostic at boot+: dump 0xB900 vector table
-         * (the relocated table the firmware should use if it sets
-         * IPTR=0x172) plus DSP runtime state. Helps diagnose why the
-         * IPTR relocation never fires in some runs. */
-        if (s->insn_count == 100000) {
-            uint16_t iptr = (s->pmst >> PMST_IPTR_SHIFT) & 0x1FF;
-            C54_LOG("BOOT+100k STATE: PMST=0x%04x IPTR=0x%03x IMR=0x%04x IFR=0x%04x ST0=0x%04x ST1=0x%04x INTM=%d PC=0x%04x SP=0x%04x XPC=%d",
-                    s->pmst, iptr, s->imr, s->ifr, s->st0, s->st1,
-                    !!(s->st1 & ST1_INTM), s->pc, s->sp, s->xpc);
-            C54_LOG("BOOT+100k VECDUMP-FORCED base=0xB900 (32 vectors, alt table @ IPTR=0x172):");
-            for (int vec = 0; vec < 32; vec++) {
-                uint32_t a = 0xB900 + vec * 4;
-                uint16_t w0 = prog_read(s, a + 0);
-                uint16_t w1 = prog_read(s, a + 1);
-                uint16_t w2 = prog_read(s, a + 2);
-                uint16_t w3 = prog_read(s, a + 3);
-                fprintf(stderr,
-                        "[c54x] alt vec %2d @ 0x%04x : %04x %04x %04x %04x\n",
-                        vec, (uint16_t)a, w0, w1, w2, w3);
-            }
-        }
-
         executed++;
     }
     return executed;
@@ -3581,13 +3529,12 @@ void c54x_interrupt_ex(C54xState *s, int vec, int imr_bit)
         s->pc = (iptr * 0x80) + vec * 4;
     }
 
-    /* Log interrupts: first 20 + every 100th, so we can count them. */
-    static uint64_t int_log_count;
-    int_log_count++;
-    if (int_log_count <= 20 || (int_log_count % 100) == 0) {
-        C54_LOG("IRQ #%llu vec=%d bit=%d: INTM=%d IMR=0x%04x IFR=0x%04x idle=%d PC=0x%04x",
-                (unsigned long long)int_log_count,
+    /* Log first few interrupts */
+    static int int_log_count = 0;
+    if (int_log_count < 5) {
+        C54_LOG("IRQ vec=%d bit=%d: INTM=%d IMR=0x%04x IFR=0x%04x idle=%d PC=0x%04x",
                 vec, imr_bit, !!(s->st1 & ST1_INTM), s->imr, s->ifr, s->idle, s->pc);
+        int_log_count++;
     }
 }
 
