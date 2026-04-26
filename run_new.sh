@@ -59,6 +59,7 @@ tmux new-session -d -s $SESSION -n qemu
 # /tmp/osmocom_l2 so osmocon can create it.
 L1CTL_SOCK="$QEMU_DUMMY_SOCK" \
 CALYPSO_DSP_ROM=/opt/GSM/calypso_dsp.txt \
+CALYPSO_SIM_CFG="$MOBILE_CFG" \
 "$QEMU" -M calypso -cpu arm946 \
     -serial pty -serial pty \
     -monitor "unix:${MON_SOCK},server,nowait" \

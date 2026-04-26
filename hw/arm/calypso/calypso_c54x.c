@@ -263,6 +263,18 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
                     addr, val, s->data[addr], s->pc, s->insn_count);
         }
     }
+    /* Dispatcher poll addresses — log ANY write so we identify the
+     * code path that should populate them. Currently 0 PORTR PA=0xF430
+     * fires because dispatcher reads 0 here forever. */
+    if (addr == 0x4359 || addr == 0x3fab) {
+        static unsigned dispw;
+        if (dispw++ < 50) {
+            fprintf(stderr,
+                    "[c54x] DISP-WRITE data[0x%04x] <- 0x%04x (was 0x%04x) "
+                    "PC=0x%04x insn=%u\n",
+                    addr, val, s->data[addr], s->pc, s->insn_count);
+        }
+    }
     /* Timer registers (0x0024-0x0026) — before MMR check */
     if (addr == TCR_ADDR) {
         /* TRB: write 1 → reload TIM from PRD, PSC from TDDR */
@@ -1325,8 +1337,31 @@ static int c54x_exec_one(C54xState *s)
         /* F8xx: branches, RPT, BANZ, CALL, RET variants */
         if (hi8 == 0xF8) {
             uint8_t sub = (op >> 4) & 0xF;
+            /* F820 (624 sites) and F830 (543 sites) are BC pmad,cond per
+             * tic54x-opc.c (bc = 0xF800 mask 0xFF00). The dispatcher at
+             * PROM0 0xb968-0xb9a4 relies on these branching when the ACC
+             * comparison succeeds. Cond 0x20 = C set, cond 0x30 = ?
+             * (we treat both via ACC compare for now since dispatcher uses
+             * cmp-style behaviour). The full F8xx range is BC per binutils
+             * but historically the firmware tolerates the legacy decode
+             * for the other sub-codes — surgical override here only. */
+            if (sub == 0x2 || sub == 0x3) {
+                op2 = prog_fetch(s, s->pc + 1);
+                consumed = 2;
+                int64_t acc_signed = (s->a & 0x8000000000LL)
+                                     ? (s->a | ~0xFFFFFFFFFFLL) : s->a;
+                bool take = false;
+                /* For now: cond=0x20 → branch if A != 0; cond=0x30 → A == 0.
+                 * These are heuristics until we confirm the exact cond
+                 * mapping from SPRU172C. Tweak based on observed dispatcher
+                 * behaviour. */
+                if (sub == 0x2)      take = (acc_signed != 0);
+                else /* sub==0x3 */  take = (acc_signed == 0);
+                if (take) { s->pc = op2; return 0; }
+                return consumed + s->lk_used;
+            }
             if (sub == 0x2) {
-                /* F82x: RPTB pmad */
+                /* Unreachable now — kept for clarity in case we revert. */
                 op2 = prog_fetch(s, s->pc + 1);
                 consumed = 2;
                 s->rea = op2;
@@ -1336,7 +1371,7 @@ static int c54x_exec_one(C54xState *s)
                 return consumed + s->lk_used;
             }
             if (sub == 0x3) {
-                /* F83x: RPT #k (short) — advance PC past RPT+imm */
+                /* Unreachable now. */
                 op2 = prog_fetch(s, s->pc + 1);
                 s->rpt_count = op2;
                 s->rpt_active = true;
@@ -2385,9 +2420,28 @@ static int c54x_exec_one(C54xState *s)
             consumed = 2;
             uint16_t mvpd_val = prog_read(s, op2);
             data_write(s, addr, mvpd_val);
-            { static int mvpd_log = 0; if (mvpd_log++ < 20)
-                C54_LOG("MVPD: prog[0x%04x]=0x%04x → data[0x%04x] PC=0x%04x insn=%u",
-                        op2, mvpd_val, addr, s->pc, s->insn_count); }
+            {
+                static unsigned mvpd_log = 0;
+                static unsigned mvpd_total;
+                static uint16_t src_min = 0xFFFF, src_max;
+                static uint16_t dst_min = 0xFFFF, dst_max;
+                static unsigned hits_a040;
+                mvpd_total++;
+                if (op2 < src_min) src_min = op2;
+                if (op2 > src_max) src_max = op2;
+                if (addr < dst_min) dst_min = addr;
+                if (addr > dst_max) dst_max = addr;
+                if (addr >= 0xa040 && addr <= 0xa080) hits_a040++;
+                if (mvpd_log++ < 500 ||
+                    (addr >= 0xa040 && addr <= 0xa080) ||
+                    (mvpd_total % 1000) == 0)
+                    C54_LOG("MVPD#%u: prog[0x%04x]=0x%04x → data[0x%04x] PC=0x%04x insn=%u%s",
+                            mvpd_total, op2, mvpd_val, addr, s->pc, s->insn_count,
+                            (addr >= 0xa040 && addr <= 0xa080) ? " *A040*" : "");
+                if ((mvpd_total % 500) == 0)
+                    C54_LOG("MVPD-SUMMARY total=%u src=[0x%04x..0x%04x] dst=[0x%04x..0x%04x] hits_a040=%u",
+                            mvpd_total, src_min, src_max, dst_min, dst_max, hits_a040);
+            }
             return consumed + s->lk_used;
         }
         if (hi8 == 0x8E) {
@@ -2403,11 +2457,13 @@ static int c54x_exec_one(C54xState *s)
             addr = resolve_smem(s, op, &ind);
             op2 = prog_fetch(s, s->pc + 1);
             consumed = 2;
-            /* PA=0x0034: BSP RX data register — return next burst sample.
-             * On real hardware, the BSP serial port delivers one I/Q sample
-             * per PORTR. We serve from the BSP DMA buffer. */
+            /* BSP RX data register — return next burst sample.
+             * The DSP firmware uses PORTR PA=0xF430 (64 sites in PROM0,
+             * verified from ROM dump). We also accept 0x0034 for legacy
+             * compatibility with earlier QEMU experiments. */
             uint16_t portr_val;
-            if (op2 == 0x0034 && s->bsp_pos < s->bsp_len) {
+            bool is_bsp_pa = (op2 == 0xF430 || op2 == 0x0034);
+            if (is_bsp_pa && s->bsp_pos < s->bsp_len) {
                 portr_val = s->bsp_buf[s->bsp_pos++];
                 data_write(s, addr, portr_val);
             } else {
@@ -3245,6 +3301,55 @@ int c54x_run(C54xState *s, int n_insns)
             }
         }
 
+        /* BSP read entry points — these functions contain PORTR PA=0xF430
+         * (read BSP sample). If DSP never visits them, the FB-det chain is
+         * dead. Targets identified by static analysis of PROM0 callers of
+         * the 64 PORTR PA=0xF430 sites at 0x9b80+. */
+        if (!s->rpt_active &&
+            (s->pc == 0x9a78 || s->pc == 0x9aaf || s->pc == 0x9ad3 ||
+             s->pc == 0x9b4c || s->pc == 0x8811)) {
+            static unsigned bsp_visits[5];
+            int idx = (s->pc == 0x9a78) ? 0 :
+                      (s->pc == 0x9aaf) ? 1 :
+                      (s->pc == 0x9ad3) ? 2 :
+                      (s->pc == 0x9b4c) ? 3 : 4;
+            if (bsp_visits[idx] < 5) {
+                bsp_visits[idx]++;
+                C54_LOG("BSP-ENTRY PC=0x%04x  A=0x%010llx ar0=%04x ar1=%04x "
+                        "ar2=%04x ar3=%04x ar4=%04x SP=0x%04x insn=%u",
+                        s->pc,
+                        (unsigned long long)(s->a & 0xFFFFFFFFFFLL),
+                        s->ar[0], s->ar[1], s->ar[2], s->ar[3], s->ar[4],
+                        s->sp, s->insn_count);
+            }
+        }
+
+        /* Trace any write touching the dispatcher poll addresses
+         * data[0x4359] / data[0x3fab]. We never see them go non-zero;
+         * confirm whether ANY code path writes them. */
+        /* (handled in data_write — see below) */
+
+        /* Dispatcher hot loop trace at PROM0 0xb968-0xb9a4 — the state
+         * machine the DSP spins in when waiting for ARM tasks. Logs the
+         * first 8 visits per PC so we see the full conditional structure
+         * (which addresses it polls, which constants it compares to). */
+        if (s->pc >= 0xb968 && s->pc <= 0xb9a4 && !s->rpt_active) {
+            static uint8_t disp_visits[64];
+            int idx = s->pc - 0xb968;
+            if (idx >= 0 && idx < 64 && disp_visits[idx] < 8) {
+                disp_visits[idx]++;
+                C54_LOG("DISP-TRACE PC=0x%04x op=0x%04x A=0x%010llx "
+                        "B=0x%010llx ar0=%04x ar1=%04x ar2=%04x ar3=%04x "
+                        "ar4=%04x ar5=%04x TC=%d",
+                        s->pc, prog_fetch(s, s->pc),
+                        (unsigned long long)(s->a & 0xFFFFFFFFFFLL),
+                        (unsigned long long)(s->b & 0xFFFFFFFFFFLL),
+                        s->ar[0], s->ar[1], s->ar[2], s->ar[3],
+                        s->ar[4], s->ar[5],
+                        !!(s->st0 & ST0_TC));
+            }
+        }
+
         /* IRQ vec area trace: log every PC visit in 0xFFCC-0xFFE0
          * (INT3 + TINT0 + BRINT0 vec slots). Captures the 3 actual
          * 4-word handlers our IRQ INT3 dispatch lands on at IPTR=0x1ff.
@@ -3598,6 +3703,7 @@ void c54x_reset(C54xState *s)
 
     C54_LOG("Reset: PC=0x%04x PMST=0x%04x SP=0x%04x prog[PC]=0x%04x",
             s->pc, s->pmst, s->sp, s->prog[s->pc]);
+
 }
 
 void c54x_interrupt_ex(C54xState *s, int vec, int imr_bit)

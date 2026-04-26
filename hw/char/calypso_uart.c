@@ -714,9 +714,6 @@ static void calypso_uart_write(void *opaque, hwaddr offset,
 
     case REG_MDR1:
         s->mdr1 = value;
-        /* MDR1 write is one of the earliest firmware UART accesses.
-         * Trigger firmware patches now (before any cons_puts call). */
-        calypso_fw_patch_apply();
         fprintf(stderr, "[UART:%s] MDR1=0x%02x\n",
                 s->label ? s->label : "?",
                 (unsigned)value);
