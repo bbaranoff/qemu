@@ -148,6 +148,27 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
                     (unsigned)offset, (unsigned)value, size, s->fn);
     }
 
+    /* DSP bootloader mailbox writes (osmocom-bb dsp.c BL_*).
+     * ARM byte → DSP word mapping (api_ram[w] ↔ ARM byte w*2):
+     *   ARM 0x0FF8 BL_ADDR_HI    ↔ DSP word 0x0FFC
+     *   ARM 0x0FFA BL_SIZE       ↔ DSP word 0x0FFD
+     *   ARM 0x0FFC BL_ADDR_LO    ↔ DSP word 0x0FFE  (BACC target)
+     *   ARM 0x0FFE BL_CMD_STATUS ↔ DSP word 0x0FFF  (poll value)
+     * Trace every write so we can confirm the handshake actually reaches
+     * the cells the bootloader at PROM0 0xb41c-0xb430 reads. */
+    if (offset == 0x0FF8 || offset == 0x0FFA ||
+        offset == 0x0FFC || offset == 0x0FFE) {
+        const char *name = (offset == 0x0FF8) ? "BL_ADDR_HI"   :
+                           (offset == 0x0FFA) ? "BL_SIZE"      :
+                           (offset == 0x0FFC) ? "BL_ADDR_LO"   :
+                                                "BL_CMD_STATUS";
+        static unsigned bl_log;
+        if (++bl_log <= 200)
+            TRX_LOG("BL ARM WR %s [arm=0x%04x dsp_word=0x%04x] = 0x%04x sz=%d fn=%u",
+                    name, (unsigned)offset, (unsigned)(offset/2 + 0x0800),
+                    (unsigned)value, size, s->fn);
+    }
+
     /* Log task writes for debugging — no interception, no faking.
      * The DSP handles all tasks via shared API RAM. */
     {

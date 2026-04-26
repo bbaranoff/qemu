@@ -1,137 +1,153 @@
 # TODO — chemin FBSB QEMU Calypso
 
-État au 2026-04-26 fin de session (suite session matin).
+État au 2026-04-26 fin de soirée.
 
 ## État courant
 
-**Run end-to-end NO-HACK** : QEMU + osmocon natif + bridge + BTS + mobile.
-- Firmware ARM tourne propre (battery_init, DSP API check, PM scan complet 514→823, boucle FBSB)
-- SIM ISO 7816 / GSM 11.11 émulée natif (IMSI/Ki chargés du `mobile.cfg` partagé avec le mobile L23)
-- 0 hack firmware restant, 0 inject/cpu_physical_memory_write, fw_console poller actif
+Le bootloader DSP termine enfin son handshake avec l'ARM. Le DSP exécute le user
+code à PROM0 0x7000 puis dans une grande zone DARAM uploadée (0x10ab → 0x148d
+→ 0x2f13 → ...). Plus de stack-overflow, plus de wait loop infini. La BTS ne
+crash plus pour clock skew. **FB1/FB2 jamais imprimé** : le DSP n'écrit pas
+encore d_fb_det avec une vraie détection — INTM probablement encore à 1.
 
-**Bug racine restant** : DSP n'entre **JAMAIS** dans le code FB-det (PORTR PA=0xF430 jamais exécuté).
+## Pipeline utilisé
 
-## Architecture nouvelle (à connaître pour next session)
-
-### Module SIM (`calypso_sim.c`, ~480 lignes)
-- Header `include/hw/arm/calypso/calypso_sim.h`
-- Wirage dans `calypso_trx.c`: `s->sim = calypso_sim_new(s->irqs[CALYPSO_IRQ_SIM])`
-- Registres `0xFFFE0000-0xFFFE000E` : CMD/STAT/CONF1/CONF2/IT/DRX/DTX/MASKIT
-- IT_RX **level-sensitive** (recompute depuis FIFO), IRQ raise/lower (pas pulse)
-- IT_WT timer (2ms après FIFO drain) — débloque `calypso_sim_powerup` polling rxDoneFlag
-- File system : MF, DF_GSM, DF_TELECOM + EFs IMSI/ICCID/PLMNsel/SST/ACC/AD/LOCI/BCCH/SPN
-- APDU dispatch : SELECT (A4), READ_BINARY (B0), GET_RESPONSE (C0), STATUS (F2),
-  VERIFY_CHV (20), RUN_GSM_ALGORITHM (88)
-- IMSI/Ki chargés au boot depuis `getenv("CALYPSO_SIM_CFG")` (= `$MOBILE_CFG` via run_new.sh)
-
-### Logs diagnostic en place
-| Tag | Source | Quoi |
-|-----|--------|------|
-| `[sim]` | `calypso_sim.c` | init, ATR, IRQ raise/lower, WT, APDU |
-| `[fw-console]` | `fw_console.c` | printf_buffer firmware (poller 10ms) |
-| `BSP-ENTRY` | `calypso_c54x.c` | DSP visite 0x9a78/0x9aaf/0x9ad3/0x9b4c/0x8811 |
-| `DISP-WRITE` | `calypso_c54x.c` | Write data[0x4359] ou data[0x3fab] |
-| `DISP-TRACE` | `calypso_c54x.c` | Dispatcher hot loop 0xb968-0xb9a4 |
-| `PORTR PA=` | `calypso_c54x.c` | Tous accès I/O port DSP |
-| `MVPD#N` | `calypso_c54x.c` | Move Program→Data au boot |
-| `VEC-TRACE` | `calypso_c54x.c` | IRQ vec slots 0xFFCC-0xFFE0 |
-
-### Fix opcodes appliqués
-- **F820 = BC if A != 0**, **F830 = BC if A == 0** (surgical override, le reste F8xx garde l'ancien décodage)
-- **PORTR PA=0xF430 = BSP RX** (en plus de 0x0034 pour compat)
-- (CALLD/RETD delay slots restent à faire — voir #4)
-
-## TODO ordre priorité
-
-### Priorité A — Diagnostic FB-det final
-
-**#1 Tracer BACC/CALA dynamiquement**
-- Aucun chemin STATIQUE depuis dispatcher 0xb990, IRQ vecs 0xFF80-FFB4, ou boot 0xB410 vers les FB functions (0xa0c9, 0xa0ce, 0xa140, 0xa0ed, 0x8817, 0x8811)
-- Hypothèse : le call chain passe par BACC (Branch on Accumulator) ou CALA (Call Accumulator), invisibles en analyse statique
-- Action : ajouter dans `calypso_c54x.c` un log `DYN-CALL src=PC tgt=A_low` à chaque exec BACC/CALA. Si on voit cible dans `0xa0XX`-`0xa1XX` ou `0x88XX`-`0x99XX`, le chemin existe et il faut comprendre quand il fire.
-
-**#2 Vérifier upload firmware DSP par osmocom-bb**
-- 0 MVPD jamais exécuté dans tous nos runs (confirmé)
-- Question : est-ce que osmocom-bb upload un firmware DSP en DARAM via une autre méthode (ARM writes dans api_ram → DSP exécute) ?
-- Grep `/opt/GSM/osmocom-bb/src/target/firmware/` pour : `dsp_load`, `dsp_upload`, `dsp_patch`, `dsp_dump`
-- Si oui, la séquence n'est probablement pas déclenchée — tracer ARM writes à api_ram
-
-**#3 Si vraiment FB code dead dans ce ROM**
-- Soit chercher un AUTRE dump DSP firmware Calypso (peut-être dans `osmocom-bb` patches ou scripts/dsp_dump_*)
-- Soit accepter que FBSB ne marchera pas et chercher path alternatif (BTS-side mock du résultat ?) — **dernière option, gros hack**
-
-### Priorité B — Cleanup (à faire après FB-det validé)
-
-**#4 Étendre delay slots à CALLD/RETD**
-- RCD utilise déjà delayed_pc/delay_slots (fix session 04-25)
-- CALLD (F274) et RETD (F273) sautent leurs 2 delay slots — peut-être source d'anomalies subtiles
-
-**#5 Cleanup logs diagnostic**
-- DISP-TRACE, BSP-ENTRY, DISP-WRITE, MVPD-SUMMARY, VEC-TRACE — beaucoup de tracers en place
-- Une fois FB-det validé, factoriser ou guarder par flag env
-
-## Run config courante
-
-```bash
-# run_new.sh passe maintenant CALYPSO_SIM_CFG="$MOBILE_CFG" à QEMU
+```
 docker exec -it trying bash -c "killall -9 qemu-system-arm 2>/dev/null; \
   rm -f /tmp/osmocom_l2 /tmp/qemu-calypso-mon.sock /tmp/qemu_l1ctl_disabled; \
   bash /opt/GSM/qemu-src/run_new.sh"
 ```
 
-Pour mobile cfg avec FBSB forcé (sans attendre PM detect) :
+Pour injecter des FB bursts directement (diagnostic) :
 ```
-ms 1
-  ...
-  test-arfcn-stick 514   # ou: stick 514
+docker exec trying python3 /opt/GSM/qemu-src/scripts/inject_fb.py
 ```
 
-## État branche
+## Fixes appliqués cette session (cumul)
 
-Pas de commit récent — toutes les modifs en working tree sur les 3 emplacements (`/home/nirvana/qemu-src/`, `/home/nirvana/qemu/`, container `/opt/GSM/qemu-src/`).
+| Fichier | Fix | Effet mesuré |
+|---|---|---|
+| `bridge.py` | `fn = bts_fn` (anchor double supprimé) | delta 797 → 24 |
+| `bridge.py` | CLK IND wall-clock (471 ms) | BTS ne shutdown plus pour PC clock skew |
+| `calypso_bsp.c` | default daram_addr = 0x3fb0 | DSP lit le bon buffer BSP |
+| `calypso_bsp.c` | BSP_FN_MATCH_WINDOW = 64 | Stale ratio /10 |
+| `calypso_timer.c` | byte access + sémantique CNTL silicon (bit 5 CLOCK_ENABLE, prescaler 4:2) | "LOST 0!" disparaît |
+| `calypso_timer.c` | mode lazy (count interpolé depuis virtual time) | LOST diff converge vers ~1885 (au lieu de chaotique) |
+| `calypso_c54x.c` | opcode SFTC `0xF494/F594` | Fin du F4xx unhandled spam |
+| `calypso_c54x.c` | F4E4 = vrai FRET (workaround retiré) | DSP retourne de 0x770c à 0xb41a |
+| `calypso_c54x.c` | F6E2/F6E3/F6E4/F6E5/F6E6/F6E7/F6EB/F69B (delayed B/CALA/RET/RETED) | Returns from interrupt enabled |
+| `calypso_c54x.c` | STLM 1-word pour 0x88xx/0x89xx | PC sync correct, plus de skip d'instruction |
+| `calypso_c54x.c` | case 0x1 = LD/LDU/LDR (était SUB faux) | A correctement chargé |
+| `calypso_c54x.c` | case 0x0 = ADD/ADDS/SUB/SUBS proper | Plus de << 16 implicite |
+| `calypso_c54x.c` | resolve_smem MOD 12-15 réordonnés (15 = `*(lk)` absolute) | Bootloader lit BL_ADDR_LO=0x7000 |
+| `calypso_c54x.c` | CMPM 0x60xx + BITF 0x61xx (sets TC) | Wait loop bootloader sort enfin |
 
-**Fichiers modifiés/nouveaux session 04-26 (suite)** :
-- `hw/arm/calypso/calypso_sim.c` (nouveau, ~480 lignes)
-- `include/hw/arm/calypso/calypso_sim.h` (nouveau)
-- `hw/arm/calypso/calypso_trx.c` (suppression hacks fw_patch + wirage SIM)
-- `hw/arm/calypso/calypso_c54x.c` (fix F820/F830, PORTR 0xF430, traces BSP-ENTRY/DISP-WRITE)
-- `hw/char/calypso_uart.c` (suppression appel fw_patch_apply)
-- `include/hw/arm/calypso/calypso_trx.h` (suppression proto)
-- `hw/arm/calypso/meson.build` (ajout calypso_sim.c)
-- `hw/arm/calypso/fw_console.c` (poller printf_buffer — déjà session matin)
-- `run_new.sh` (ajout CALYPSO_SIM_CFG=$MOBILE_CFG)
+## Tracers ajoutés
 
-## Historique sessions précédentes
+- `[c54x] DYN-CALL` : tous les BACC/CALA (F4E2/F5E2/F4E3/F5E3) avec data[]/prog[] dump
+- `[c54x] FRET #N` : exec FRET (PC retour, SP, XPC)
+- `[c54x] RETED #N` : exec RETED
+- `[c54x] WATCH-READ #N data[0x0ffc..0x0fff]` : data vs api_ram (mailbox bootloader)
+- `[c54x] WATCH-READ d_fb_det[0x08F8]` : real d_fb_det (était 0x01F0 erroné)
+- `[c54x] WAIT-3DD0` : DSP polls data[0x3dd0]
+- `[c54x] DISP-PTR data[0x3f65]` : dispatcher pointer
+- `[calypso-trx] BL ARM WR` : ARM-side writes à BL_ADDR_HI/SIZE/LO/CMD_STATUS
 
-(Archive complet dans memory `/root/.claude/projects/-home-nirvana/memory/`)
+## Indicateurs au dernier run
 
-### Session 2026-04-26 matin
-VEC-TRACE révèle cycle IRQ tortueux via boot stub. Fix FRET expose 3 bugs latents (MVPD/ISR/mem[0x0ffe]).
-TODO original (#4 MVPD trace, #5 DARAM 0xa04c, #6 mem[0x0ffe], #7 PMST stack) maintenant **OBSOLÈTE** :
-- #4 résolu : 0 MVPD exécuté (boot DSP via C-code copy au reset, pas par MVPD opcode)
-- #5 résolu : PROM0 0xa000+ contient code dense, pas vec table — l'hypothèse IPTR=0x140 était fausse
-- #6 résolu : mem[0x0ffe]=0x10 hors-path (FRET reverté en IDLE)
-- #7 résolu : PMST stable à 0xffa8 (IPTR=0x1FF), corruption unique à 0xdbc7
+| Métrique | Valeur |
+|---|---|
+| FRET count | 1 |
+| RETED count | 0 |
+| RETE count | 0 |
+| DSP WR d_fb_det count | 0 |
+| DYN-CALL count | 1 (BACC à 0x7000 ✓) |
+| IDLE count | 0 (DSP run vraiment) |
+| IRQ INT3 servies | 0 (INTM=1 toujours bloque) |
+| FB1/FB2 print firmware | 0 |
 
-Le vrai bug est le shift de focus identifié 04-26 matin : dispatcher 0xb990 ne dispatch pas. Maintenant on sait pourquoi : **aucun chemin statique vers le FB code**.
+## Bug racine restant
 
-### Session 2026-04-25 (RCD fix)
-- RCD delay slot mécanisme introduit
-- 0x7700 loop cassée, FBSB_CONF (type=0x02) envoyé au mobile
+**INTM=1 forever** : aucun RSBX INTM (`0xf6bb`) jamais exécuté. Le DSP visite
+maintenant énormément de zones DARAM différentes (0x10ab → 0x148d → 0x2f13 →
+...) mais on ne voit jamais visite à PROM0 0xa4d0/0xa510/0xa6c0/0xc660/...
+(addresses des RSBX INTM par CLAUDE.md).
 
-### Sessions 2026-04-04 → 2026-04-17
-Voir mémoires `project_session_2026040X.md` à `project_session_20260417.md`.
-Highlights : bridge server, INTH refactor, opcode fixes (50+), DSP boot stabilisation,
-FB sample buffer localisé à DARAM[0x021f] (12K mots), inner loop FB-det à PROM0 0xa10d.
+Sans clear INTM, l'INT3 frame interrupt fire mais est rejetée, le DSP ne
+process pas task_md=5, n'écrit pas d_fb_det.
 
-## Issues annexes (inchangées)
+## TODO ordre priorité
+
+### Priorité A — Atteindre RSBX INTM
+
+**#1 Tracer où le DSP devrait normalement faire RSBX INTM**
+- Toutes les RSBX INTM sont dans les ISR (INT3, BRINT0, etc.) selon CLAUDE.md
+- Pour entrer dans une ISR, il faut INTM=0. Catch-22.
+- Au boot, INTM=1 par défaut (reset value de ST1).
+- **Hypothèse** : le code uploadé en DARAM par le DSP user contient un RSBX
+  INTM dans son init. Il faut le trouver. Tracer 0xf6bb à chaque exec.
+- **Action** : ajouter dans calypso_c54x.c F6Bx handler un log "RSBX-INTM
+  exec PC=…" si bit==11.
+
+**#2 Vérifier CMPM/BITF / autres opcodes manquants**
+- L'audit a révélé que beaucoup d'opcodes 0x60xx-0x67xx sont mal couverts
+  (seul 0x60/0x61 sont fixés). Voir tic54x-opc.c lignes pour 0x6200-0x67FF :
+  MPY Smem,lk; MAC Smem,lk; etc. À faire selon besoin si DSP spam unimpl.
+
+**#3 Continuer audit case 0x4-0x7 du switch**
+- case 0x2, 0x3 : MAC/MAS/MPY variants (vérifier le shift et les flags)
+- case 0x4, 0x5 : ADD/SUB Smem,SHIFT,SRC1
+- case 0x9 : LD Xmem,SHFT,DST etc
+- Beaucoup d'opcodes PROM peuvent être mal décodés silencieusement.
+
+### Priorité B — Si INT3 servies
+
+**#4 BSP delivery efficiency**
+- STALE ratio toujours élevé (~50:1) malgré window=64
+- Si le DSP atteint enfin son inner correlator, peut-être augmenter window à 128
+
+**#5 Nettoyer les workarounds latents**
+- Le f4e4=IDLE workaround a été retiré. Peut-être d'autres workarounds
+  similaires dans le code (chercher comments "Until X is fixed").
+
+## Run config courante
+
+`run_new.sh` passe `CALYPSO_SIM_CFG="$MOBILE_CFG"` à QEMU pour le module SIM
+(session 04-26 matin) et désactive l'ancien injection hack.
+
+## Session précédente (matin/après-midi 2026-04-26)
+
+Voir mémoires `project_session_20260426*.md`. Résumé des découvertes :
+- Module SIM ISO 7816 émulé natif (calypso_sim.c)
+- Hacks fw_patch supprimés (no INJECT, no fw_patch_apply)
+- BSP daram fix initial 0x3fb0
+- Bridge anchor fix
+- Multiple opcode fixes (SFTC, F6Ex, etc.)
+
+## Session de soirée (cette session, 2026-04-26)
+
+L'audit CLAUDE.md a révélé une cascade de **7 bugs d'opcode majeurs** :
+- F4E4 workaround → vrai FRET
+- F6Ex tous décodés en MVDD
+- 0x88/0x89 STLM décodé en MVDM 2-word
+- case 0x1 = SUB au lieu de LD/LDU
+- case 0x0 = ADD avec << 16 toujours
+- Indirect MOD table 12-15 décalée d'1
+- 0x60xx/0x61xx CMPM/BITF jamais implémentés
+
+Cette série a permis au bootloader de terminer (BACC à 0x7000) et au DSP
+d'entrer dans le user code. Le bug INTM=1 reste.
+
+## Issues annexes
+
+### tmpfs /tmp 16G
+
+`qemu.log` peut atteindre 12G+ avec tous les tracers. Surveiller `df -h /tmp`.
 
 ### Link `-lm` cassé (workaround manuel)
+
 ```bash
 cd /opt/GSM/qemu-src/build
 ninja -t commands qemu-system-arm | tail -1 > /tmp/link.sh
 sed -i 's|$| -lm|' /tmp/link.sh && bash /tmp/link.sh
 ```
-
-### `/tmp` tmpfs 16G
-`qemu.log` peut atteindre 12G+ avec tous les tracers. Surveiller `df -h /tmp`.

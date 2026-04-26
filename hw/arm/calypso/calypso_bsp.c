@@ -52,7 +52,11 @@ uint32_t calypso_trx_get_fn(void);
  * is a QEMU artefact. ±4 frames tolerates bridge/BTS CLK IND jitter and
  * is narrow enough not to swap adjacent FCCH with non-FCCH in the 51-
  * multiframe pattern (FCCH appears every 10 frames on the BCCH slot). */
-#define BSP_FN_MATCH_WINDOW  4
+/* Was 4: too tight for BTS scheduler lookahead (observed delta=1..139 with
+ * mean ~50). 99 % of bursts went stale before the QEMU virtual FN caught up.
+ * 64 covers the typical lookahead and lets the queue drain fast enough that
+ * BDLENA pulses actually consume bursts. */
+#define BSP_FN_MATCH_WINDOW  64
 
 typedef struct {
     int16_t  iq[296];  /* 148 I/Q pairs max */
@@ -310,7 +314,10 @@ static void bsp_trxd_readable(void *opaque)
 void calypso_bsp_init(C54xState *dsp)
 {
     bsp.dsp = dsp;
-    bsp.daram_addr     = parse_uint_env("CALYPSO_BSP_DARAM_ADDR", 0x3fc0);
+    /* DSP reads I/Q at DARAM 0x3fb3-0x3fbe (verified via DARAM RD HIST).
+     * 0x3fc0 was off by 13 words — DSP saw zeros and never advanced past
+     * the FB-det wait loop at PROM0 0x7700. */
+    bsp.daram_addr     = parse_uint_env("CALYPSO_BSP_DARAM_ADDR", 0x3fb0);
     bsp.daram_len      = parse_uint_env("CALYPSO_BSP_DARAM_LEN",  296);
     bsp.bypass_bdlena  = parse_uint_env("CALYPSO_BSP_BYPASS_BDLENA", 0);
     bsp.bursts_seen = 0;
