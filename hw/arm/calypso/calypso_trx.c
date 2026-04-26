@@ -138,6 +138,24 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
     else if (size == 4) { s->dsp_ram[offset/2] = value; s->dsp_ram[offset/2+1] = value >> 16; }
     else ((uint8_t *)s->dsp_ram)[offset] = value;
 
+    /* Mirror to DSP s->data[] so prog_fetch in OVLY mode sees ARM writes
+     * to the shared API/DARAM region. On real silicon dsp_ram and the DSP
+     * DARAM share one physical memory; without this mirror, ARM writes
+     * land in dsp_ram only and the DSP executes the stale (boot-time
+     * MVPD-copied) value via prog_fetch. */
+    if (s->dsp) {
+        uint16_t dsp_word = offset/2 + 0x0800;
+        if (size == 2) {
+            s->dsp->data[dsp_word] = (uint16_t)value;
+        } else if (size == 4) {
+            s->dsp->data[dsp_word]     = (uint16_t)value;
+            s->dsp->data[dsp_word + 1] = (uint16_t)(value >> 16);
+        }
+        /* size==1 byte: skip — sub-word writes to DSP data are unusual
+         * and would need careful endianness handling; falls back to the
+         * dsp_ram-only path which is fine for the sub-word case. */
+    }
+
     /* Debug: log task-related writes to write pages (d_task_d/u/md/ra) */
     if ((offset == 0x0000 || offset == 0x0004 || offset == 0x0008 ||
          offset == 0x000E || offset == 0x0028 || offset == 0x002C ||
@@ -341,6 +359,14 @@ static void calypso_tpu_write(void *o, hwaddr off, uint64_t val, unsigned sz) {
          * before the write page was fully populated. */
         calypso_dsp_done(s);
     }
+    if (off==TPU_INT_CTRL) {
+        static int ictrl_log = 0;
+        if (++ictrl_log <= 30)
+            TRX_LOG("INT_CTRL WR val=0x%02x (MCU_FRAME=%d DSP_FRAME=%d DSP_FORCE=%d) fn=%u",
+                    (unsigned)val,
+                    !!(val&ICTRL_MCU_FRAME), !!(val&ICTRL_DSP_FRAME),
+                    !!(val&ICTRL_DSP_FRAME_FORCE), s->fn);
+    }
     if (off==TPU_INT_CTRL && !(val&ICTRL_MCU_FRAME) && !s->tdma_running) calypso_tdma_start(s);
     if (off==TPU_IT_DSP_PG) s->dsp_page=val&1;
 }
@@ -429,14 +455,29 @@ static void calypso_tdma_tick(void *opaque) {
      * in l1s_compl() which runs in the IRQ4 handler AFTER this tick). */
 
     /* ── 4. DSP frame interrupt ──
-     * Send INT3 only when firmware requests it via TPU_CTRL_DSP_EN.
-     * Sending INT3 every frame causes stack overflow (CALLD loop). */
-    if (s->dsp && s->dsp->running && s->dsp_init_done) {
+     * Three conditions for periodic INT3 fire:
+     *   - INT_CTRL.ICTRL_DSP_FRAME (bit 2) = persistent enable at TPU,
+     *     polarity INVERTED (bit clear = enabled).
+     *   - DSP IMR bit 3 (C54X_INT_FRAME_BIT) = mask enable at DSP.
+     *     Empirically: firing INT3 while IMR bit 3 = 0 perturbs the
+     *     firmware boot path (DSP wakes from IDLE without expecting it,
+     *     takes wrong code path, never reaches IMR-init at PC=0x0810,
+     *     dead-locks). Respecting IMR matches the "hardware INT line
+     *     gated by IMR" model used on Calypso.
+     *   - TPU_CTRL.DSP_EN (bit 4) = one-shot force, alternative path.
+     *     Bypasses IMR (explicit hardware override). */
+    if (s->dsp && s->dsp->running) {
         bool was_idle = s->dsp->idle;
 
-        if (s->tpu_regs[TPU_CTRL/2] & TPU_CTRL_DSP_EN) {
+        bool tpu_armed = !(s->tpu_regs[TPU_INT_CTRL/2] & ICTRL_DSP_FRAME);
+        bool imr_armed = !!(s->dsp->imr & (1 << C54X_INT_FRAME_BIT));
+        bool periodic_armed = tpu_armed && imr_armed;
+        bool force_pulse    = !!(s->tpu_regs[TPU_CTRL/2] & TPU_CTRL_DSP_EN);
+        if (periodic_armed || force_pulse) {
             c54x_interrupt_ex(s->dsp, C54X_INT_FRAME_VEC, C54X_INT_FRAME_BIT);
-            s->tpu_regs[TPU_CTRL/2] &= ~TPU_CTRL_DSP_EN;
+            if (force_pulse)
+                s->tpu_regs[TPU_CTRL/2] &= ~TPU_CTRL_DSP_EN;
+            /* periodic_armed: do NOT clear — hardware-persistent enable. */
         }
 
         /* ── 5. Run DSP ── */

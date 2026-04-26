@@ -215,7 +215,8 @@ static uint16_t data_read(C54xState *s, uint16_t addr)
         {
             static int ifr_log = 0;
             if ((s->ifr & 0x0020) && ifr_log < 10) {
-                C54_LOG("IFR READ=0x%04x (TINT0!) PC=0x%04x", s->ifr, s->pc);
+                /* bit 5 = BRINT0 per C54X header (vec 21). */
+                C54_LOG("IFR READ=0x%04x (BRINT0 pending) PC=0x%04x", s->ifr, s->pc);
                 ifr_log++;
             }
             return s->ifr;
@@ -309,6 +310,28 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
                     "PC=0x%04x insn=%u\n",
                     addr, val, s->data[addr], s->pc, s->insn_count);
         }
+    }
+    /* CALAD source zone 0x4180-0x41FF — LD-A-TRACE shows the firmware
+     * reads 0x4189 (DP=0x83) but our emulation has it as 0. Log every
+     * write to this range so we can tell whether (a) anyone is meant to
+     * populate it and we missed the path, or (b) DP=0x83 is itself a
+     * symptom upstream of an unrelated bug. */
+    if (addr >= 0x4180 && addr <= 0x41FF) {
+        static unsigned cwz;
+        if (cwz++ < 5000) {
+            fprintf(stderr,
+                    "[c54x] CALAD-ZONE-W data[0x%04x] <- 0x%04x (was 0x%04x) "
+                    "PC=0x%04x insn=%u\n",
+                    addr, val, s->data[addr], s->pc, s->insn_count);
+        }
+    }
+    /* Dedicated watch on 0x4189 — never capped. The LD-A loop reads this
+     * slot in the CALAD trap; we want to know if/when *anyone* finally
+     * writes a non-zero value, and from which PC. */
+    if (addr == 0x4189) {
+        fprintf(stderr,
+                "[c54x] *** WR-0x4189 *** data[0x4189] <- 0x%04x (was 0x%04x) PC=0x%04x insn=%u\n",
+                val, s->data[addr], s->pc, s->insn_count);
     }
     /* Timer registers (0x0024-0x0026) — before MMR check */
     if (addr == TCR_ADDR) {
@@ -718,6 +741,61 @@ static int c54x_exec_one(C54xState *s)
                     pc_ring[(pc_ring_idx-2)&255], pc_ring[(pc_ring_idx-1)&255]);
             daram_log++;
         }
+        /* 0x7700 entry tracer: log when PC enters 0x7700 from elsewhere
+         * (i.e. prev_pc != 0x76FF, the natural sequential predecessor).
+         * Reveals which CALL/B/RET sources land here. PC HIST shows
+         * 7700/7701 as the hottest non-loop addresses — find the callers. */
+        if (s->pc == 0x7700 && prev_pc != 0x76FF) {
+            static uint64_t e7700;
+            e7700++;
+            if (e7700 <= 30 || (e7700 % 5000) == 0) {
+                C54_LOG("ENTER-7700 #%llu from PC=0x%04x A=%010llx B=%010llx SP=0x%04x trail: %04x %04x %04x %04x %04x",
+                        (unsigned long long)e7700, prev_pc,
+                        (unsigned long long)(s->a & 0xFFFFFFFFFFULL),
+                        (unsigned long long)(s->b & 0xFFFFFFFFFFULL),
+                        s->sp,
+                        pc_ring[(pc_ring_idx-5)&255], pc_ring[(pc_ring_idx-4)&255],
+                        pc_ring[(pc_ring_idx-3)&255], pc_ring[(pc_ring_idx-2)&255],
+                        pc_ring[(pc_ring_idx-1)&255]);
+            }
+        }
+        /* MAC-7700 tracer: at PC=0x7700 (MAC *AR2-, A) we want to know
+         * what AR2 points at, what data[AR2] holds, T, and A before/after.
+         * Helps determine if AR2 references the BSP RX zone (correlator
+         * FB-det) or somewhere else. Also dumps full AR0-AR7 + ST0/ST1. */
+        if (s->pc == 0x7700) {
+            static uint64_t mac7700_total;
+            mac7700_total++;
+            if (mac7700_total <= 50 || (mac7700_total % 5000) == 0) {
+                uint16_t ar2 = s->ar[2];
+                uint16_t v_at_ar2 = s->data[ar2];
+                C54_LOG("MAC-7700 #%llu AR2=0x%04x data[AR2]=0x%04x T=0x%04x "
+                        "A_pre=%010llx ST0=0x%04x ST1=0x%04x",
+                        (unsigned long long)mac7700_total, ar2, v_at_ar2,
+                        s->t,
+                        (unsigned long long)(s->a & 0xFFFFFFFFFFULL),
+                        s->st0, s->st1);
+                C54_LOG("MAC-7700 #%llu ARs: AR0=%04x AR1=%04x AR2=%04x AR3=%04x "
+                        "AR4=%04x AR5=%04x AR6=%04x AR7=%04x SP=%04x",
+                        (unsigned long long)mac7700_total,
+                        s->ar[0], s->ar[1], s->ar[2], s->ar[3],
+                        s->ar[4], s->ar[5], s->ar[6], s->ar[7], s->sp);
+            }
+        }
+        /* RCD-75e8 tracer: when DSP arrives at PC=0x75e8 (cond=0x47 = LEQ),
+         * log A. The RCD takes if A <= 0; report whether the loop will
+         * exit this iteration. */
+        if (s->pc == 0x75e8) {
+            static uint64_t rcd75e8_total;
+            rcd75e8_total++;
+            if (rcd75e8_total <= 50 || (rcd75e8_total % 5000) == 0) {
+                int64_t acc = sext40(s->a);
+                C54_LOG("RCD-75e8 #%llu A=%010llx (signed=%lld) RCD-taken=%d AR2=%04x",
+                        (unsigned long long)rcd75e8_total,
+                        (unsigned long long)(s->a & 0xFFFFFFFFFFULL),
+                        (long long)acc, (acc <= 0), s->ar[2]);
+            }
+        }
         prev_pc = s->pc;
         /* DARAM 0x1100-0x1130 tracer: dump first 64 visits */
         static int daram1110_log = 0;
@@ -862,46 +940,42 @@ static int c54x_exec_one(C54xState *s)
         if (op >= 0xF4E0 && op <= 0xF4FF && op != 0xF4E4 && op != 0xF4EB) {
             return consumed + s->lk_used;
         }
-        /* F4EB = RETE (return from interrupt, alternate encoding per tic54x-opc.c) */
+        /* F4EB = RETE (return from interrupt). Pop PC, pop XPC iff APTS=1.
+         * Symmetric with c54x_interrupt_ex push order. */
         if (op == 0xF4EB) {
+            uint16_t ra = data_read(s, s->sp); s->sp++;
+            uint16_t prev_xpc = s->xpc;
             if (s->pmst & PMST_APTS) {
                 s->xpc = data_read(s, s->sp); s->sp++;
                 if (s->xpc > 3) s->xpc &= 3;
             }
-            uint16_t ra = data_read(s, s->sp); s->sp++;
             s->st1 &= ~ST1_INTM;
             {
                 static uint64_t rete_count;
                 rete_count++;
                 if (rete_count <= 20 || (rete_count % 100) == 0)
-                    C54_LOG("RETE #%llu PC=0x%04x -> ra=0x%04x SP=0x%04x",
+                    C54_LOG("RETE #%llu PC=0x%04x -> ra=0x%04x XPC=%u→%u SP=0x%04x",
                             (unsigned long long)rete_count,
-                            s->pc, ra, s->sp);
+                            s->pc, ra, prev_xpc, s->xpc, s->sp);
             }
             s->pc = ra; return 0;
         }
-        /* 0xF4E4 = FRET (far return). Per tic54x-opc.c:
-         *   { "fret", 1,0,0,0xF4E4, 0xFFFF, ... B_RET|FL_FAR|FL_NR }
-         * Pop XPC then PC (no INTM change). The historical workaround that
-         * forced FRET → IDLE is now removed: the mailbox handshake the
-         * bootloader at 0xb41a depends on is implemented in the BL_*
-         * register handlers, so completing the return lets the bootloader
-         * finish, jump to user code at 0xb360, and run the init sequence
-         * that finally clears INTM via RSBX INTM. Without this the DSP
-         * halts at 0x770c, INT3 is never serviced, FB-det never completes. */
+        /* 0xF4E4 = FRET (far return). Pop PC, pop XPC iff APTS=1.
+         * Symmetric with FCALL/FCALLD push (also APTS-gated). */
         if (op == 0xF4E4) {
+            uint16_t ra = data_read(s, s->sp); s->sp++;
+            uint16_t prev_xpc = s->xpc;
             if (s->pmst & PMST_APTS) {
                 s->xpc = data_read(s, s->sp); s->sp++;
                 if (s->xpc > 3) s->xpc &= 3;
             }
-            uint16_t ra = data_read(s, s->sp); s->sp++;
             {
                 static uint64_t fret_count;
                 fret_count++;
                 if (fret_count <= 30 || (fret_count % 1000) == 0)
-                    C54_LOG("FRET #%llu PC=0x%04x -> ra=0x%04x SP=0x%04x XPC=%d",
+                    C54_LOG("FRET #%llu PC=0x%04x -> ra=0x%04x XPC=%u→%u SP=0x%04x",
                             (unsigned long long)fret_count,
-                            s->pc, ra, s->sp, s->xpc);
+                            s->pc, ra, prev_xpc, s->xpc, s->sp);
             }
             s->pc = ra;
             return 0;
@@ -1481,9 +1555,30 @@ static int c54x_exec_one(C54xState *s)
                 s->pc += 2;
                 return 0;
             }
-            /* F88x/F89x: B pmad — unconditional branch (2 words)
-             * F8Ax/F8Bx: BD pmad — delayed branch (2 words)
-             * Per SPRU172C: 1111 1000 1SSS DDDD pmad */
+            /* Per tic54x-opc.c:
+             *   F880-F8FF mask FF80 = FB pmad (FAR branch unconditional)
+             * The low 7 bits of the opcode word encode the target XPC bits.
+             * Calypso uses 2-bit XPC, so & 0x3 is sufficient.
+             *
+             * Earlier this range was treated as plain B pmad — a bug that
+             * kept XPC=0 forever (DSP never reached PROM1 user code). */
+            if ((op & 0xFF80) == 0xF880) {
+                op2 = prog_fetch(s, s->pc + 1);
+                consumed = 2;
+                uint8_t new_xpc = (op & 0x7F) & 0x03;
+                static uint64_t fb_total;
+                fb_total++;
+                if (fb_total <= 30 || (fb_total % 5000) == 0) {
+                    C54_LOG("FB FAR #%llu PC=0x%04x → XPC=%u PC=0x%04x (was XPC=%u)",
+                            (unsigned long long)fb_total, s->pc,
+                            new_xpc, op2, s->xpc);
+                }
+                s->xpc = new_xpc;
+                s->pc  = op2;
+                return 0;
+            }
+            /* F88x..F8Bx (mask FF80=0): historic plain B pmad (NEAR), kept
+             * for sub-codes that fall outside the FAR mask above. */
             if (sub >= 0x8 && sub <= 0xB) {
                 op2 = prog_fetch(s, s->pc + 1);
                 s->pc = op2;
@@ -1558,7 +1653,18 @@ static int c54x_exec_one(C54xState *s)
             }
             /* F320+: LD #k9, DP */
             uint16_t k9 = op & 0x01FF;
+            uint16_t old_dp = s->st0 & ST0_DP_MASK;
             s->st0 = (s->st0 & ~ST0_DP_MASK) | k9;
+            {
+                static uint64_t dpc;
+                dpc++;
+                if (dpc <= 80 || (dpc % 5000) == 0 || k9 == 0x83) {
+                    C54_LOG("DP-SET F32x #%llu PC=0x%04x DP 0x%03x → 0x%03x %s",
+                            (unsigned long long)dpc, s->pc,
+                            old_dp, k9,
+                            k9 == 0x83 ? "*** 0x83 (CALAD-zone base 0x4180) ***" : "");
+                }
+            }
             return consumed + s->lk_used;
         }
         /* F6xx: various — LD/ST acc-acc, ABDST, SACCD, etc. */
@@ -1619,20 +1725,45 @@ static int c54x_exec_one(C54xState *s)
             }
             if (op == 0xF6E2 || op == 0xF6E3) {
                 /* BACCD A / CALAD A — delayed branch/call to acc(low).
-                 * TEMPORARILY DISABLED (log only) — when fully active these
-                 * jumps land on uninitialised A_low and the DSP scatters
-                 * into boot-stub NOPs, regressing PC HIST from a stable
-                 * DARAM loop to chaos. Need to find/fix the upstream LD-A
-                 * path before re-enabling so A holds a valid target. */
+                 * 1-word op + 2 delay slots. CALAD pushes PC+3 (skip op +
+                 * 2 delay slots) per TI convention (cf. CALLD which pushes
+                 * PC+4 for its 2-word form). Branch is armed via the
+                 * delayed_pc/delay_slots mechanism so the 2 slots run
+                 * before PC commits to tgt. */
                 uint16_t tgt = (uint16_t)(s->a & 0xFFFF);
-                static uint64_t fbcd_skip;
-                fbcd_skip++;
-                if (fbcd_skip <= 30 || (fbcd_skip % 5000) == 0) {
-                    C54_LOG("F6E%c-SKIP #%llu PC=0x%04x A_low=0x%04x SP=0x%04x",
-                            (op == 0xF6E2) ? '2' : '3',
-                            (unsigned long long)fbcd_skip,
-                            s->pc, tgt, s->sp);
+                bool is_call = (op == 0xF6E3);
+                static uint64_t bcd_total;
+                bcd_total++;
+                /* Pre-load context: dump the 8 words preceding PC (in OVLY
+                 * the executor reads from DARAM, mirror that). Lets us see
+                 * which LD/MAR sequence was supposed to put a valid target
+                 * in A before the CALAD/BACCD. */
+                int pre_ovly = (s->pmst & PMST_OVLY) && s->pc >= 0x80 && s->pc < 0x2800;
+                uint16_t pre[8];
+                for (int i = 0; i < 8; i++) {
+                    uint16_t a = (uint16_t)(s->pc - 8 + i);
+                    pre[i] = pre_ovly ? s->data[a] : s->prog[a];
                 }
+                if (bcd_total <= 60 || (bcd_total % 5000) == 0) {
+                    C54_LOG("BCD/CAD F6E%c #%llu PC=0x%04x tgt=0x%04x A=%010llx SP=0x%04x DP=0x%03x mem[%c PC-8..-1]=%04x %04x %04x %04x %04x %04x %04x %04x%s",
+                            is_call ? '3' : '2',
+                            (unsigned long long)bcd_total,
+                            s->pc, tgt,
+                            (unsigned long long)(s->a & 0xFFFFFFFFFFULL),
+                            s->sp,
+                            (s->st0 & 0x1FF),
+                            pre_ovly ? 'D' : 'P',
+                            pre[0], pre[1], pre[2], pre[3],
+                            pre[4], pre[5], pre[6], pre[7],
+                            is_call ? " CALAD" : " BACCD");
+                }
+                if (is_call) {
+                    uint16_t ret_pc = (uint16_t)(s->pc + 3);
+                    s->sp = (s->sp - 1) & 0xFFFF;
+                    data_write(s, s->sp, ret_pc);
+                }
+                s->delayed_pc  = tgt;
+                s->delay_slots = 2;
                 return consumed + s->lk_used;
             }
             if (op == 0xF6E4 || op == 0xF6E5) {
@@ -1649,16 +1780,38 @@ static int c54x_exec_one(C54xState *s)
                 return consumed + s->lk_used;
             }
             if (op == 0xF6E6 || op == 0xF6E7) {
-                /* FBACCD / FCALAD — TEMPORARILY DISABLED, see F6E2/E3 note. */
+                /* FBACCD A / FCALAD A — far delayed branch/call to A.
+                 * A(22:16) → XPC, A(15:0) → tgt. XPC update is immediate
+                 * (mirrors FRETED at line ~1639). FCALAD pushes ret PC+3,
+                 * and (when APTS) pushes XPC first (so RETF/FRETD pops in
+                 * order). 2 delay slots. */
                 uint16_t tgt = (uint16_t)(s->a & 0xFFFF);
-                static uint64_t ffbcd_skip;
-                ffbcd_skip++;
-                if (ffbcd_skip <= 10 || (ffbcd_skip % 5000) == 0) {
-                    C54_LOG("F6E%c-SKIP #%llu PC=0x%04x A_low=0x%04x SP=0x%04x",
-                            (op == 0xF6E6) ? '6' : '7',
-                            (unsigned long long)ffbcd_skip,
-                            s->pc, tgt, s->sp);
+                uint8_t  new_xpc = (uint8_t)((s->a >> 16) & 0xFF);
+                if (new_xpc > 3) new_xpc &= 3;
+                bool is_call = (op == 0xF6E7);
+                static uint64_t fbcd_total;
+                fbcd_total++;
+                if (fbcd_total <= 10 || (fbcd_total % 5000) == 0) {
+                    C54_LOG("FBCD/FCAD F6E%c #%llu PC=0x%04x tgt=0x%04x newXPC=%u A=%010llx SP=0x%04x%s",
+                            is_call ? '7' : '6',
+                            (unsigned long long)fbcd_total,
+                            s->pc, tgt, new_xpc,
+                            (unsigned long long)(s->a & 0xFFFFFFFFFFULL),
+                            s->sp,
+                            is_call ? " FCALAD" : " FBACCD");
                 }
+                if (is_call) {
+                    if (s->pmst & PMST_APTS) {
+                        s->sp = (s->sp - 1) & 0xFFFF;
+                        data_write(s, s->sp, s->xpc);
+                    }
+                    uint16_t ret_pc = (uint16_t)(s->pc + 3);
+                    s->sp = (s->sp - 1) & 0xFFFF;
+                    data_write(s, s->sp, ret_pc);
+                }
+                s->xpc         = new_xpc;
+                s->delayed_pc  = tgt;
+                s->delay_slots = 2;
                 return consumed + s->lk_used;
             }
             if (sub >= 0x8) {
@@ -1729,13 +1882,36 @@ static int c54x_exec_one(C54xState *s)
             }
             return consumed + s->lk_used;
         }
-        /* F9xx: CC pmad, cond — conditional CALL (2 words).
-         * Per tic54x-opc.c: cc 0xF900 mask 0xFF00.
-         * Like BC but PUSHES return address before branching.
-         * F980+ (mask FF80) = FCALL (far call) — handled same way. */
+        /* F9xx encoding split per tic54x-opc.c:
+         *   F900-F97F mask FF00 = CC pmad cond (NEAR conditional call)
+         *   F980-F9FF mask FF80 = FCALL pmad   (FAR call unconditional)
+         * The bit 7 of the opcode low byte distinguishes them. */
         if (hi8 == 0xF9) {
             op2 = prog_fetch(s, s->pc + 1);
             consumed = 2;
+            /* FCALL FAR : push XPC (iff APTS=1) then return PC. Set new XPC
+             * and jump. With APTS=0, only PC is pushed — firmware manages
+             * XPC manually via STM/LDLM as needed. */
+            if ((op & 0x80) != 0) {
+                uint8_t new_xpc = (op & 0x7F) & 0x03;
+                static uint64_t fcall_total;
+                fcall_total++;
+                if (s->pmst & PMST_APTS) {
+                    s->sp = (s->sp - 1) & 0xFFFF;
+                    data_write(s, s->sp, s->xpc);
+                }
+                s->sp = (s->sp - 1) & 0xFFFF;
+                data_write(s, s->sp, (uint16_t)(s->pc + 2));
+                if (fcall_total <= 30 || (fcall_total % 5000) == 0) {
+                    C54_LOG("FCALL FAR #%llu PC=0x%04x → XPC=%u PC=0x%04x (was XPC=%u SP=0x%04x APTS=%d)",
+                            (unsigned long long)fcall_total, s->pc,
+                            new_xpc, op2, s->xpc, s->sp,
+                            !!(s->pmst & PMST_APTS));
+                }
+                s->xpc = new_xpc;
+                s->pc  = op2;
+                return 0;
+            }
             uint8_t cond_code = (op >> 4) & 0xF;
             uint8_t qual = op & 0xF;
             bool take = false;
@@ -1779,23 +1955,60 @@ static int c54x_exec_one(C54xState *s)
             }
             return consumed + s->lk_used;
         }
-        /* FAxx: RPT Smem or conditional ops */
+        /* FAxx encoding split per tic54x-opc.c:
+         *   FA80-FAFF mask FF80 = FBD pmad (FAR branch delayed)
+         *   FA00-FA7F = various NEAR delayed ops (treated as branch). */
         if (hi8 == 0xFA) {
-            /* FA3x: BC with delay, FA4x: conditional etc. */
             op2 = prog_fetch(s, s->pc + 1);
             consumed = 2;
-            /* Simplified: treat as delayed branch */
+            if ((op & 0x80) != 0) {
+                /* FBD FAR delayed branch — XPC change, no push */
+                uint8_t new_xpc = (op & 0x7F) & 0x03;
+                static uint64_t fbd_total;
+                fbd_total++;
+                if (fbd_total <= 30 || (fbd_total % 5000) == 0) {
+                    C54_LOG("FBD FAR #%llu PC=0x%04x → XPC=%u PC=0x%04x (was XPC=%u, delayed 2 slots)",
+                            (unsigned long long)fbd_total, s->pc,
+                            new_xpc, op2, s->xpc);
+                }
+                s->xpc = new_xpc;
+                s->delayed_pc  = op2;
+                s->delay_slots = 2;
+                return consumed + s->lk_used;
+            }
+            /* NEAR FAxx fallback: simplified treat as branch */
             s->pc = op2;
             return 0;
         }
-        /* FBxx: LD #k, 16, A/B (short immediate shift 16) */
-        /* FBxx: CCD pmad, cond — conditional CALL delayed (2 words).
-         * Per tic54x-opc.c: ccd 0xFB00 mask 0xFF00.
-         * Like CC but with 2 delay slots (execute PC+2, PC+3 before call).
-         * FB80+ (mask FF80) = FCALLD (far call delayed). */
+        /* FBxx encoding split per tic54x-opc.c:
+         *   FB80-FBFF mask FF80 = FCALLD pmad (FAR call delayed)
+         *   FB00-FB7F mask FF00 = CCD pmad cond (NEAR conditional call delayed) */
         if (hi8 == 0xFB) {
             op2 = prog_fetch(s, s->pc + 1);
             consumed = 2;
+            /* FCALLD FAR : push XPC (iff APTS=1), push return PC+4 (past
+             * delay slots), set new XPC, delayed branch to op2. */
+            if ((op & 0x80) != 0) {
+                uint8_t new_xpc = (op & 0x7F) & 0x03;
+                static uint64_t fcalld_total;
+                fcalld_total++;
+                if (s->pmst & PMST_APTS) {
+                    s->sp = (s->sp - 1) & 0xFFFF;
+                    data_write(s, s->sp, s->xpc);
+                }
+                s->sp = (s->sp - 1) & 0xFFFF;
+                data_write(s, s->sp, (uint16_t)(s->pc + 4));
+                if (fcalld_total <= 30 || (fcalld_total % 5000) == 0) {
+                    C54_LOG("FCALLD FAR #%llu PC=0x%04x → XPC=%u PC=0x%04x (was XPC=%u SP=0x%04x APTS=%d, delayed)",
+                            (unsigned long long)fcalld_total, s->pc,
+                            new_xpc, op2, s->xpc, s->sp,
+                            !!(s->pmst & PMST_APTS));
+                }
+                s->xpc = new_xpc;
+                s->delayed_pc  = op2;
+                s->delay_slots = 2;
+                return consumed + s->lk_used;
+            }
             uint8_t cond_code = (op >> 4) & 0xF;
             uint8_t qual = op & 0xF;
             bool take = false;
@@ -1972,7 +2185,18 @@ static int c54x_exec_one(C54xState *s)
             /* EAxx: LD #k9, DP — Load Data Page pointer (1-word).
              * Per tic54x-opc.c: ld 0xEA00 mask 0xFE00, 1 word. */
             uint16_t k9 = op & 0x01FF;
+            uint16_t old_dp = s->st0 & ST0_DP_MASK;
             s->st0 = (s->st0 & ~ST0_DP_MASK) | k9;
+            {
+                static uint64_t dpc;
+                dpc++;
+                if (dpc <= 80 || (dpc % 5000) == 0 || k9 == 0x83) {
+                    C54_LOG("DP-SET EAxx #%llu PC=0x%04x DP 0x%03x → 0x%03x %s",
+                            (unsigned long long)dpc, s->pc,
+                            old_dp, k9,
+                            k9 == 0x83 ? "*** 0x83 (CALAD-zone base 0x4180) ***" : "");
+                }
+            }
             return consumed + s->lk_used;
         }
         if (hi8 == 0xEC) {
@@ -2324,6 +2548,21 @@ static int c54x_exec_one(C54xState *s)
             break;
         }
         if (dst) s->b = sext40(v); else s->a = sext40(v);
+        /* CALAD-zone LD trace: every LD/LDU/LDR that targets A while
+         * executing in DARAM near the CALAD cluster. Reveals what
+         * address/value is feeding A right before each CALAD A. */
+        if (dst == 0 && (s->pmst & PMST_OVLY) &&
+            s->pc >= 0x10b0 && s->pc < 0x1100) {
+            static uint64_t ldA_total;
+            ldA_total++;
+            if (ldA_total <= 60 || (ldA_total % 5000) == 0) {
+                C54_LOG("LD-A-TRACE #%llu PC=0x%04x op=0x%04x sub=%d addr=0x%04x val=0x%04x A_after=0x%04x DP=0x%03x",
+                        (unsigned long long)ldA_total,
+                        s->pc, op, sub, addr, val,
+                        (uint16_t)(s->a & 0xFFFF),
+                        (s->st0 & 0x1FF));
+            }
+        }
         return consumed + s->lk_used;
     }
 
@@ -2357,6 +2596,18 @@ static int c54x_exec_one(C54xState *s)
         } else {
             if (dst) s->b = sext40(s->b + v);
             else     s->a = sext40(s->a + v);
+        }
+        /* CALAD-zone ADD/SUB trace: same scope as LD-A-TRACE. */
+        if (dst == 0 && (s->pmst & PMST_OVLY) &&
+            s->pc >= 0x10b0 && s->pc < 0x1100) {
+            static uint64_t addA_total;
+            addA_total++;
+            if (addA_total <= 30 || (addA_total % 5000) == 0) {
+                C54_LOG("ADDSUB-A-TRACE #%llu PC=0x%04x op=0x%04x sub=%d addr=0x%04x val=0x%04x A_after=%010llx",
+                        (unsigned long long)addA_total,
+                        s->pc, op, sub, addr, val,
+                        (unsigned long long)(s->a & 0xFFFFFFFFFFULL));
+            }
         }
         return consumed + s->lk_used;
     }
@@ -3802,6 +4053,102 @@ int c54x_run(C54xState *s, int n_insns)
         s->cycles++;
         s->insn_count++;
 
+        /* === DIAGNOSTIC HACK — TEMPORARY — REMOVE ASAP ===
+         * Force-clear INTM at insn_count = $CALYPSO_FORCE_INTM_CLEAR_AT.
+         * Discriminates the catch-22 hypothesis: if clearing INTM here
+         * unblocks the FB-det path (RETED ≥1, d_fb_det written, FB1/FB2
+         * print), the root cause is "boot init never executes RSBX INTM";
+         * then we hunt the missing path (α/β/γ). If no change → INTM is
+         * not the only blocker.
+         *
+         * Documented in hw/arm/calypso/doc/TODO.md "DIAGNOSTIC HACK" —
+         * MUST BE REMOVED once the real RSBX path is identified.
+         * Disabled by default (env var unset). */
+        {
+            static int hack_at = -2;
+            static int hack_done = 0;
+            if (hack_at == -2) {
+                const char *e = getenv("CALYPSO_FORCE_INTM_CLEAR_AT");
+                hack_at = e ? atoi(e) : -1;
+                if (hack_at > 0)
+                    C54_LOG("DIAG-HACK armed: will clear INTM at insn=%d", hack_at);
+            }
+            if (hack_at > 0 && !hack_done && (uint32_t)hack_at == s->insn_count) {
+                uint16_t iptr = (s->pmst >> PMST_IPTR_SHIFT) & 0x1FF;
+                uint32_t vec_base = (uint32_t)iptr << 7;
+                C54_LOG("DIAG-HACK *** FIRE *** insn=%u PC=0x%04x SP=0x%04x ST0=0x%04x ST1=0x%04x INTM=%d PMST=0x%04x IPTR=0x%03x MP_MC=%d OVLY=%d DROM=%d APTS=%d IMR=0x%04x IFR=0x%04x XPC=%d",
+                        s->insn_count, s->pc, s->sp, s->st0, s->st1,
+                        !!(s->st1 & ST1_INTM),
+                        s->pmst, iptr,
+                        !!(s->pmst & PMST_MP_MC),
+                        !!(s->pmst & PMST_OVLY),
+                        !!(s->pmst & PMST_DROM),
+                        !!(s->pmst & PMST_APTS),
+                        s->imr, s->ifr, s->xpc);
+                /* Dump vec table at IPTR-derived base : reset, INT3 (vec19),
+                 * TINT0 (vec20), BRINT0 (vec21), and a few more for context. */
+                struct { const char *n; int v; } vecs[] = {
+                    {"reset", 0}, {"NMI", 1}, {"INT0", 16}, {"INT1", 17},
+                    {"INT2", 18}, {"INT3", 19}, {"TINT0", 20}, {"BRINT0", 21},
+                    {"BXINT0", 22}, {"BRINT1", 23},
+                };
+                for (size_t i = 0; i < sizeof(vecs)/sizeof(vecs[0]); i++) {
+                    uint32_t a = vec_base + (uint32_t)vecs[i].v * 4;
+                    uint16_t w0 = prog_read(s, a + 0);
+                    uint16_t w1 = prog_read(s, a + 1);
+                    uint16_t w2 = prog_read(s, a + 2);
+                    uint16_t w3 = prog_read(s, a + 3);
+                    fprintf(stderr,
+                            "[c54x] DIAG-HACK   vec%2d %-6s @ 0x%04x : %04x %04x %04x %04x\n",
+                            vecs[i].v, vecs[i].n, (uint16_t)a, w0, w1, w2, w3);
+                }
+                /* Aliasing diagnostic: compare s->data[0x10c0..0x10F8] vs
+                 * api_ram[0x8c0..0x8F8] (same DSP-word, two views).
+                 * Diverging values prove ARM/DSP write paths populate
+                 * different backing stores. */
+                C54_LOG("DIAG-HACK ALIAS-CHECK DARAM 0x10c0-0x10f8 (s->data vs api_ram):");
+                int diverge_count = 0;
+                for (uint16_t a = 0x10c0; a <= 0x10f8; a++) {
+                    uint16_t vd = s->data[a];
+                    uint16_t va = s->api_ram ? s->api_ram[a - 0x0800] : 0xDEAD;
+                    if (vd != va) {
+                        if (diverge_count < 20)
+                            fprintf(stderr,
+                                    "[c54x] DIAG-HACK   DIVERGE @0x%04x: s->data=0x%04x api_ram=0x%04x\n",
+                                    a, vd, va);
+                        diverge_count++;
+                    }
+                }
+                C54_LOG("DIAG-HACK   total diverging slots in 0x10c0-0x10f8: %d / %d", diverge_count, 0x10f8 - 0x10c0 + 1);
+                /* Sample DARAM bootloader-mailbox slots too (0x0FFC-0x0FFF) */
+                for (uint16_t a = 0x0FFC; a <= 0x0FFF; a++) {
+                    uint16_t vd = s->data[a];
+                    uint16_t va = s->api_ram ? s->api_ram[a - 0x0800] : 0xDEAD;
+                    fprintf(stderr,
+                            "[c54x] DIAG-HACK   mailbox @0x%04x: s->data=0x%04x api_ram=0x%04x %s\n",
+                            a, vd, va, (vd == va) ? "OK" : "*** DIVERGE ***");
+                }
+                /* CALAD source slot 0x4189 (out of API range, DSP-only).
+                 * Confirms it stays zero — the LD-A-TRACE feeds A=0 to CALAD. */
+                fprintf(stderr,
+                        "[c54x] DIAG-HACK   CALAD-source @0x4189: s->data=0x%04x (api range ends at 0x27FF, so api_ram NA)\n",
+                        s->data[0x4189]);
+                /* Also sample 0x41a0-0x41ab where we saw DSP writes earlier */
+                for (uint16_t a = 0x41a0; a <= 0x41ab; a++) {
+                    fprintf(stderr,
+                            "[c54x] DIAG-HACK   CALAD-zone @0x%04x: s->data=0x%04x\n",
+                            a, s->data[a]);
+                }
+                if (s->st1 & ST1_INTM) {
+                    s->st1 &= ~ST1_INTM;
+                    C54_LOG("DIAG-HACK *** INTM cleared *** ST1=0x%04x", s->st1);
+                } else {
+                    C54_LOG("DIAG-HACK INTM already 0, no clear needed");
+                }
+                hack_done = 1;
+            }
+        }
+
         /* One-shot diagnostic at boot+: dump 0xB900 vector table
          * (the relocated table the firmware should use if it sets
          * IPTR=0x172) plus DSP runtime state. Helps diagnose why the
@@ -3956,9 +4303,21 @@ void c54x_reset(C54xState *s)
     /* Boot ROM MVPD: copy PROM0 code to DARAM overlay.
      * On real Calypso, the internal boot ROM copies PROM0[0x7080..0x9FFF]
      * to DARAM data[0x0080..0x27FF] before jumping to user code.
-     * This populates the DARAM code overlay that the DSP executes with OVLY=1. */
-    for (int i = 0; i < 0x2780; i++)
-        s->data[0x0080 + i] = s->prog[0x7080 + i];
+     * This populates the DARAM code overlay that the DSP executes with OVLY=1.
+     *
+     * On real silicon, DARAM and API RAM share one physical memory in the
+     * range 0x0800-0x27FF (DSP-words). Mirror the copy into api_ram so the
+     * ARM-side view matches the DSP-side view from boot — without this
+     * mirror, every ARM read into the overlay zone returns 0 while the
+     * DSP executes the copied code, which silently splits the two views. */
+    for (int i = 0; i < 0x2780; i++) {
+        uint16_t addr = 0x0080 + i;
+        uint16_t val = s->prog[0x7080 + i];
+        s->data[addr] = val;
+        if (s->api_ram &&
+            addr >= C54X_API_BASE && addr < C54X_API_BASE + C54X_API_SIZE)
+            s->api_ram[addr - C54X_API_BASE] = val;
+    }
 
     /* Install boot ROM interrupt vectors at 0xFF80 (IPTR=0x1FF).
      * These are from the Calypso internal boot ROM, not in the PROM dump.
@@ -3971,13 +4330,17 @@ void c54x_reset(C54xState *s)
      * Do NOT overwrite — the ROM contains the real interrupt handlers. */
 
     /* Boot ROM stubs at 0x0000-0x007F.
-     * The internal Calypso boot ROM occupies prog 0x0000-0x007F but is not
-     * in the PROM dump. The DSP init code does CALA with A(low)=0x0000 to
-     * call boot ROM routines. The handler at 0x7706/0x8A46 expects B(high)=SP.
-     * Stub: LDMM SP,B; RET. The CALL at 0x770A (F074) pushes the return
-     * address so RET pops it correctly — no infinite loop. */
+     * Discriminant test 2026-04-26 confirmed FRET stub did NOT block the
+     * firmware path to 0x0810 (reverting to NOPs gave identical PC HIST
+     * + same IMR change=0). FRET stub kept: prevents stack runaway when
+     * CALAA targets the stub area, with no downside.
+     *
+     * Fallback per slot:
+     *   - 0x0000: LDMM SP, B (real boot ROM behaviour)
+     *   - 0x0001: RET (paired with the CALL at 0x770A)
+     *   - rest:   FRET (0xF4E4) — return immediately to caller. */
     for (int i = 0; i < 0x80; i++)
-        s->prog[i] = 0xF495;  /* NOP (fallback) */
+        s->prog[i] = 0xF4E4;  /* FRET fallback — return-from-far */
     s->prog[0x0000] = 0xBA18;  /* LDMM SP, B */
     s->prog[0x0001] = 0xFC00;  /* RET */
 

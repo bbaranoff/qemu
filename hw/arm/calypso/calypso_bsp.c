@@ -55,7 +55,8 @@ uint32_t calypso_trx_get_fn(void);
 /* Was 4: too tight for BTS scheduler lookahead (observed delta=1..139 with
  * mean ~50). 99 % of bursts went stale before the QEMU virtual FN caught up.
  * 64 covers the typical lookahead and lets the queue drain fast enough that
- * BDLENA pulses actually consume bursts. */
+ * BDLENA pulses actually consume bursts. (Bumped to 1024 in diag 2026-04-26
+ * — confirmed not the bottleneck. Restored to 64.) */
 #define BSP_FN_MATCH_WINDOW  64
 
 typedef struct {

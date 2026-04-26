@@ -62,11 +62,6 @@ typedef struct L1CTLSock {
 
 static L1CTLSock g_l1ctl;
 
-/* sercomm_wrap() removed with the INJECT hack on 2026-04-25 — its only
- * caller built sercomm frames to push directly into the UART RX FIFO,
- * bypassing the QEMU PTY chain. The native PTY path doesn't need this
- * helper. */
-
 /* ---- Send L1CTL message to mobile (length-prefix) ---- */
 
 static void l1ctl_send_to_mobile(L1CTLSock *s, const uint8_t *payload, int len)
@@ -187,22 +182,10 @@ static void l1ctl_client_readable(void *opaque)
 
         uint8_t *payload = &s->lp_buf[2];
 
-        /* HACK REMOVED 2026-04-25:
-         * The previous code wrapped `payload` in sercomm and called
-         * calypso_uart_receive() directly, bypassing the QEMU PTY chain.
-         * That bypass conflicted with feedback_no_hacks_client_server.md
-         * ("No injections") and with the documented role of this socket
-         * (project_l1ctl_sock_role.md says it's the UART(write)→BTS(read)
-         * pipe, not the mobile↔L1 upstream socket).
-         *
-         * The mobile process must speak to the firmware via the QEMU
-         * native PTY exposed by `-serial pty` — the chardev that backs
-         * the Calypso UART model. Until the mobile is reconfigured to
-         * point at that PTY, inbound messages on this socket are dropped
-         * (logged below) so the absence is visible.
-         */
-        L1CTL_LOG("DROP RX←mobile: len=%d type=0x%02x (INJECT hack removed; "
-                  "mobile must use QEMU PTY)", msglen, payload[0]);
+        /* This socket is the UART(write)→BTS(read) pipe, not the
+         * mobile↔L1 upstream. The mobile speaks to the firmware via
+         * the QEMU PTY backing the Calypso UART. Inbound is dropped. */
+        L1CTL_LOG("DROP RX←mobile: len=%d type=0x%02x", msglen, payload[0]);
 
         /* Consume from buffer */
         int consumed = 2 + msglen;
