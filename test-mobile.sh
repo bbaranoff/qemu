@@ -141,7 +141,7 @@ sys.exit(0 if b'Power up simcard' in data else 1)" 2>/dev/null; then
 done
 
 if $BOOT_OK; then
-    ok "Firmware booted ($(printf '%.1f' "$(echo "$i * 0.25" | bc)")s)"
+    ok "Firmware booted ($(printf '%.1f' \"$(echo "$i * 0.25\" | bc)")s)"
 else
     warn "Boot timeout (firmware may still be running)"
 fi
