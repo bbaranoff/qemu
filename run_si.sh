@@ -47,6 +47,9 @@ L1CTL_SOCK="/tmp/osmocom_l2"
 QEMU_DUMMY_SOCK="/tmp/qemu_l1ctl_disabled"
 
 # ---------- cleanup ----------
+rm -f "$QEMU_LOG" "$BRIDGE_LOG" "$OSMOCON_LOG" "$MOBILE_LOG" \
+      "$MON_SOCK" "$L1CTL_SOCK" "$QEMU_DUMMY_SOCK"
+
 tmux kill-session -t "$SESSION" 2>/dev/null || true
 killall -9 qemu-system-arm osmo-bts-trx mobile osmocon 2>/dev/null || true
 pkill -9 -f bridge.py 2>/dev/null || true
