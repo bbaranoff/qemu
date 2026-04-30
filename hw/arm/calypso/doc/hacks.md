@@ -17,21 +17,45 @@
 
 ### Hacks bruts
 
-#### `si3_blob[23]` hardcodé (étape 2 BCCH read)
+#### `si3_blob[]` hardcoded — RESOLVED (2026-04-30)
 
-**Quoi** : `static const uint8_t si3_blob[23] = { 0x1b, 0x75, ... }` packed dans `a_cd[3..14]` à chaque task=24 fire pour produire DATA_IND avec payload LAPDm valide.
+**Status** : **REMOVED from active path**.
 
-**Pourquoi c'est un hack** : `osmo-bts-trx` émet déjà des bursts BCCH réels via TRXD UDP 5702 vers `bridge.py`. La fixture libosmocore (`tests/gb/gprs_bssgp_rim_test.c:376`) court-circuite ce pipeline producteur existant. Le LAI/CGI ne matche pas la config réelle du BSC.
+**Path** : `si3_blob[]` renamed to `si3_fallback[]`, used only when mmap unavailable
+at first ALLC fire (cold-start race condition).
 
-**Critère de retrait OBLIGATOIRE** (cf. `TODO.md` § XXX TEMP HARDCODE) :
-1. `bridge.py` instrumenté pour intercepter les bursts BCCH (TN=0, fn%51 ∈ {2,3,4,5}) reçus de `osmo-bts`.
-2. Soit déinterleavage côté Python → 23 bytes LAPDm puis forward UDP séparé vers QEMU.
-3. Soit intercept `osmo-bts` avant interleaving (RSL/scheduler) pour 23 bytes pré-encodés.
-4. `case DSP_TASK_ALLC` lit depuis buffer dynamique au lieu de fixture statique.
-5. Hardcode physiquement retiré du `.c`, entrée TODO.md supprimée.
-6. Run validation : DATA_IND traversent + cell synced avec SI3 réel BSC.
+**Replacement** : `rsl_si_tap.py` + `/dev/shm/calypso_si.bin` mmap interface.
 
-**Marqueur code** : `XXX TEMP HARDCODE replace with bridge intercept`
+**Removal criterion** (for full cleanup) : tap reliability validated over
+multiple sessions, then `si3_fallback[]` can be removed (replaced by
+log warning + zeroed blob output, mobile would fail FBSB cleanly).
+
+#### `populate-si.sh` — Cold-start warm cache (NOT a hack)
+
+**Status** : kept in `scripts/` as manual debug tool. Removed from `run_si.sh` boot path.
+
+**Function** : pre-populates mmap with last-known-good SI bytes. Useful when
+osmo-bsc unavailable (debug isolation of QEMU+mobile without full network stack).
+
+**Bytes contained** : snapshot from RSL trace 12:13 (osmo-bsc → osmo-bts
+re-attach), byte-exact identical to live tap output for current BSC config.
+
+**If BSC config changes** : re-run populate-si.sh post manual snapshot, OR rely
+on `rsl_si_tap.py` which always reflects current BSC live config.
+
+**Removal criterion** : `csi_init_once()` in `calypso_fbsb.c` modified to retry
+mmap open periodically (currently lazy one-shot). Until then keep populate-si.sh
+for manual cold-start scenarios.
+
+#### `allc_burst_idx` static counter cycle 0..3
+
+**Quoi** : compteur local incrémenté à chaque task=24 fire, écrit dans `db_r->d_burst_d`.
+
+**Pourquoi c'est un hack** : assume une cadence parfaite cmd→resp côté firmware. Si timing dérive (frame skip, jitter), le counter désynchronise → `BURST ID mismatch` côté firmware (24/28 mismatch observés). User suggéra de lire `wp[DB_W_D_BURST_D]` directement, mais shift de timing schedule firmware empêche cette approche simpliste.
+
+**Critère de retrait** : implémenter frame-tick scheduled write basé sur fn modulo 51 (block boundary) pour aligner sur le vrai schedule mframe. Ou alternative : fix proprement le timing TDMA pour éliminer la dérive cmd/resp.
+
+**Note** : le hack ne casse pas DATA_IND (resp(3) match accidentel donne 1 DATA_IND par bloc), mais 75% des resps sont rejetées avec mismatch noisy.
 
 #### `allc_burst_idx` static counter cycle 0..3
 

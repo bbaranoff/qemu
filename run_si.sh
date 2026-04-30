@@ -1,18 +1,18 @@
 #!/bin/bash
-# run_si.sh — Calypso QEMU pipeline with mmap-based SI injection.
+# run_si.sh — Calypso QEMU pipeline with live RSL SI injection.
 #
-# Étape 2b/3 path : SI1/SI2/SI3/SI4/SI13 alimentés via mmap shared file
-# /dev/shm/calypso_si.bin (cf. doc/MMAP_SI_FORMAT.md).
+# Étape 3 path : SI1/SI2/SI3/SI4/SI13 alimentés dynamiquement par
+# rsl_si_tap.py (sniff RSL osmo-bsc → osmo-bts) → /dev/shm/calypso_si.bin
+# (cf. doc/MMAP_SI_FORMAT.md).
 #
 # Différences vs run_new.sh :
-#   - Phase 0 : populate-si.sh écrit le mmap au boot avec les 5 SI
-#               RSL-extracted (étape 2b stub disposable).
-#   - QEMU : CALYPSO_SI_MMAP_PATH env var passée à QEMU.
-#   - (Future étape 3) : remplacer populate-si.sh par rsl_si_tap.py
-#                        en tmux window dédiée.
+#   - rsl_si_tap.py démarre AVANT osmo-bts pour capturer BCCH_INFO de l'attach
+#   - QEMU : CALYPSO_SI_MMAP_PATH env var passée à QEMU
+#   - mmap rempli byte-exact depuis le live BSC, pas de hardcode
 #
-# IMPORTANT : populate-si.sh est transitoire. À supprimer une fois
-# scripts/rsl_si_tap.py opérationnel en steady-state (sniff RSL live).
+# Note : populate-si.sh existe toujours dans scripts/ comme outil debug
+# manuel pour tester l'interface mmap sans dépendre de osmo-bsc/RSL.
+# Plus utilisé dans le path de boot normal.
 
 set -euo pipefail
 
@@ -24,7 +24,6 @@ BRIDGE="/opt/GSM/qemu-src/bridge.py"
 OSMOCON="/opt/GSM/osmocom-bb/src/host/osmocon/osmocon"
 BTS_CFG="/etc/osmocom/osmo-bts-trx.cfg"
 MOBILE_CFG="/root/.osmocom/bb/mobile_group1.cfg"
-POPULATE_SI="/opt/GSM/qemu-src/scripts/populate-si.sh"
 
 # ---- mmap SI file ----
 # Override possible : CALYPSO_SI_MMAP_PATH=/path/to/file run_si.sh
@@ -58,15 +57,9 @@ sleep 1
 /etc/osmocom/status.sh stop 2>/dev/null || true
 /etc/osmocom/osmo-start.sh 2>/dev/null || true
 
-# ---------- 0. mmap SI populator (étape 2b stub) ----------
-# Écrit /dev/shm/calypso_si.bin avec les 5 SI RSL-extracted.
-# QEMU lit ce fichier pour injecter les bons SI selon TC (TS 44.018 §3.4).
-echo -n "Populating mmap SI file ($CALYPSO_SI_MMAP_PATH)... "
-if [ -x "$POPULATE_SI" ]; then
-    "$POPULATE_SI" || { echo "FAIL"; exit 1; }
-else
-    echo "WARN — $POPULATE_SI not executable, fallback to hardcoded SI3"
-fi
+# Note : pas de pré-population mmap. rsl_si_tap.py (phase 4 ci-dessous)
+# capture les vraies BCCH_INFO depuis le BSC dès l'attache osmo-bts.
+# Si besoin de warm-start manuel pour debug, lancer scripts/populate-si.sh.
 
 tmux new-session -d -s "$SESSION" -n qemu
 
@@ -158,8 +151,8 @@ echo "  CALYPSO_BSP_DARAM_ADDR      = $CALYPSO_BSP_DARAM_ADDR"
 echo "  CALYPSO_FORCE_INTM_CLEAR_AT = ${CALYPSO_FORCE_INTM_CLEAR_AT:-(unset)}"
 echo "  CALYPSO_SIM_CFG             = $CALYPSO_SIM_CFG"
 echo
-echo "To force re-populate SI mmap during runtime :"
-echo "  $POPULATE_SI"
+echo "Manual warm-start (debug, if BSC unavailable) :"
+echo "  /opt/GSM/qemu-src/scripts/populate-si.sh"
 echo
 
 tmux select-window -t "$SESSION:qemu"

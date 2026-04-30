@@ -1,5 +1,30 @@
 # TODO — chemin FBSB QEMU Calypso
 
+## Next blocker: IMM ASSIGN / UL chain
+
+Three options under evaluation:
+
+(a) AGCH IMM ASSIGN synth via mmap (similar to BCCH SI mmap)
+    - Risk: requires matching `Request Reference` (RA + FN) to mobile's actual RACH
+    - Becomes BSC mock if forging IMM ASSIGN locally
+
+(b) Wire UL: QEMU → bridge.py → osmo-bts (TRXD UL UDP 5701)
+    - Architecturally clean, BSC handles IMM ASSIGN naturally
+    - Estimated 2-4 days (3 broken links: DSP encoding, task_u read, bridge UL)
+
+(c) Hybrid: synth RACH burst in QEMU + bridge UL forward + osmo-bts capture
+    - Bypass DSP RACH encoding via L1CTL hook
+    - Estimated 2-4h, follows mmap BCCH philosophy
+    - Documented hack like `publish_fb_found` bypass
+
+Decision pending. Diag UL chain done :
+- 7 L1CTL_RACH_CONF côté osmocon (mobile RACH bursts confirmés par firmware)
+- `task_u` poll dans calypso_trx.c lit dsp_ram garbage (64413, 65427 etc.)
+- bridge.py n'a aucun handler UL (grep `recv.*5701` retourne 0)
+- 0 packets capturés sur UDP 5701 (TRX UL)
+
+---
+
 ## Status 2026-04-30 nuit — BCCH pipeline end-to-end validé (étape 2)
 
 **Milestone L2** : 88 DATA_IND traversent firmware → osmocon avec payload

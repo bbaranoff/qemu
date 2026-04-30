@@ -1,6 +1,38 @@
 # Calypso GSM Baseband Emulator — Project Status
 
-## Latest update — 2026-04-30 nuit — BCCH pipeline end-to-end validé (étape 2)
+## 2026-04-30 13:00 — Milestone L3 mobile-side via dynamic RSL tap
+
+- BCCH SI injection: 100% dynamic from osmo-bsc live RSL
+  - `rsl_si_tap.py` sniffs lo:3003, parses RSL_MT_BCCH_INFO (0x11),
+    extracts FULL_BCCH_INFO IE (0x27) by SYSTEM_INFO_TYPE IE (0x1e)
+  - Writes `/dev/shm/calypso_si.bin` per `doc/MMAP_SI_FORMAT.md` v1
+- QEMU mmap consumer in `calypso_fbsb.c` (`csi_init_once` + `csi_lookup_for_tc`)
+- TC scheduling per TS 44.018 §3.4 table 1 (SI3 emitted 3× per cycle)
+- Fallback hardcoded SI3 in `calypso_fbsb.c` retained as cold-start safety,
+  inactive when tap operational
+- `populate-si.sh` retained as manual debug tool (NOT in run_si.sh boot path
+  any more; tap covers warm-start dès osmo-bts attach)
+
+Mobile L23 reaches:
+- `New SYSTEM INFORMATION 1, 2, 3` parsed (lai=001-01-1)
+- `Changing CCCH_MODE to 2`
+- MM cell-selected (CGI 001-01-1-6001)
+- `RR_EST_REQ` → state idle → connection pending
+- `CHANNEL REQUEST: 00 (Location Update with NECI)`
+- `RANDOM ACCESS` bursts × 8 (max retransmits)
+- T3126 timeout (5s) — no IMM ASSIGN downstream
+- Cycle: T3126 fired → return idle → re-RR_EST_REQ → re-CHANNEL REQUEST
+
+Blockers downstream:
+1. UL chain broken (3 sub-issues per diag) :
+   - DSP-emulated RACH encoding absent in `calypso_trx.c`
+   - `d_task_u` read returns garbage (firmware doesn't write proper RACH task)
+   - `bridge.py` has 0 UL forward handler (no UDP 5701 sender)
+2. AGCH downlink not synthesized — IMM ASSIGN never reaches mobile
+
+---
+
+## 2026-04-30 nuit — BCCH pipeline end-to-end validé (étape 2)
 
 **Milestone L2 atteint** : pipeline BCCH descend de QEMU jusqu'à L23 mobile,
 avec payload structuré byte-à-byte vérifié.
