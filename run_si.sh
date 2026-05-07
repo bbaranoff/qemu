@@ -33,9 +33,35 @@ export CALYPSO_SI_MMAP_PATH
 # ---- DSP / DIAG instruments (override at command line if needed) ----
 CALYPSO_DSP_ROM="${CALYPSO_DSP_ROM:-/opt/GSM/calypso_dsp.txt}"
 CALYPSO_BSP_DARAM_ADDR="${CALYPSO_BSP_DARAM_ADDR:-0x3fb0}"
-CALYPSO_FORCE_INTM_CLEAR_AT="${CALYPSO_FORCE_INTM_CLEAR_AT:-}"
 CALYPSO_SIM_CFG="${CALYPSO_SIM_CFG:-$MOBILE_CFG}"
-export CALYPSO_DSP_ROM CALYPSO_BSP_DARAM_ADDR CALYPSO_FORCE_INTM_CLEAR_AT CALYPSO_SIM_CFG
+export CALYPSO_DSP_ROM CALYPSO_BSP_DARAM_ADDR CALYPSO_SIM_CFG
+
+# ---- Env-gated dev assists (default OFF = real path) ----
+# Set =1 in the calling environment to enable. Cf. README.md "Env vars".
+CALYPSO_FBSB_SYNTH="${CALYPSO_FBSB_SYNTH:-0}"
+CALYPSO_BCCH_INJECT="${CALYPSO_BCCH_INJECT:-0}"
+CALYPSO_W1C_LATCH="${CALYPSO_W1C_LATCH:-0}"
+CALYPSO_NDB_D_RACH_OFFSET="${CALYPSO_NDB_D_RACH_OFFSET:-}"
+CALYPSO_RACH_FORCE_BSIC="${CALYPSO_RACH_FORCE_BSIC:-}"
+BRIDGE_CLK_FROM_QEMU="${BRIDGE_CLK_FROM_QEMU:-1}"
+export CALYPSO_FBSB_SYNTH CALYPSO_BCCH_INJECT CALYPSO_W1C_LATCH \
+       CALYPSO_NDB_D_RACH_OFFSET CALYPSO_RACH_FORCE_BSIC BRIDGE_CLK_FROM_QEMU
+
+# ---- icount mode (deterministic virtual clock paced by instruction count) ----
+# Default ON (auto = shift=auto,sleep=on,align=off). Set CALYPSO_ICOUNT=off
+# to disable. The kick timer (calypso_kick_cb) was moved to
+# QEMU_CLOCK_VIRTUAL so it no longer races with icount.
+# Other accepted values:
+#   auto              shift dynamic, wall-clock aligned (recommended)
+#   shift=N,sleep=on  fixed shift (1<<N instr ≈ 1ns), explicit sleep
+#   off               disable (legacy default-clock mode)
+CALYPSO_ICOUNT="${CALYPSO_ICOUNT:-auto}"
+export CALYPSO_ICOUNT
+if [ "$CALYPSO_ICOUNT" = "off" ]; then
+    QEMU_ICOUNT_FLAG=""
+else
+    QEMU_ICOUNT_FLAG="-icount $CALYPSO_ICOUNT"
+fi
 
 # ---- log paths ----
 QEMU_LOG="/root/qemu.log"
@@ -67,9 +93,13 @@ sleep 1
 tmux new-session -d -s "$SESSION" -n qemu
 
 # ---------- 1. QEMU ----------
-# CALYPSO_SI_MMAP_PATH propagé via export en haut du script.
+# icount controlled by CALYPSO_ICOUNT env var (default 'auto'). The kick
+# timer in calypso_trx.c was moved to QEMU_CLOCK_VIRTUAL so icount no
+# longer freezes the TDMA tick → bridge UDP path. If you observe the
+# bridge wait timeout again, fall back with CALYPSO_ICOUNT=off.
 L1CTL_SOCK="$QEMU_DUMMY_SOCK" \
 "$QEMU" -M calypso -cpu arm946 \
+    $QEMU_ICOUNT_FLAG \
     -serial pty -serial pty \
     -monitor "unix:${MON_SOCK},server,nowait" \
     -kernel "$FW_ELF" \
@@ -151,8 +181,14 @@ echo "ENV summary:"
 echo "  CALYPSO_SI_MMAP_PATH        = $CALYPSO_SI_MMAP_PATH"
 echo "  CALYPSO_DSP_ROM             = $CALYPSO_DSP_ROM"
 echo "  CALYPSO_BSP_DARAM_ADDR      = $CALYPSO_BSP_DARAM_ADDR"
-echo "  CALYPSO_FORCE_INTM_CLEAR_AT = ${CALYPSO_FORCE_INTM_CLEAR_AT:-(unset)}"
 echo "  CALYPSO_SIM_CFG             = $CALYPSO_SIM_CFG"
+echo "  CALYPSO_FBSB_SYNTH          = $CALYPSO_FBSB_SYNTH"
+echo "  CALYPSO_BCCH_INJECT         = $CALYPSO_BCCH_INJECT"
+echo "  CALYPSO_W1C_LATCH           = $CALYPSO_W1C_LATCH"
+echo "  CALYPSO_NDB_D_RACH_OFFSET   = ${CALYPSO_NDB_D_RACH_OFFSET:-(default 0x01CB)}"
+echo "  CALYPSO_RACH_FORCE_BSIC     = ${CALYPSO_RACH_FORCE_BSIC:-(unset = use d_rach byte)}"
+echo "  BRIDGE_CLK_FROM_QEMU        = $BRIDGE_CLK_FROM_QEMU"
+echo "  CALYPSO_ICOUNT              = $CALYPSO_ICOUNT  (flag: ${QEMU_ICOUNT_FLAG:-(none)})"
 echo
 echo "Manual warm-start (debug, if BSC unavailable) :"
 echo "  /opt/GSM/qemu-src/scripts/populate-si.sh"
