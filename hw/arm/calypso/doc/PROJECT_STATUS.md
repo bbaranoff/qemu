@@ -1,5 +1,83 @@
 # Calypso GSM Baseband Emulator — Project Status
 
+## 2026-05-07 — UL pipeline wired + hack cleanup
+
+**State** : DL milestone preserved, UL chain instrumented end-to-end, all
+documented hacks either removed or env-gated. Next blocker discriminated to
+`RACH→BTS→IMM_ASS_CMD` round-trip.
+
+### Verified live (this session)
+
+With `CALYPSO_FBSB_SYNTH=1 ./run.sh` :
+- DL : `<0001> sysinfo.c New SYSTEM INFORMATION 3 (lai=001-01-1)` reappears
+  in mobile log ; SI1/SI2/SI3/SI4 all decoded ; `Changing CCCH_MODE to 2`
+- UL : 8 packets delivered to BTS via bridge UL, including
+  `bridge: UL #7 TN=0 fn=1480` and `UL #8 TN=0 fn=1480` (RACH-slot,
+  vs noise-slots TN=4/6 we saw on first instrumentation)
+- bridge stats : `tick=5931 clk=68 dl=54996 ul=N` — CLK IND skew greatly
+  reduced vs pre-icount (1-FN compensations vs 102-FN before)
+
+Without `CALYPSO_FBSB_SYNTH` : DSP runs the real fb-det against bridge-fed
+GMSK samples, doesn't converge → mobile loops `L1CTL_FBSB_REQ`.
+
+### Wiring added
+
+| Connection | File | Notes |
+|---|---|---|
+| `DB_W_D_TASK_RA` polling (write-page word 7) | `calypso_trx.c::tdma_tick` | RACH was silently dropped — `d_task_u` (word 2) is the SDCCH/SACCH/TCH lane, not RACH |
+| `calypso_bsp_tx_rach_burst` | `calypso_bsp.c` | `gsm0503_rach_ext_encode` produces real 148-symbol AB ; `d_rach` read at `CALYPSO_NDB_D_RACH_OFFSET` (default 0x01CB) |
+| libosmocoding link | `hw/arm/calypso/meson.build` | `dependency('libosmocoding')` |
+| `bsp.trxd_peer` pre-set | `calypso_bsp.c::calypso_bsp_init` | UL works before first DL |
+| `bridge.trxd_remote` pre-set | `bridge.py::Bridge.__init__` | UL forwards to (BTS, base+102) immediately |
+| `BRIDGE_CLK_FROM_QEMU` env mode | `bridge.py` | CLK IND from QEMU FN advance, not host wall-clock |
+| `-icount shift=auto,align=off,sleep=off` | `run.sh` | Deterministic virtual time |
+
+### Hacks removed (per CLAUDE.md règle #1)
+
+| Hack | File | Line span |
+|---|---|---|
+| BOURRIN-FBDET-SKIP block (PC range pop+jump bypass) | `calypso_c54x.c` | ~864-899 (36 lines) |
+| DIAG-HACK INTM force-clear + ALIAS-CHECK + BOOT+100k VECDUMP | `calypso_c54x.c` | ~4950-5066 (~120 lines) |
+| `si3_fallback[23]` hardcoded SI3 | `calypso_fbsb.c::DSP_TASK_ALLC` | inline literal |
+| `allc_burst_idx` static cycle 0..3 | `calypso_fbsb.c::DSP_TASK_ALLC` | replaced by `fn & 3` |
+
+### Env-gated (default OFF — real path) ; on retains DL milestone
+
+| Env var | Effect |
+|---|---|
+| `CALYPSO_FBSB_SYNTH=1` | `calypso_fbsb_publish_fb_found` + `_publish_sb_found` re-enabled in `on_dsp_task_change`. Used while emulated DSP correlator does not converge on bridge GMSK. |
+| `CALYPSO_NDB_D_RACH_OFFSET=0xNNN` | Override d_rach word index in NDB (verify offset for active DSP version). |
+| `BRIDGE_CLK_FROM_QEMU=1` | Replaces wall-clock-paced CLK IND with QEMU-FN-paced. Pair with `-icount`. |
+
+### Current blocker
+
+Mobile sends RACH, no `IMM_ASS_CMD` reaches L3. Two failure modes not yet
+discriminated :
+- (a) BTS doesn't decode our UL RACH bursts (encoding off, FN off, BSIC
+  mismatch, or burst arrives outside BTS RACH detect window)
+- (b) BTS does decode and BSC sends IMM_ASS, but mobile DSP misses the
+  AGCH sub-slot on the CCCH multiframe
+
+Test discriminant : tcpdump GSMTAP during a `CALYPSO_FBSB_SYNTH=1` run.
+- IMM_ASS visible on air → (b) — debug DL AGCH sub-slot scheduling
+- Absent + `osmo-bts-trx` RACH detect counter at 0 → (a) — debug UL
+  burst encoding (verify d_rach offset, BSIC source, FN tagging)
+
+### Co-issue discovered : task_ra spurious values
+
+`task_ra` and `task_u` both read non-zero at fn=104 with seemingly random
+values (e.g. `task_ra=0x2d4e tn=6 fn=104`, `d_rach=0x19a9 ra=0x19 bsic=0x2a`).
+BSIC varies run-to-run, RA looks plausible. Two hypotheses :
+- d_rach offset wrong → reading garbage from a different NDB slot
+- Firmware actually writes nonzero values to d_task_ra during init that we
+  pick up as legitimate RACH triggers
+
+Open : trace API RAM writes to (page word 7) and to candidate d_rach
+offsets during a known RACH attempt (after Location Update L3 starts) to
+filter noise from real RACH commands.
+
+---
+
 ## 2026-04-30 13:00 — Milestone L3 mobile-side via dynamic RSL tap
 
 - BCCH SI injection: 100% dynamic from osmo-bsc live RSL

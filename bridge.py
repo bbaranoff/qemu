@@ -25,6 +25,11 @@ CLK_IND_WALL_S = (CLK_IND_PERIOD * 4615) / 1_000_000  # ~0.471 s real-time
 
 QEMU_BSP_ADDR = ("127.0.0.1", 6702)
 
+# When set, drive CLK IND from QEMU FN advance instead of host wall-clock.
+# Eliminates host-load jitter at the cost of CLK IND rate following QEMU
+# emulation speed. Pair with -icount on QEMU for full determinism.
+CLK_FROM_QEMU = os.environ.get("BRIDGE_CLK_FROM_QEMU", "0") == "1"
+
 def udp_bind(port):
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -39,7 +44,10 @@ class Bridge:
         self.trxd_sock = udp_bind(bts_base + 2)
         self.bts_clk_addr = ("127.0.0.1", bts_base + 100)
         self.trxc_remote = None
-        self.trxd_remote = None     # BTS TRXD endpoint, learned on first DL
+        # Pre-set TRXD remote to osmo-bts-trx convention (base+102=5802) so
+        # UL packets from QEMU forward correctly even before the first DL
+        # has arrived. Refined to the actual sender on first DL.
+        self.trxd_remote = ("127.0.0.1", bts_base + 102)
         self.powered = False
         self.fn = 0
         # BTS starts its own FN at 0 on POWERON — several seconds after QEMU
@@ -48,8 +56,7 @@ class Bridge:
         self.fn_anchor = 0
         self.anchored = False
         self._stop = False
-        self.stats = {"clk": 0, "trxc": 0, "dl": 0, "ul": 0,
-                      "ul_drop_no_bts": 0, "tick": 0}
+        self.stats = {"clk": 0, "trxc": 0, "dl": 0, "ul": 0, "tick": 0}
 
         # QEMU CLK tick receiver
         self.qemu_clk_sock = udp_bind(6700)
@@ -76,18 +83,34 @@ class Bridge:
         if self.stats["tick"] <= 3 or self.stats["tick"] % 10000 == 0:
             print(f"bridge: QEMU tick #{self.stats['tick']} FN={self.fn}", flush=True)
 
+        # In QEMU-driven CLK mode, send CLK IND on every tick crossing the
+        # CLK_IND_PERIOD boundary. Eliminates wall-clock jitter.
+        if CLK_FROM_QEMU and self.powered:
+            if self.last_clk_fn is None or \
+               (self.fn - self.last_clk_fn) % GSM_HYPERFRAME >= CLK_IND_PERIOD:
+                self._send_clk_ind()
+                self.last_clk_fn = self.fn
+
+    def _send_clk_ind(self):
+        clk_fn = (self.fn // CLK_IND_PERIOD) * CLK_IND_PERIOD
+        try:
+            self.clk_sock.sendto(
+                f"IND CLOCK {clk_fn}\0".encode(), self.bts_clk_addr)
+            self.stats["clk"] += 1
+        except OSError:
+            pass
+
     def maybe_send_clk(self):
-        """Send CLK IND to BTS at WALL-CLOCK period (one CLK_IND_PERIOD
-        worth of GSM frames every ~471 ms wall-clock = 102 * 4.615 ms).
+        """Wall-clock-paced CLK IND.
 
         osmo-bts-trx's scheduler_trx.c monitors PC clock skew (real elapsed
-        time between CLK INDs vs the GSM time they advertise) and shuts
-        down with "PC clock skew too high" if QEMU runs slower than real-
-        time. Driving CLK IND from wall-clock keeps the BTS happy on the
-        time axis; the embedded FN still tracks QEMU so downlink bursts
-        land at the FN the BSP queue is matching against.
+        time between CLK INDs vs the GSM time they advertise). When the
+        guest emulation is slower than real-time, sending CLK INDs at
+        wall-clock cadence keeps the BTS scheduler from declaring skew —
+        but introduces host-load-dependent jitter. Use BRIDGE_CLK_FROM_QEMU=1
+        for deterministic runs (CLK driven from QEMU FN advance).
         """
-        if not self.powered:
+        if CLK_FROM_QEMU or not self.powered:
             return
         now = time.monotonic()
         if not hasattr(self, '_last_clk_wall'):
@@ -98,13 +121,7 @@ class Bridge:
         # Catch up if we slipped a long time (avoid runaway send burst)
         if now - self._last_clk_wall > CLK_IND_WALL_S * 4:
             self._last_clk_wall = now
-        clk_fn = (self.fn // CLK_IND_PERIOD) * CLK_IND_PERIOD
-        try:
-            self.clk_sock.sendto(
-                f"IND CLOCK {clk_fn}\0".encode(), self.bts_clk_addr)
-            self.stats["clk"] += 1
-        except OSError:
-            pass
+        self._send_clk_ind()
 
     def handle_trxc(self):
         try: data, addr = self.trxc_sock.recvfrom(256)
@@ -167,20 +184,9 @@ class Bridge:
           [5]    RSSI offset (BTS sees -value dBm)
           [6:8]  ToA256 (BE)
           [8:]   148 soft bits (±127)
-        """
-        if self.trxd_remote is None:
-            # BTS hasn't sent any DL yet — we don't know its TRXD addr.
-            # Without POWERON+DL flow there's no UL session anyway, so this
-            # is a transient at startup; log first few then thin.
-            self.stats["ul_drop_no_bts"] += 1
-            d = self.stats["ul_drop_no_bts"]
-            if d <= 5 or (d % 1000) == 0:
-                tn = data[0] & 0x07
-                fn = int.from_bytes(data[1:5], 'big')
-                print(f"bridge: UL drop (no BTS peer yet) #{d} "
-                      f"TN={tn} fn={fn} len={len(data)}", flush=True)
-            return
 
+        trxd_remote is pre-set in __init__ so the first UL is never dropped.
+        """
         self.stats["ul"] += 1
         tn = data[0] & 0x07
         fn = int.from_bytes(data[1:5], 'big')
@@ -258,14 +264,13 @@ class Bridge:
                ((self.stats["dl"] + self.stats["ul"]) % 5000) == 0:
                 print(f"bridge: tick={self.stats['tick']} "
                       f"clk={self.stats['clk']} "
-                      f"dl={self.stats['dl']} ul={self.stats['ul']} "
-                      f"ul_drop={self.stats['ul_drop_no_bts']}", flush=True)
+                      f"dl={self.stats['dl']} ul={self.stats['ul']}",
+                      flush=True)
 
         self._stop = True
         print(f"bridge: tick={self.stats['tick']} clk={self.stats['clk']} "
               f"trxc={self.stats['trxc']} dl={self.stats['dl']} "
-              f"ul={self.stats['ul']} "
-              f"ul_drop={self.stats['ul_drop_no_bts']}", flush=True)
+              f"ul={self.stats['ul']}", flush=True)
 
 if __name__ == "__main__":
     Bridge().run()

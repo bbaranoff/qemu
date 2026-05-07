@@ -1,27 +1,40 @@
 # TODO — chemin FBSB QEMU Calypso
 
-## Next blocker: IMM ASSIGN / UL chain
+## Status 2026-05-07 — UL connections wired, hacks removed
 
-Three options under evaluation:
+Decision retenue : **option (b)** — wire UL real, no hack.
 
-(a) AGCH IMM ASSIGN synth via mmap (similar to BCCH SI mmap)
-    - Risk: requires matching `Request Reference` (RA + FN) to mobile's actual RACH
-    - Becomes BSC mock if forging IMM ASSIGN locally
+### Done in this pass
 
-(b) Wire UL: QEMU → bridge.py → osmo-bts (TRXD UL UDP 5701)
-    - Architecturally clean, BSC handles IMM ASSIGN naturally
-    - Estimated 2-4 days (3 broken links: DSP encoding, task_u read, bridge UL)
+- ✓ `DB_W_D_TASK_RA = 7` polling added in `calypso_trx.c::tdma_tick`
+  (RACH writes are no longer silently dropped — only `d_task_u` was polled
+  before, which is why CLAUDE.md mentioned "garbage 64413/65427" : these
+  values lived in the unread word 7 = d_task_ra slot, not task_u garbage).
+- ✓ `calypso_bsp_tx_rach_burst` in `calypso_bsp.c` :
+  reads NDB `d_rach`, calls `gsm0503_rach_ext_encode` (libosmocoding) to
+  produce a real 148-symbol AB burst, sends via the bridge UL path.
+- ✓ libosmocoding linkage in `hw/arm/calypso/meson.build`.
+- ✓ bridge.py UL handler de-raced : `trxd_remote` pre-set to (BTS, 5802)
+  so the first UL burst is no longer silently dropped.
+- ✓ BSP UL trxd_peer pre-set to (bridge, 5702).
+- ✓ Hacks deleted (cf. `doc/hacks.md` § Cleanup 2026-05-07).
+- ✓ Stability : `-icount` on QEMU + `BRIDGE_CLK_FROM_QEMU=1`.
 
-(c) Hybrid: synth RACH burst in QEMU + bridge UL forward + osmo-bts capture
-    - Bypass DSP RACH encoding via L1CTL hook
-    - Estimated 2-4h, follows mmap BCCH philosophy
-    - Documented hack like `publish_fb_found` bypass
+### Open items
 
-Decision pending. Diag UL chain done :
-- 7 L1CTL_RACH_CONF côté osmocon (mobile RACH bursts confirmés par firmware)
-- `task_u` poll dans calypso_trx.c lit dsp_ram garbage (64413, 65427 etc.)
-- bridge.py n'a aucun handler UL (grep `recv.*5701` retourne 0)
-- 0 packets capturés sur UDP 5701 (TRX UL)
+1. **Verify d_rach offset** : `CALYPSO_NDB_D_RACH_OFFSET` defaults to
+   `0x01CB` (DSP==33 layout walk). The firmware writes `d_rach` right
+   before `d_task_ra` ; trace API RAM writes during a RACH attempt to
+   confirm. Set env var to override if needed.
+2. **NB UL bits buffer addr** : `calypso_bsp_tx_burst` reads from
+   `dsp->data[0x0900]`. Candidate, unverified. Trace DSP DARAM writes
+   during a real SDCCH UL to find the actual encoder output buffer.
+3. **Test discriminant** for the IMM_ASS_CMD silence : tcpdump GSMTAP.
+   - IMM_ASS visible on air → bug in DL AGCH path (DSP misses sub-slots).
+   - Absent + osmo-bts-trx RACH counter at 0 → bug in UL emission.
+4. **NB UL encoding** for SDCCH/SACCH/FACCH : `gsm0503_xcch_encode` +
+   `gsm0503_xcch_burst_encode`. Same pattern as RACH — call site is
+   `calypso_bsp_tx_burst` (currently reads candidate DARAM addr only).
 
 ---
 

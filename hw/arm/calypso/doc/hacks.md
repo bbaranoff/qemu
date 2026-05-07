@@ -11,6 +11,35 @@
 | **Bypass architectural** | Workaround documenté pour combler un trou de l'environnement d'émulation (pas de RF, pas de timing physique). Justifié tant que QEMU n'a pas l'équivalent. | Acceptable pour LU PoC. À évaluer post-LU si replacement faisable. |
 | **Dette technique** | Code correct mais pas idéal. Pattern fragile, code mort, redondance. Pas mentir, juste pas propre. | Nettoyer post-LU pour qualité long-terme. Pas bloquant. |
 
+## Cleanup — 2026-05-07
+
+User mandate : « tant pis on bourrine pas, tu vire les hack des que tu vois ».
+Removed in this pass :
+
+| Hack | Type | File / loc | Replacement |
+|---|---|---|---|
+| `BOURRIN-FBDET-SKIP` PC range pop+jump | brut | `calypso_c54x.c` ~864 (block) | DSP runs full fb-det ; `-icount` covers cycle budget |
+| `DIAG-HACK` env-gated INTM force-clear + ALIAS-CHECK dump | brut | `calypso_c54x.c` ~4950 (block) | Removed entirely ; CALYPSO_FORCE_INTM_CLEAR_AT no longer recognized |
+| `publish_fb_found(toa=0,pm=80,angle=0,snr=100)` synth call | bypass | `calypso_fbsb.c::on_dsp_task_change DSP_TASK_FB` | Real DSP fb-det path on GMSK-modulated I/Q from `osmo-bts-trx` |
+| `publish_sb_found(bsic=0)` synth call | bypass | `calypso_fbsb.c::on_dsp_task_change DSP_TASK_SB` | Real DSP sb-det path |
+| `si3_fallback[23]` hardcoded SI3 | brut | `calypso_fbsb.c::on_dsp_task_change DSP_TASK_ALLC` | mmap-only ; no SI written if `/dev/shm/calypso_si.bin` absent |
+| `allc_burst_idx` static cycle 0..3 | brut | `calypso_fbsb.c::on_dsp_task_change DSP_TASK_ALLC` | `burst_d = fn & 3` (FN-derived, no static state) |
+| `ul_drop_no_bts` race in bridge UL | brut | `bridge.py::_handle_ul` | `trxd_remote` pre-set to (BTS, base+102) at init |
+| BSP `trxd_peer_valid=false` until first DL | brut | `calypso_bsp.c::calypso_bsp_init` | Pre-set to bridge default (127.0.0.1:5702) ; refined on first DL |
+
+Functions kept compiled but unused (`calypso_fbsb_publish_fb_found` /
+`_publish_sb_found`) — diagnostic utilities, no live caller.
+
+Connections added in this pass :
+
+| Connection | File | Why |
+|---|---|---|
+| `DB_W_D_TASK_RA` polling (write-page word 7) | `calypso_trx.c::tdma_tick UL section` | RACH writes were silently dropped — only d_task_u was polled |
+| `calypso_bsp_tx_rach_burst` via libosmocoding | `calypso_bsp.c` | Real RACH AB burst encoding from NDB d_rach |
+| libosmocoding linkage in meson | `hw/arm/calypso/meson.build` | dep on `libosmocoding` for gsm0503_rach_ext_encode |
+| `BRIDGE_CLK_FROM_QEMU` env-gated mode | `bridge.py` | Deterministic CLK IND from QEMU FN advance |
+| `-icount shift=auto,align=off,sleep=off` on QEMU | `run.sh` | Reproducible virtual clock |
+
 ---
 
 ## `calypso_fbsb.c` — orchestration FBSB host-side
@@ -47,53 +76,38 @@ on `rsl_si_tap.py` which always reflects current BSC live config.
 mmap open periodically (currently lazy one-shot). Until then keep populate-si.sh
 for manual cold-start scenarios.
 
-#### `allc_burst_idx` static counter cycle 0..3
+#### `allc_burst_idx` static counter cycle 0..3 — RESOLVED (2026-05-07)
 
-**Quoi** : compteur local incrémenté à chaque task=24 fire, écrit dans `db_r->d_burst_d`.
+**Status** : **REMOVED**. Replaced by `burst_d = fn & 3` (FN-derived).
+No static state, no run-to-run drift. The duplicate entry below is preserved
+for historical context — both pointed at the same problem.
 
-**Pourquoi c'est un hack** : assume une cadence parfaite cmd→resp côté firmware. Si timing dérive (frame skip, jitter), le counter désynchronise → `BURST ID mismatch` côté firmware (24/28 mismatch observés). User suggéra de lire `wp[DB_W_D_BURST_D]` directement, mais shift de timing schedule firmware empêche cette approche simpliste.
+#### `allc_burst_idx` (duplicate entry — same fix as above)
 
-**Critère de retrait** : implémenter frame-tick scheduled write basé sur fn modulo 51 (block boundary) pour aligner sur le vrai schedule mframe. Ou alternative : fix proprement le timing TDMA pour éliminer la dérive cmd/resp.
-
-**Note** : le hack ne casse pas DATA_IND (resp(3) match accidentel donne 1 DATA_IND par bloc), mais 75% des resps sont rejetées avec mismatch noisy.
-
-#### `allc_burst_idx` static counter cycle 0..3
-
-**Quoi** : compteur local incrémenté à chaque task=24 fire, écrit dans `db_r->d_burst_d`.
-
-**Pourquoi c'est un hack** : assume une cadence parfaite cmd→resp côté firmware. Si timing dérive (frame skip, jitter), le counter désynchronise → `BURST ID mismatch` côté firmware (24/28 mismatch observés). User suggéra de lire `wp[DB_W_D_BURST_D]` directement, mais shift de timing schedule firmware empêche cette approche simpliste.
-
-**Critère de retrait** : implémenter frame-tick scheduled write basé sur fn modulo 51 (block boundary) pour aligner sur le vrai schedule mframe. Ou alternative : fix proprement le timing TDMA pour éliminer la dérive cmd/resp.
-
-**Note** : le hack ne casse pas DATA_IND (resp(3) match accidentel donne 1 DATA_IND par bloc), mais 75% des resps sont rejetées avec mismatch noisy.
+**Status** : RESOLVED 2026-05-07. See entry above.
 
 ### Bypass architecturaux
 
-#### `publish_fb_found(toa=0, pm=80, angle=0, snr=100)`
+#### `publish_fb_found(toa=0, pm=80, angle=0, snr=100)` — RESOLVED (2026-05-07)
 
-**Quoi** : valeurs synthétiques "FB trouvé parfait" écrites dans NDB `a_sync_demod[*]` à chaque ARM `d_task_md=5` write.
+**Status** : **call site REMOVED** in `on_dsp_task_change`. The function
+is still compiled (no live caller) for diagnostic re-use if needed.
+DSP fb-det now runs against real GMSK-modulated I/Q from `osmo-bts-trx`
+(via `calypso_bsp.c::bsp_trxd_readable` → cos_tab/sin_tab phase walk).
 
-**Pourquoi bypass** : QEMU n'a pas de vrai signal RF analogique. Le bridge livre des samples I/Q d'une LUT cos/sin fixe, pas un vrai FCCH 67kHz pure tone. Le DSP correlator émulé ne peut pas converger sur ces samples synthétiques. Sans bypass, `freq_err` resté à -14119 Hz (valeur DSP iter sur LUT) → FBSB_CONF result=255.
+**Risk if it regresses** : without enough cycle budget per TDMA tick,
+the DSP fb-det routine doesn't complete → `freq_err` drifts → FBSB
+returns result=255. Mitigation : `-icount shift=auto` on QEMU.
 
-**Justification environnement** : le DSP demod/AFC est ce qui n'est pas faisable en QEMU faute de vrai signal RF. L'origine du payload (osmo-bts → bridge → DSP) reste correcte.
+#### `publish_sb_found(bsic=0)` — RESOLVED (2026-05-07)
 
-**Replacement éventuel** : émulation SDR-style avec gr-osmosdr générant un vrai FCCH burst → DSP correlator converge. Out of scope pour LU PoC.
+**Status** : **call site REMOVED** in `on_dsp_task_change`. Same as
+`publish_fb_found` — function compiled but unused.
 
-#### `publish_sb_found(bsic=0)`
+#### `publish_pm_found` (RSSI synthétique) — N/A
 
-**Quoi** : `a_sch[0..4]` écrit dans LES DEUX read pages avec pattern CRC-OK + BSIC=0.
-
-**Pourquoi bypass** : même raison que FB. SB demod nécessite un vrai burst SCH décodable.
-
-**Pourquoi belt-and-suspenders sur les deux pages** : ARM toggle `d_dsp_page` indépendamment du moment où notre hook fire. Sans certitude sur la page active au resp time, on écrit aux deux. Acceptable mais dette technique.
-
-**Replacement éventuel** : tracker `s->dsp_page` pour écrire sur la page active uniquement.
-
-#### `publish_pm_found` (RSSI synthétique)
-
-**Quoi** : valeurs RSSI synthétiques pour mesure puissance ARFCN.
-
-**Pourquoi bypass** : pas de RF réel.
+**Status** : was conceptual in the original `hacks.md` ; no concrete
+implementation found in code at audit time. No removal needed.
 
 #### `case ALLC_DSP_TASK` echo `d_task_d` + `d_burst_d`
 
@@ -107,36 +121,23 @@ for manual cold-start scenarios.
 
 ### Hacks bruts (bourrin pre-LU)
 
-#### Short-circuit fb-det `[0x8d00, 0x8f80]` — 2026-05-06
+#### Short-circuit fb-det `[0x8d00, 0x8f80]` — RESOLVED (2026-05-07)
 
-**Quoi** : early-return dans `c54x_exec_one` (calypso_c54x.c ligne ~864). Au premier PC entrant dans la zone fb-det depuis l'extérieur, on simule un RET non-FAR (POP stack → PC, SP++) sans exécuter la routine. Marqueur `XXX BOURRIN PRE-LU` + log `BOURRIN-FBDET-SKIP #N`.
-
-**Pourquoi bourrin** : la routine DSP fb-det émulée consommait ~3M cycles/tick → `work_dt` ≈ 6.6M > budget QB 4.615M. Conséquence : LOST 3500-7400, BURST ID désynchronisé, FBSB jamais complété. fbsb.c publish synthétique délivre les valeurs FB/SB/PM en parallèle, donc le résultat publié reste correct sans la routine DSP. Bonus : la routine émulée écrivait `d_fb_mode=0` (cf. memory `project_fbdet_threshold_blocker`, BSP 31:1 stale) ce qui faisait rejeter la threshold ARM ; skip => d_fb_mode garde sa valeur synth.
-
-**Side-effects acceptés** :
-- Compteurs DSP (insn_count fb-det) sous-évalués → cosmétique
-- Race ARM read vs DSP state désynchro intra-routine → mitigée par latches W1C
-- Si la routine est appelée en FCALL (FAR), POP sans XPC laisse XPC sur la stack → caller potentiellement déphasé. Log empirique pour détecter ce cas (`ra` invalide => crash ou wedge ailleurs visible).
-
-**Critère de retrait** :
-1. Location Update end-to-end complet (`mobile.log` montre LU ACCEPT)
-2. BSP 31:1 fix réel implémenté (DSP voit samples corrects)
-3. fb-det re-exécutée réellement OU shortcut conditionnel `if (!fbsb_synth_active)` proprement
-
-**Renvoi** : `doc/TODO.md` section "Cleanup post-LU bourrin"
+**Status** : **REMOVED**. The 36-line block at `c54x_exec_one` ~864 has
+been deleted entirely. DSP fb-det runs to completion. Cycle budget is
+covered by `-icount shift=auto` on QEMU (set in `run.sh`).
 
 ### Hacks bruts (diagnostiques)
 
-#### `CALYPSO_FORCE_INTM_CLEAR_AT=N` env var
+#### `CALYPSO_FORCE_INTM_CLEAR_AT=N` env var — RESOLVED (2026-05-07)
 
-**Quoi** : block de code dans `c54x_exec_one` qui force `ST1.INTM ← 0` à insn count N si env var positionnée.
+**Status** : **REMOVED**. ~120-line block at `c54x_run_until_idle_or_n`
+~4950 deleted. Env var no longer recognized. The 100k-instruction VECDUMP
+diagnostic block (`BOOT+100k VECDUMP-FORCED base=0xB900`) was removed in
+the same edit since it was paired with the hack.
 
-**Status** : documenté comme **instrument diagnostic** dans `TODO.md` (pas workaround). Désactivé par défaut. Permet de tester l'hypothèse catch-22 INTM forever.
-
-**Critère de retrait OBLIGATOIRE** (cf. TODO.md) :
-1. La vraie séquence RSBX INTM du boot DSP est identifiée et émulée correctement.
-2. Run sans `CALYPSO_FORCE_INTM_CLEAR_AT` passe les indicateurs (RETED ≥1, d_fb_det écrit).
-3. Block physiquement retiré du `.c`, `hack.patch` supprimé.
+The INTM=1 catch-22 was resolved naturally when the DSP frame-IRQ wiring +
+BSP RX delivery path converged ; no need for force-clear anymore.
 
 ### Bypass architecturaux
 
