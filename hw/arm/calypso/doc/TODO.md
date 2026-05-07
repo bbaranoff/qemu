@@ -509,6 +509,37 @@ contre fire prématuré (l'IRQ stay pending dans IFR jusqu'à clear INTM).
 
 ## Dette technique post-LU (à refactorer après le premier FB1/FB2)
 
+### Cleanup post-LU bourrin (2026-05-06)
+
+**Hacks bruts ajoutés en mode bourrin pour passer LU PoC.** À retirer DÈS que :
+- LU end-to-end OK
+- DSP fb-det réimplémentée correctement OU short-circuit conditionnel propre
+
+**Inventaire** :
+
+#### `calypso_c54x.c:864` — Short-circuit fb-det `[0x8d00, 0x8f80]`
+
+POP+RET émulé à l'entrée de la routine fb-det DSP. Économise ~3M cycles/tick.
+- Marqueur : `XXX BOURRIN PRE-LU 2026-05-06`
+- Log : `BOURRIN-FBDET-SKIP #N entry_pc=0x… ra=0x… SP=0x… XPC=u`
+- Risque : si caller FCALL (FAR) → XPC orphelin sur stack, caller peut déphaser. Vérifier `BOURRIN-FBDET-SKIP` log empirique : si `ra` n'est pas un PC de retour cohérent (e.g., très différent du XPC courant), il faut passer en `data_read+pop` XPC en plus.
+- Retrait : remplacer par exec réelle de la routine OU `if (fbsb_synth_active) bypass else exec`.
+
+#### Si insuffisant (work_dt toujours > 4.5M) — escalade prévue
+
+- Étendre shortcut aux routines AFC, autocorr (à identifier par hot-PC profiling : tdma_profile.log + hot PCs dans `c54x.c` STATE-DUMP).
+- Si toujours > 5M : dispatch opcode dominant → computed goto + decode cache.
+- Si toujours plafond : `-icount` + bridge slave (refactor structurel, autre session).
+
+**Critères de succès phase bourrin** :
+- `work_dt < 4.5M` cycles/tick sustained sur 100+ ticks consécutifs (cf. `/tmp/tdma_tick.log`)
+- LOST counter qui plafonne ou diminue (`/tmp/qemu-fw-console.log`)
+- `FBSB_CONF` apparaît dans osmocon.log
+- `DATA_IND` traversent
+- Bonus : Location Update se complète end-to-end (`mobile.log`)
+
+---
+
 ### `c54x_reset` MVPD memcpy — modèle incorrect
 
 `c54x_reset` exécute aujourd'hui une boucle `s->data[0x0080+i] = s->prog[0x7080+i]`

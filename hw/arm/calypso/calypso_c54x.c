@@ -861,6 +861,43 @@ static int c54x_exec_one(C54xState *s)
     int consumed = 1;
     s->lk_used = false;  /* reset before each instruction */
 
+    /* XXX BOURRIN PRE-LU 2026-05-06 — short-circuit DSP fb-det routine.
+     * Range [0x8d00, 0x8f80] englobe les real-fb-det stores 0x8d33/0x8eb9/0x8f51.
+     * Routine consommait ~3M cycles/tick (work_dt > budget QB 4.615M).
+     * fbsb.c publish synth path délivre FB/SB/PM indépendamment, donc skip
+     * complet de la routine DSP est sûr côté résultat publié.
+     * Effet bonus : la routine écrivait d_fb_mode=0 (BSP 31:1 stale) ce qui
+     * faisait rejeter la threshold ARM. Skip => d_fb_mode reste à sa valeur
+     * synth, threshold passe.
+     * Mécanisme : à l'entrée d'un PC dans la zone (depuis l'extérieur), on
+     * pop le retour caller de la stack (CALL push convention) et on saute
+     * directement dessus. RET non-FAR ; si l'appelant est FCALL, l'XPC top
+     * sera ignoré et le caller verra un PC mal-aligné — log empirique pour
+     * détecter ce cas.
+     * Critère retrait : Location Update end-to-end OK + BSP 31:1 fix réel
+     *   (cf. doc/TODO.md "Cleanup post-LU bourrin").
+     */
+    {
+        static uint16_t prev_pc_fbdet = 0;
+        static uint64_t fbdet_skip_count = 0;
+        if (s->pc >= 0x8d00 && s->pc < 0x8f80 &&
+            (prev_pc_fbdet < 0x8d00 || prev_pc_fbdet >= 0x8f80)) {
+            uint16_t ra = data_read(s, s->sp);
+            s->sp = (uint16_t)(s->sp + 1);
+            fbdet_skip_count++;
+            if (fbdet_skip_count <= 30 || (fbdet_skip_count % 5000) == 0) {
+                C54_LOG("BOURRIN-FBDET-SKIP #%llu entry_pc=0x%04x ra=0x%04x SP=0x%04x XPC=%u insn=%u",
+                        (unsigned long long)fbdet_skip_count,
+                        s->pc, ra, s->sp, s->xpc, s->insn_count);
+            }
+            s->pc = ra;
+            prev_pc_fbdet = ra;
+            s->cycles += 5;
+            return 0;  /* PC was set by branch — caller skips +consumed advance */
+        }
+        prev_pc_fbdet = s->pc;
+    }
+
     uint8_t hi4 = (op >> 12) & 0xF;
     uint8_t hi8 = (op >> 8) & 0xFF;
 

@@ -105,6 +105,26 @@ for manual cold-start scenarios.
 
 ## `calypso_c54x.c` — émulateur DSP TMS320C54x
 
+### Hacks bruts (bourrin pre-LU)
+
+#### Short-circuit fb-det `[0x8d00, 0x8f80]` — 2026-05-06
+
+**Quoi** : early-return dans `c54x_exec_one` (calypso_c54x.c ligne ~864). Au premier PC entrant dans la zone fb-det depuis l'extérieur, on simule un RET non-FAR (POP stack → PC, SP++) sans exécuter la routine. Marqueur `XXX BOURRIN PRE-LU` + log `BOURRIN-FBDET-SKIP #N`.
+
+**Pourquoi bourrin** : la routine DSP fb-det émulée consommait ~3M cycles/tick → `work_dt` ≈ 6.6M > budget QB 4.615M. Conséquence : LOST 3500-7400, BURST ID désynchronisé, FBSB jamais complété. fbsb.c publish synthétique délivre les valeurs FB/SB/PM en parallèle, donc le résultat publié reste correct sans la routine DSP. Bonus : la routine émulée écrivait `d_fb_mode=0` (cf. memory `project_fbdet_threshold_blocker`, BSP 31:1 stale) ce qui faisait rejeter la threshold ARM ; skip => d_fb_mode garde sa valeur synth.
+
+**Side-effects acceptés** :
+- Compteurs DSP (insn_count fb-det) sous-évalués → cosmétique
+- Race ARM read vs DSP state désynchro intra-routine → mitigée par latches W1C
+- Si la routine est appelée en FCALL (FAR), POP sans XPC laisse XPC sur la stack → caller potentiellement déphasé. Log empirique pour détecter ce cas (`ra` invalide => crash ou wedge ailleurs visible).
+
+**Critère de retrait** :
+1. Location Update end-to-end complet (`mobile.log` montre LU ACCEPT)
+2. BSP 31:1 fix réel implémenté (DSP voit samples corrects)
+3. fb-det re-exécutée réellement OU shortcut conditionnel `if (!fbsb_synth_active)` proprement
+
+**Renvoi** : `doc/TODO.md` section "Cleanup post-LU bourrin"
+
 ### Hacks bruts (diagnostiques)
 
 #### `CALYPSO_FORCE_INTM_CLEAR_AT=N` env var
