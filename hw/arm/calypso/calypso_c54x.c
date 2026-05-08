@@ -81,6 +81,72 @@ static uint16_t prog_read(C54xState *s, uint32_t addr);
 
 static uint16_t data_read(C54xState *s, uint16_t addr)
 {
+    /* PC-histogram pour identifier la routine PM. Deux ranges :
+     *   [0x3fb0..0x3fbf] = buffer BSP (samples I/Q)
+     *   [0x3dcf..0x3dd5] = buffer scratch dominant (78k+52k reads observés)
+     * Compte par PC, dump top-10 toutes les 50k reads dans chaque range.
+     * Plus compteur d'entrée par PC dominant pour distinguer
+     * "PM cassée" vs "PM jamais appelée" (vu IRQ rate 1.5 Hz). */
+    if (addr >= 0x3fb0 && addr <= 0x3fbf) {
+        static uint32_t pc_hist_3fb[65536];
+        static uint32_t total_3fb;
+        pc_hist_3fb[s->pc]++;
+        total_3fb++;
+        if ((total_3fb % 50000) == 0) {
+            uint32_t top_pc[10] = {0};
+            uint32_t top_cnt[10] = {0};
+            for (uint32_t p = 0; p < 65536; p++) {
+                uint32_t c = pc_hist_3fb[p];
+                if (c == 0) continue;
+                for (int i = 0; i < 10; i++) {
+                    if (c > top_cnt[i]) {
+                        for (int j = 9; j > i; j--) {
+                            top_pc[j]  = top_pc[j-1];
+                            top_cnt[j] = top_cnt[j-1];
+                        }
+                        top_pc[i]  = p;
+                        top_cnt[i] = c;
+                        break;
+                    }
+                }
+            }
+            fprintf(stderr, "[c54x] PC-HIST-3FB total=%u :", total_3fb);
+            for (int i = 0; i < 10 && top_cnt[i]; i++) {
+                fprintf(stderr, " %04x:%u", top_pc[i], top_cnt[i]);
+            }
+            fprintf(stderr, "\n");
+        }
+    }
+    if (addr >= 0x3dcf && addr <= 0x3dd5) {
+        static uint32_t pc_hist_3dd[65536];
+        static uint32_t total_3dd;
+        pc_hist_3dd[s->pc]++;
+        total_3dd++;
+        if ((total_3dd % 50000) == 0) {
+            uint32_t top_pc[10] = {0};
+            uint32_t top_cnt[10] = {0};
+            for (uint32_t p = 0; p < 65536; p++) {
+                uint32_t c = pc_hist_3dd[p];
+                if (c == 0) continue;
+                for (int i = 0; i < 10; i++) {
+                    if (c > top_cnt[i]) {
+                        for (int j = 9; j > i; j--) {
+                            top_pc[j]  = top_pc[j-1];
+                            top_cnt[j] = top_cnt[j-1];
+                        }
+                        top_pc[i]  = p;
+                        top_cnt[i] = c;
+                        break;
+                    }
+                }
+            }
+            fprintf(stderr, "[c54x] PC-HIST-3DD total=%u :", total_3dd);
+            for (int i = 0; i < 10 && top_cnt[i]; i++) {
+                fprintf(stderr, " %04x:%u", top_pc[i], top_cnt[i]);
+            }
+            fprintf(stderr, "\n");
+        }
+    }
     /* Watch the mailbox slots that the firmware polls at PROM0 0xb41a
      * (LDU *(0x0ffe), A then BACC A) and 0xb41c (CMPM *(0x0fff), 4).
      * If these stay zero / 0x10 forever, ARM never wrote them. */
@@ -368,6 +434,23 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
     /* WATCH-WRITE on the same mailbox slots tracked in data_read.
      * Whoever writes them — DSP or ARM via api_ram alias — gets logged
      * so we can attribute the source of the value the firmware polls. */
+    /* WATCH-WRITE 0x3dd2 — la cellule sur laquelle 0x75db poll en boucle
+     * (37M reads/15s). Identifier qui écrit (et qui ne le fait pas).
+     * Cas 1 : zéro write → un bloc compute ne fire jamais.
+     * Cas 2 : write boot only → init OK mais set steady-state manquant.
+     * Cas 3 : writes périodiques avec valeur jamais matchée par le test
+     *         à 0x75db → bug dans le compute en amont. */
+    if (addr == 0x3dd2) {
+        static unsigned w3dd2;
+        w3dd2++;
+        if (w3dd2 <= 100 || (w3dd2 % 1000) == 0) {
+            fprintf(stderr,
+                    "[c54x] WATCH-WRITE 0x3dd2 #%u <- 0x%04x (was 0x%04x) "
+                    "PC=0x%04x insn=%u INTM=%d\n",
+                    w3dd2, val, s->data[addr], s->pc, s->insn_count,
+                    !!(s->st1 & ST1_INTM));
+        }
+    }
     if (addr == 0x0ffe || addr == 0x0fff || addr == 0x01F0) {
         static unsigned wcount;
         if (wcount++ < 30) {
@@ -789,6 +872,45 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
                             other_pc_count, val, s->pc, s->sp);
                 }
             }
+            /* === D_FB_DET ZERO-OVERRIDE TRACE ===
+             * Race-window observed (memory `project_fbdet_threshold_blocker`):
+             * DSP writes high SNR (e.g. 0x7902, 0x7766) at fb-det PCs, then
+             * SOMETHING zeroes d_fb_det before ARM reads. ARM sees 200×
+             * 0x0000 → no FB found → endless L1CTL_FBSB_REQ retries.
+             *
+             * Capture EVERY write of val=0 to 0x08F8 with full context so
+             * we identify the zero-ifying PCs and reconstruct the condition
+             * (threshold check, post-correlation reset, error path, etc.).
+             * Cap 200 events. */
+            if (val == 0) {
+                static unsigned zero_log = 0;
+                if (zero_log < 200) {
+                    C54_LOG("D_FB_DET ZERO-WR #%u PC=0x%04x op=0x%04x prev=0x%04x "
+                            "A=%010llx B=%010llx T=0x%04x ST0=0x%04x ST1=0x%04x insn=%u",
+                            zero_log + 1,
+                            s->pc, s->prog[s->pc],
+                            s->data[0x08F8],
+                            (unsigned long long)(s->a & 0xFFFFFFFFFFLL),
+                            (unsigned long long)(s->b & 0xFFFFFFFFFFLL),
+                            s->t, s->st0, s->st1, s->insn_count);
+                    zero_log++;
+                }
+            }
+            /* Transition trace : non-zero → zero (the override moment).
+             * Logs whenever d_fb_det was non-zero just before this write
+             * but the new write makes it zero. Cap 100. */
+            if (val == 0 && s->data[0x08F8] != 0) {
+                static unsigned override_log = 0;
+                if (override_log < 100) {
+                    C54_LOG("D_FB_DET OVERRIDE #%u prev=0x%04x → 0 PC=0x%04x op=0x%04x "
+                            "A=%010llx ST0=0x%04x insn=%u",
+                            override_log + 1,
+                            s->data[0x08F8], s->pc, s->prog[s->pc],
+                            (unsigned long long)(s->a & 0xFFFFFFFFFFLL),
+                            s->st0, s->insn_count);
+                    override_log++;
+                }
+            }
             fbd_log++;
         }
     }
@@ -998,6 +1120,30 @@ static int c54x_exec_one(C54xState *s)
     uint8_t hi4 = (op >> 12) & 0xF;
     uint8_t hi8 = (op >> 8) & 0xFF;
 
+    /* INTM-TRANS probe : log toute transition INTM 0→1.
+     * Le SSBX INTM orphelin se cache entre insn=89.83M (last write 0x3dd2)
+     * et insn=98.38M (entrée wait permanente). Cap à 200 transitions pour
+     * éviter le flood au boot ; capture le PC qui a fait passer INTM à 1
+     * et l'adresse de retour stack pour identifier le caller. */
+    {
+        static int prev_intm = -1;
+        static unsigned itrans_total;
+        int cur_intm = !!(s->st1 & ST1_INTM);
+        if (prev_intm == 0 && cur_intm == 1) {
+            itrans_total++;
+            if (itrans_total <= 200) {
+                uint16_t ret = s->data[s->sp];
+                uint16_t ret_p1 = s->data[(uint16_t)(s->sp + 1)];
+                fprintf(stderr,
+                        "[c54x] INTM-TRANS #%u 0->1 PC=0x%04x insn=%u SP=0x%04x "
+                        "RET=%04x RET+1=%04x op=0x%04x IMR=0x%04x IFR=0x%04x\n",
+                        itrans_total, s->pc, s->insn_count, s->sp,
+                        ret, ret_p1, op, s->imr, s->ifr);
+            }
+        }
+        prev_intm = cur_intm;
+    }
+
     /* Detect when DSP enters DARAM code zone (0x0080-0x27FF) from ROM */
     {
         static uint16_t prev_pc = 0;
@@ -1051,6 +1197,40 @@ static int c54x_exec_one(C54xState *s)
                         s->ar[4], s->ar[5], s->ar[6], s->ar[7],
                         s->insn_count);
             }
+        }
+        /* WAIT-A21A probe : à PC=0xa21a, snapshot INTM + IMR + IFR.
+         * Tranche H1/H2/H3 :
+         *   INTM=1 + IFR=0  + IMR plein → H3 strict, hardware silencieux
+         *   INTM=1 + IFR≠0  + IMR plein → H3 + IRQ pending bloquée (BUG)
+         *   INTM=0                       → H1/H2 (IRQ servable mais path
+         *                                  vers 0x7740 cassé en amont) */
+        if (s->pc == 0xa21a) {
+            static uint64_t a21a_total;
+            a21a_total++;
+            if (a21a_total <= 5 || (a21a_total % 100000) == 0) {
+                C54_LOG("WAIT-A21A #%llu insn=%u INTM=%d IMR=0x%04x IFR=0x%04x "
+                        "ST0=0x%04x ST1=0x%04x SP=0x%04x",
+                        (unsigned long long)a21a_total, s->insn_count,
+                        !!(s->st1 & ST1_INTM), s->imr, s->ifr,
+                        s->st0, s->st1, s->sp);
+            }
+        }
+        /* CALLER-7740 tracer : à l'entrée 0x7740, log le contexte caller.
+         * data[sp] = adresse de retour pushée par le CALL/CALLD précédent.
+         * INTM=1 → on est dans un IRQ context. Permet de distinguer
+         * "appelé via IRQ ISR" vs "appelé via flow régulier", et de
+         * remonter la chaîne caller→callee jusqu'à l'IRQ vector. */
+        if (s->pc == 0x7740) {
+            static uint64_t enter7740;
+            enter7740++;
+            uint16_t ret_addr = s->data[s->sp];
+            uint16_t ret_addr_p1 = s->data[(uint16_t)(s->sp + 1)];
+            C54_LOG("ENTER-7740 #%llu insn=%u SP=%04x RET=%04x RET+1=%04x "
+                    "INTM=%d XPC=%02x AR2=%04x AR3=%04x BK=%04x",
+                    (unsigned long long)enter7740, s->insn_count,
+                    s->sp, ret_addr, ret_addr_p1,
+                    !!(s->st1 & ST1_INTM), s->xpc,
+                    s->ar[2], s->ar[3], s->bk);
         }
         /* MAC-7700 tracer: at PC=0x7700 (MAC *AR2-, A) we want to know
          * what AR2 points at, what data[AR2] holds, T, and A before/after.
@@ -2780,6 +2960,24 @@ static int c54x_exec_one(C54xState *s)
                                 s->pc, cc, ra, s->sp);
                     rc_log++;
                 }
+                /* POST-BOOTSTUB-RET : si on est en train de RET depuis le
+                 * boot stub (PC ∈ 0x0000..0x0008), c'est la sortie du
+                 * task-switch trampoline 0x701b/0x701d → 0x0000. Le ra
+                 * poppé est le PC du task qui prend le contrôle. À insn≈90.2M
+                 * (dernière transition INTM), ce PC = le task qui ne clear
+                 * jamais INTM ensuite. */
+                if (s->pc <= 0x0008) {
+                    static unsigned bsr;
+                    bsr++;
+                    if (bsr <= 200 || (bsr % 50) == 0) {
+                        fprintf(stderr,
+                                "[c54x] POST-BOOTSTUB-RET #%u PC=0x%04x -> task=0x%04x "
+                                "SP_new=0x%04x B=0x%010llx INTM=%d insn=%u\n",
+                                bsr, s->pc, ra, s->sp,
+                                (unsigned long long)(s->b & 0xFFFFFFFFFFULL),
+                                !!(s->st1 & ST1_INTM), s->insn_count);
+                    }
+                }
                 s->pc = ra;
                 return 0;
             }
@@ -3137,6 +3335,25 @@ static int c54x_exec_one(C54xState *s)
             uint8_t mmr = op & 0x7F;
             op2 = prog_fetch(s, s->pc + 1);
             consumed = 2;
+            /* WATCH-ST1-WRITE : MMR 0x07 = ST1. Capture toutes les
+             * écritures de ST1 (STM #lk, ST1) — incluant celles qui
+             * ne changent pas la valeur d'INTM mais redéfinissent
+             * tout le mot ST1. Sortie : valeur écrite, bit 11 (INTM),
+             * delta vs current ST1. Cap 200 entries pour boot, puis
+             * sample 1/100. */
+            if (mmr == 0x07) {
+                static unsigned st1w;
+                st1w++;
+                if (st1w <= 200 || (st1w % 100) == 0) {
+                    int new_intm = !!(op2 & (1 << 11));
+                    int cur_intm = !!(s->st1 & ST1_INTM);
+                    fprintf(stderr,
+                            "[c54x] ST1-WR #%u STM #0x%04x,ST1 PC=0x%04x "
+                            "cur=0x%04x->0x%04x INTM:%d->%d insn=%u XPC=%d\n",
+                            st1w, op2, s->pc, s->st1, op2,
+                            cur_intm, new_intm, s->insn_count, s->xpc);
+                }
+            }
             data_write(s, mmr, op2);
             return consumed + s->lk_used;
         }
@@ -4332,15 +4549,21 @@ ba_handler:
             case 2: s->ar[yar_c]--; break;
             case 3: s->ar[yar_c] += s->ar[0]; break;
             }
-            /* MAC dual-mem formula per SPRU172C : dst = src + (Xmem)×(Ymem)
-             * NOT T×Xmem. The previous code used T×xval which was masked
-             * by the encoding bug (3-bit AR read junk values, junk×T was
-             * something the firmware tolerated by accident). With the
-             * encoding now correct, the formula bug becomes critical and
-             * blocks the init RPTB at 0xa21b (correlation-product based
-             * initialization fails → BANZD AR never reaches 0 → infinite
-             * loop). T is updated from Ymem AFTER the MAC computation. */
-            int64_t prod_c = (int64_t)(int16_t)xval_c * (int64_t)(int16_t)yval_c;
+            /* MAC dual-mem formula : T × Xmem (pas X × Y per SPRU pure).
+             *
+             * 2026-05-08 retest empirique avec pipeline stable :
+             *   T×X  : BRC variable, A/B accumulator drift, d_fb_det reaches
+             *          high SNR values (0x7902 / 0x7766) at moments
+             *   X×Y  : BRC=0 uniforme (201/201), A=B=0 forever, d_fb_det
+             *          mostly 0 — correlation produces only zeros
+             *
+             * Le firmware Calypso s'appuie sur le pipeline c54x : T est
+             * latched depuis Ymem du MAC précédent (T = Y(post)). Ainsi
+             * MAC dual-mem effectivement calcule `T_old × X_current` =
+             * `Y[n-1] × X[n]`. Notre `prod = T × X` reproduit fidèlement
+             * cet effet pipelined. `X × Y` (les 2 du buffer courant) ne
+             * matche pas la sémantique attendue par le firmware. */
+            int64_t prod_c = (int64_t)(int16_t)s->t * (int64_t)(int16_t)xval_c;
             if (s->st1 & ST1_FRCT) prod_c <<= 1;
             if (hi8 & 0x01) prod_c += 0x8000; /* round */
             int is_sub_c = (hi8 >= 0xD4);
@@ -4352,7 +4575,7 @@ ba_handler:
                 if (is_sub_c) s->a = sext40(s->a - prod_c);
                 else          s->a = sext40(s->a + prod_c);
             }
-            s->t = yval_c;  /* T loaded from Ymem post (per SPRU172C) */
+            s->t = yval_c;
             return consumed + s->lk_used;
         }
 
@@ -5107,29 +5330,99 @@ int c54x_run(C54xState *s, int n_insns)
             }
         }
 
-        /* === ENTER-RPTB-A218 probe (Q-BRC investigation 2026-05-08 v5) ===
-         * Post-fix-formula run : DSP stuck at 0xa21b RPTB inner-loop.
-         * Static dump 0xa218=0xf072 (RPTB pmad), 0xa219=0xa21e (end addr).
-         * PC HIST shows 0xa217:13 vs 0xa21b..0xa21f:~400k each, suggesting
-         * BRC ≈ 30770 per outer iteration → inner loop is huge.
+        /* === Rolling PC sampler (v6 — find the REAL stuck zone) ===
+         * The cumulative-since-boot PC HIST shows 0xa218..0xa222 dominant
+         * because the init loop at 0xa222 (BANZD AR5, 60k iters) ran once
+         * early. After that, the DSP moved on but the cumulative histogram
+         * still shows those PCs at the top.
          *
-         * Hypothesis : the MAC formula fix (X×Y instead of T×X) changed the
-         * correlation result feeding BRC at 0xa215..0xa217. If BRC is now
-         * computed wrong (too large), the DSP loops near-forever in the
-         * inner RPTB. Capture BRC + AR1 + A + B + T at RPTB entry to
-         * confirm. 20-event cap. */
-        if (s->pc == 0xa218) {
-            static int rptb_a218_n = 0;
-            if (rptb_a218_n < 20) {
-                C54_LOG("ENTER-RPTB-A218 #%d BRC=%u (0x%04x) AR0=0x%04x AR1=0x%04x "
-                        "AR2=0x%04x A=%010llx B=%010llx T=0x%04x "
-                        "ST0=0x%04x ST1=0x%04x insn=%u",
-                        rptb_a218_n + 1, s->brc, s->brc,
-                        s->ar[0], s->ar[1], s->ar[2],
+         * BANZD-A222 traces (2026-05-08) confirmed AR5 was the actual loop
+         * counter (61523→61499 in 25 iter), not AR1. Loop finishes in
+         * ~984k insns (= 0.06% of a 1.7B run). Whatever IS currently
+         * burning DSP cycles is in a different zone, invisible to the
+         * cumulative top-N.
+         *
+         * Solution : rolling histogram per 100k-insn window. Resets each
+         * window so we always see "what is the DSP doing RIGHT NOW".
+         * Logs top-5 PCs of the most recent window. */
+        {
+            static uint32_t pc_recent[0x10000];
+            static uint32_t recent_last_dump = 0;
+            pc_recent[s->pc]++;
+            if (s->insn_count - recent_last_dump >= 100000) {
+                recent_last_dump = s->insn_count;
+                uint32_t top_cnt[5] = {0};
+                uint16_t top_pc[5]  = {0};
+                for (int i = 0; i < 0x10000; i++) {
+                    uint32_t c = pc_recent[i];
+                    if (c <= top_cnt[4]) continue;
+                    top_cnt[4] = c; top_pc[4] = (uint16_t)i;
+                    for (int j = 4; j > 0 && top_cnt[j] > top_cnt[j-1]; j--) {
+                        uint32_t tc = top_cnt[j]; top_cnt[j] = top_cnt[j-1]; top_cnt[j-1] = tc;
+                        uint16_t tp = top_pc[j]; top_pc[j] = top_pc[j-1]; top_pc[j-1] = tp;
+                    }
+                }
+                C54_LOG("PC RECENT (last 100k) top: %04x:%u %04x:%u %04x:%u %04x:%u %04x:%u",
+                        top_pc[0], top_cnt[0], top_pc[1], top_cnt[1],
+                        top_pc[2], top_cnt[2], top_pc[3], top_cnt[3],
+                        top_pc[4], top_cnt[4]);
+                memset(pc_recent, 0, sizeof(pc_recent));
+            }
+        }
+
+        /* === ENTER-RPTB-A218 probe (Q-BRC investigation 2026-05-08 v5+v6) ===
+         * v5 hypothesis (BRC≈30770) was REFUTED by first 20 events :
+         *   BRC=0 systematic, AR1=0 systematic, AR2 increments by 2,
+         *   16 insns between visits.
+         * v6 expands to capture the late-run behaviour : the cap=20 saturated
+         * at insn=48M while the run reached 2.4B. We now have :
+         *   (a) cap=200 for early events
+         *   (b) periodic sampler at 100k-visits intervals (late-run)
+         *   (c) BANZD-A222 probe to capture the actual AR used by the
+         *       branch-back instruction at 0xa222 op=0x6e81.
+         * The !s->rpt_active guard avoids spurious mid-RPTB hits. */
+        if (s->pc == 0xa218 && !s->rpt_active) {
+            static unsigned a218_total = 0;
+            static int a218_log = 0;
+            a218_total++;
+            bool log_now = (a218_log < 200) ||
+                           (a218_total % 100000 == 0);
+            if (log_now) {
+                C54_LOG("ENTER-RPTB-A218 #%d total=%u BRC=%u (0x%04x) "
+                        "AR0=0x%04x AR1=0x%04x AR2=0x%04x AR3=0x%04x "
+                        "AR4=0x%04x AR5=0x%04x A=%010llx T=0x%04x "
+                        "ST0=0x%04x insn=%u",
+                        a218_log + 1, a218_total, s->brc, s->brc,
+                        s->ar[0], s->ar[1], s->ar[2], s->ar[3],
+                        s->ar[4], s->ar[5],
                         (unsigned long long)(s->a & 0xFFFFFFFFFFLL),
-                        (unsigned long long)(s->b & 0xFFFFFFFFFFLL),
-                        s->t, s->st0, s->st1, s->insn_count);
-                rptb_a218_n++;
+                        s->t, s->st0, s->insn_count);
+                a218_log++;
+            }
+        }
+        /* === BANZD-A222 probe (v6) ===
+         * 0xa222 op=0x6e81 + opnd 0x8208 = `BANZD pmad, *Sind`.
+         * The *Sind operand decodes some AR but my v5 guess (AR1) was
+         * unverified — capture all ARs so we see which one is non-zero
+         * and how it evolves. If AR1=0 systematically, the branch test
+         * uses a different AR. Cap=200, plus periodic 100k. */
+        if (s->pc == 0xa222 && !s->rpt_active) {
+            static unsigned a222_total = 0;
+            static int a222_log = 0;
+            a222_total++;
+            bool log_now = (a222_log < 200) ||
+                           (a222_total % 100000 == 0);
+            if (log_now) {
+                C54_LOG("BANZD-A222 #%d total=%u op=0x%04x op2=0x%04x "
+                        "AR0=0x%04x AR1=0x%04x AR2=0x%04x AR3=0x%04x "
+                        "AR4=0x%04x AR5=0x%04x AR6=0x%04x AR7=0x%04x "
+                        "BRC=%u insn=%u",
+                        a222_log + 1, a222_total,
+                        s->prog[s->pc], s->prog[(uint16_t)(s->pc + 1)],
+                        s->ar[0], s->ar[1], s->ar[2], s->ar[3],
+                        s->ar[4], s->ar[5], s->ar[6], s->ar[7],
+                        s->brc, s->insn_count);
+                a222_log++;
             }
         }
         /* Companion probe at 0xa215 (BRC setup) and 0xa217 (outer entry).
@@ -5478,21 +5771,14 @@ int c54x_run(C54xState *s, int n_insns)
                     (unsigned long long)(s->a & 0xFFFFFFFFFFLL),
                     (unsigned long long)(s->b & 0xFFFFFFFFFFLL));
         }
-        /* Check RPTB (block repeat) — skip during RPT (single repeat has priority).
-         * Use >= instead of == : if the last instruction in the block is a
-         * 2-word instruction (e.g. LD *(lk)), PC jumps by 2 and overshoots
-         * REA+1. The real C54x pipeline catches this; we emulate with >=. */
-        if (s->rptb_active && !s->rpt_active && s->pc >= s->rea + 1) {
-            static int rptb_log = 0;
-            if (rptb_log < 20) { C54_LOG("RPTB redirect PC=0x%04x→RSA=0x%04x REA=0x%04x BRC=%d", s->pc, s->rsa, s->rea, s->brc); rptb_log++; }
-            if (s->brc > 0) {
-                s->brc--;
-                s->pc = s->rsa;
-            } else {
-                s->rptb_active = false; { static int _re=0; if (_re<50) { C54_LOG("RPTB EXIT PC=0x%04x RSA=0x%04x REA=0x%04x insn=%u SP=0x%04x", s->pc, s->rsa, s->rea, s->insn_count, s->sp); _re++; } }
-                s->st1 &= ~ST1_BRAF;
-            }
-        }
+        /* RPTB check moved below — must run AFTER `s->pc += consumed` so
+         * that when the body's last instruction has executed and PC has
+         * advanced to REA+1, the redirect to RSA is the FINAL operation
+         * on PC for this iteration. The previous placement (before PC
+         * advance) caused a 1-instruction off-by-one : redirect set
+         * pc=RSA, then `s->pc += consumed` bumped it to RSA+1, so the
+         * first body instruction was never re-executed across iterations
+         * (PC HIST showed body=[RSA+1..REA+1] instead of [RSA..REA]). */
 
         /* Trace the IMR loop: how does the DSP reach 0x03F0? */
         /* Trace RPTB entry at 0x76FD: dump all AR values */
@@ -5651,6 +5937,35 @@ int c54x_run(C54xState *s, int n_insns)
             s->delay_slots--;
             if (s->delay_slots == 0) {
                 s->pc = s->delayed_pc;
+            }
+        }
+
+        /* === RPTB (block repeat) end-of-body check ===
+         * Must run AFTER PC advance and delayed-branch settle so the
+         * redirect to RSA is the final word on s->pc for this iteration.
+         * Triggers when PC has overshot REA (= reached REA+1 or beyond,
+         * accounting for 2-word instructions at the body's tail). Skip
+         * during RPT (single-instruction repeat has priority). */
+        if (s->rptb_active && !s->rpt_active && s->pc >= s->rea + 1) {
+            static int rptb_log = 0;
+            if (rptb_log < 20) {
+                C54_LOG("RPTB redirect PC=0x%04x→RSA=0x%04x REA=0x%04x BRC=%d",
+                        s->pc, s->rsa, s->rea, s->brc);
+                rptb_log++;
+            }
+            if (s->brc > 0) {
+                s->brc--;
+                s->pc = s->rsa;
+            } else {
+                s->rptb_active = false;
+                { static int _re=0;
+                  if (_re<50) {
+                    C54_LOG("RPTB EXIT PC=0x%04x RSA=0x%04x REA=0x%04x insn=%u SP=0x%04x",
+                            s->pc, s->rsa, s->rea, s->insn_count, s->sp);
+                    _re++;
+                  }
+                }
+                s->st1 &= ~ST1_BRAF;
             }
         }
 
