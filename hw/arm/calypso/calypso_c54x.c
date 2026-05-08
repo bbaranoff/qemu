@@ -3345,11 +3345,36 @@ static int c54x_exec_one(C54xState *s)
             /* MAR only modifies AR via addressing mode, no data access */
             return consumed + s->lk_used;
         }
-        /* 76xx: LDM MMR, dst */
+        /* 76xx: ST #lk, Smem  (2 or 3 words) — store 16-bit literal to data
+         * memory. Per binutils tic54x-opc.c {st, 2,2,2, 0x7600, 0xFF00,
+         * {OP_lk, OP_Smem}} and tic54x-dis.c get_insn_size = words +
+         * has_lkaddr (extra word when Smem mode in 0xC..0xF).
+         *
+         * Encoding (verified via tic54x-dis.c:192-204):
+         *   word 0 = opcode (0x76xx)
+         *   word 1 = lkaddr  (Smem extension, only if mode in 0xC..0xF)
+         *   word N = opcode2 (the #lk value being stored, last extension)
+         *
+         * Was previously misdecoded as LDM MMR,dst (1 word) — copy/paste
+         * of the wrong mnemonic. The real LDM is 0x48xx mask 0xFE00,
+         * already correctly handled in the 0x4 group. Misdecoding caused
+         * PC to advance by 1 instead of 2-3 ; the literal then executed
+         * as a stray opcode. In particular the 0x4F00 (DST B,Lmem with
+         * DP=0 → MMR_IMR) stray write zeroed IMR forever, masking
+         * INT3+BRINT0 → DSP parked in RPTB at e9ab..e9b6 awaiting a
+         * frame interrupt that was never serviced. Fix 2026-05-08. */
         if (hi8 == 0x76) {
-            uint8_t mmr = op & 0x7F;
-            uint16_t val = data_read(s, mmr);
-            s->a = (int64_t)(int16_t)val << 16;
+            static unsigned hit76_log;
+            addr = resolve_smem(s, op, &ind);
+            op2 = prog_fetch(s, s->pc + 1 + (s->lk_used ? 1 : 0));
+            consumed = 2;
+            if (hit76_log++ < 30) {
+                fprintf(stderr,
+                        "[c54x] HIT-76 PC=0x%04x op=0x%04x addr=0x%04x "
+                        "lk=0x%04x lk_used=%d insn=%u\n",
+                        s->pc, op, addr, op2, s->lk_used, s->insn_count);
+            }
+            data_write(s, addr, op2);
             return consumed + s->lk_used;
         }
         /* 77xx: STM #lk, MMR (2 words) */
