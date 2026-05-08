@@ -1,5 +1,54 @@
 # Calypso GSM Baseband Emulator — Project Status
 
+## État courant (2026-05-08)
+
+### Ce qui marche
+- Pipeline ARM ↔ TPU ↔ BSP ↔ DSP fonctionnel (timer, UART, RPTB, sercomm)
+- Mobile L23 atteint **gsm322 cell selection (DSC=90)** avec `CALYPSO_FBSB_SYNTH=1`
+- `CALYPSO_BSP_DARAM_ADDR` configurable, samples I/Q FCCH binarisés (`7ffe/8002/0000`) livrés
+- 9 probes runtime instrumentés (PC-HIST-3FB/3DD, WATCH-WRITE 0x3dd2, INTM-TRANS, WAIT-A21A, ENTER-7740, ST1-WR, POST-BOOTSTUB-RET, D_FB_DET-WR-SITE)
+
+### Fixes émulateur 2026-05-08
+1. **POPM (0x8A00 mask 0xFF00) fixé** — était décodé en MVDK Smem,dmad. Corrigé : pop top-of-stack vers MMR. Débloque restore ST1 → INTM se clear correctement → fin du dwell INTM=1 perpétuel observé depuis avril.
+2. **8 stubs NOP** posés sur opcodes misclassifiés causant push/pop fantômes :
+   - `0x80` (était MVDD, doit être STL src,Smem)
+   - `0x8B` (était MVDK long-addr, doit être POPD Smem)
+   - `0xAA/AB` (était STLM duplicate, doit être LD variant — vrai STLM en 0x88/89)
+   - `0xC5` (était PSHM, doit être ST||OP — vrai PSHM en 0x4A)
+   - `0xCD` (était POPM, doit être ST||OP — vrai POPM en 0x8A)
+   - `0xCE` (était FRAME, doit être ST||OP)
+   - `0xDD` (était POPD, doit être ST||OP — cause SP runaway post-POPM)
+   - `0xDE` (était POPD dmad 2-word, doit être ST||OP)
+3. **Référence opcode** : `doc/opcodes/tic54x_hi8_map.md` créé (table tic54x complète).
+
+### Symptômes débloqués vs résiduels
+
+| Symptôme | Avant 2026-05-08 | Après |
+|---|---|---|
+| INTM=1 dwell | perpétuel après insn=90.2M | INTM=0 dans POST-BOOTSTUB-RET ✓ |
+| WAIT-A21A | 5.7M iters (loop morte) | 0 ✓ |
+| ENTER-7740 | 37k figé | 0 (path différent) |
+| DSP throughput | 1× | **5× plus rapide** (4.3B insn / 44s) |
+| RETE | 0 | **0** (toujours zéro) |
+| fb0_att | 0 | **0** (correlator lit zone vide) |
+| L1CTL_DATA_IND | 0 | **0** (pas de BCCH décodé) |
+
+### Blocker actuel — D_FB_DET-WR-SITE révèle mismatch source/sink
+
+50 hits captures à PC=0x8f51 (write d_fb_det) :
+
+```
+#1   AR1=001c AR2=0000 AR3=0000 AR4=2bc0 AR7=0000  data[AR1]=bbef BK=00b0
+#50  AR1=004a AR2=fc5d AR3=03a3 AR4=2bc3 AR7=fc5d  data[AR1]=0000 BK=00b0
+```
+
+- AR3 stride +19, base 0 → **lit DARAM `[0x0000..0x03A3]`** (linéaire)
+- AR2/AR7 stride −19, BK=176 → **wrap circulaire `[0xfc5d..]`**
+- AR4 = 0x2bc0 quasi-fixe → table coefficients ROM
+- **Aucun AR ne tombe dans la zone BSP DMA target.**
+
+Tests A/B `CALYPSO_BSP_DARAM_ADDR` (`0x3fb0` / `0x2bc0` / `0x0080`) → D_FB_DET-WR-SITE bit-pour-bit identique. **L'init AR du firmware est indépendante de daram_addr.**
+
 ## Goal
 Run real OsmocomBB layer1.highram.elf firmware on emulated TI Calypso (ARM7 + TMS320C54x DSP) in QEMU. Connect to a real BTS via TRX protocol through a bridge. Mobile/ccch_scan sees the BTS and decodes BCCH/CCCH.
 
