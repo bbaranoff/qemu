@@ -3999,8 +3999,31 @@ static int c54x_exec_one(C54xState *s)
             if ((op >> 7) & 1) s->ar[xar_s]--; else s->ar[xar_s]++;
             return consumed + s->lk_used;
         }
-        if (hi8 == 0x8A) {
-            /* MVDK Smem, dmad */
+        /* POPM MMR — pop top-of-stack into MMR (1-word).
+         * Per tic54x-opc.c: { "popm", 0x8A00, 0xFF00, {OP_MMR} }.
+         * Per SPRU172C section 4 : value at SP popped to MMR, SP++.
+         *
+         * Bug fix 2026-05-08 : 0x8Axx était précédemment mal décodé en
+         * MVDK Smem,dmad (qui est en réalité 0x7100 mask 0xFF00). Le
+         * pattern PSHM/POPM symétrique du firmware (e.g. PROM0 0x7013-0x7023
+         * sauve/restaure 6 MMRs autour d'un CALA) ne fonctionnait jamais
+         * post-CALA → ST1 jamais restauré → INTM=1 dwell perpétuel
+         * → IRQ vectoring bloqué → DSP wait stuck → L1 mort.
+         * Le case MVDK ci-dessous devient dead code mais est laissé pour
+         * référence historique. */
+        if ((op & 0xFF00) == 0x8A00) {
+            uint16_t mmr = op & 0x7F;
+            uint16_t val = data_read(s, s->sp);
+            s->sp = (s->sp + 1) & 0xFFFF;
+            data_write(s, mmr, val);
+            return consumed + s->lk_used;
+        }
+        /* OBSOLETE — superseded by POPM above. The 0x8Axx range belongs to
+         * POPM per tic54x-opc.c, not MVDK (which is 0x7100 mask 0xFF00).
+         * Kept commented for one revision so any caller depending on the
+         * old (incorrect) behaviour is forced to be re-examined. */
+        if (0 && hi8 == 0x8A) {
+            /* MVDK Smem, dmad — INCORRECT for 0x8Axx, see POPM above */
             addr = resolve_smem(s, op, &ind);
             op2 = prog_fetch(s, s->pc + 1);
             consumed = 2;
