@@ -502,6 +502,14 @@ void calypso_bsp_rx_burst(uint8_t tn, uint32_t fn,
         c54x_interrupt_ex(bsp.dsp, 21, 5);
         if (bsp.dsp->idle) bsp.dsp->idle = false;
     }
+    /* Fire DMAC0 (bit 12 / vec 28) — when firmware enters IDLE @ 0xa21d
+     * with IMR=0xF100 (bits 8,12-15 only), bit 5 is masked so the wait
+     * never breaks. Bit 12 = DMAC0 channel completion, has a real ISR
+     * at IPTR=0x111 + 28*4 = 0x88f0 in the firmware vector table. */
+    if (bsp.dsp && !(bsp.dsp->ifr & (1 << 12))) {
+        c54x_interrupt_ex(bsp.dsp, 28, 12);
+        if (bsp.dsp->idle) bsp.dsp->idle = false;
+    }
 }
 
 /* ---- Deliver buffered burst when BDLENA fires ---- */
@@ -560,6 +568,13 @@ void calypso_bsp_deliver_buffered(uint32_t current_fn)
         /* Fire BRINT0 */
         if (bsp.dsp && !(bsp.dsp->ifr & (1 << 5))) {
             c54x_interrupt_ex(bsp.dsp, 21, 5);
+            if (bsp.dsp->idle) bsp.dsp->idle = false;
+        }
+        /* Fire DMAC0 (bit 12) — see calypso_bsp_dl_tick() for rationale.
+         * Firmware enters IDLE with IMR=0xF100 expecting DMA channel
+         * completion; bit 5 (BRINT0) is masked. */
+        if (bsp.dsp && !(bsp.dsp->ifr & (1 << 12))) {
+            c54x_interrupt_ex(bsp.dsp, 28, 12);
             if (bsp.dsp->idle) bsp.dsp->idle = false;
         }
     }
