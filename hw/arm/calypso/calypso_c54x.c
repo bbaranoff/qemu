@@ -6009,6 +6009,65 @@ static bool dsp_idle_fast_forward(C54xState *s, int *consumed_out)
     return true;
 }
 
+/* === CALYPSO_TRAP_OOR hook (root-cause probe insn 10M..12M) ===
+ * Whitelist-complement on dispatch PC + edge-trigger on SP descent
+ * below 0x1000. Gated by env CALYPSO_TRAP_OOR=1 and insn_count >= 10M.
+ * One-shot latch. Dumps last 16 dispatch PCs, last 16 SP-change events,
+ * regs, RPTB state. Halts DSP via s->running=0. */
+static inline bool pc_is_legit(uint16_t pc) {
+    return  pc <  0x0080
+        || (pc >= 0x7700 && pc <  0x79A0)
+        || (pc >= 0x8000 && pc <  0x9000)
+        || (pc >= 0xA000 && pc <  0xA100)
+        || (pc >= 0xF000);
+}
+
+static struct {
+    unsigned insn; uint16_t old_sp, new_sp, exec_pc, exec_op;
+} g_sp_trail[16];
+static unsigned g_sp_trail_idx = 0;
+
+static void dsp_trap_dump(C54xState *s, uint16_t exec_pc, uint16_t exec_op,
+                          uint16_t sp_before, const char *trig)
+{
+    fprintf(stderr,
+        "[c54x] TRAP[%s] insn=%u exec_pc=0x%04x exec_op=0x%04x "
+        "next_pc=0x%04x sp_before=0x%04x sp_now=0x%04x INTM=%d\n",
+        trig, s->insn_count, exec_pc, exec_op, s->pc,
+        sp_before, s->sp, !!(s->st1 & ST1_INTM));
+    fprintf(stderr, "[c54x] TRAP pc_ring[-16..-1]:");
+    for (int i = 16; i >= 1; i--)
+        fprintf(stderr, " %04x", pc_ring[(pc_ring_idx - i) & 255]);
+    fprintf(stderr, "\n[c54x] TRAP sp_trail[-16..-1] (insn old->new @pc op):\n");
+    for (int i = 16; i >= 1; i--) {
+        unsigned k = (g_sp_trail_idx - i) & 15;
+        fprintf(stderr, "  %u  %04x->%04x  pc=%04x op=%04x\n",
+                g_sp_trail[k].insn, g_sp_trail[k].old_sp,
+                g_sp_trail[k].new_sp, g_sp_trail[k].exec_pc,
+                g_sp_trail[k].exec_op);
+    }
+    fprintf(stderr,
+        "[c54x] TRAP regs A=%010llx B=%010llx T=%04x  "
+        "AR0..7: %04x %04x %04x %04x %04x %04x %04x %04x  "
+        "BK=%04x ARP=%d DP=%d  ST0=%04x ST1=%04x PMST=%04x  "
+        "RSA=%04x REA=%04x BRC=%d  IFR=%04x IMR=%04x XPC=%d\n",
+        (unsigned long long)(s->a & 0xFFFFFFFFFFULL),
+        (unsigned long long)(s->b & 0xFFFFFFFFFFULL),
+        s->t,
+        s->ar[0], s->ar[1], s->ar[2], s->ar[3],
+        s->ar[4], s->ar[5], s->ar[6], s->ar[7],
+        s->bk, (s->st0 >> 13) & 7, s->st0 & 0x1FF,
+        s->st0, s->st1, s->pmst,
+        s->rsa, s->rea, s->brc, s->ifr, s->imr, s->xpc);
+    fprintf(stderr,
+        "[c54x] TRAP prog[exec_pc..+3]=%04x %04x %04x %04x  "
+        "prog[next_pc..+3]=%04x %04x %04x %04x\n",
+        s->prog[exec_pc], s->prog[(uint16_t)(exec_pc+1)],
+        s->prog[(uint16_t)(exec_pc+2)], s->prog[(uint16_t)(exec_pc+3)],
+        s->prog[s->pc], s->prog[(uint16_t)(s->pc+1)],
+        s->prog[(uint16_t)(s->pc+2)], s->prog[(uint16_t)(s->pc+3)]);
+}
+
 int c54x_run(C54xState *s, int n_insns)
 {
     int executed = 0;
@@ -7246,6 +7305,24 @@ int c54x_run(C54xState *s, int n_insns)
             }
         }
 
+        /* Feed sp_trail ring for TRAP-OOR dump (only when armed). */
+        {
+            static int trap_armed = -1;
+            if (trap_armed < 0) {
+                const char *e = getenv("CALYPSO_TRAP_OOR");
+                trap_armed = (e && *e == '1') ? 1 : 0;
+            }
+            if (trap_armed && s->sp != sp_before) {
+                unsigned k = g_sp_trail_idx & 15;
+                g_sp_trail[k].insn    = s->insn_count;
+                g_sp_trail[k].old_sp  = sp_before;
+                g_sp_trail[k].new_sp  = s->sp;
+                g_sp_trail[k].exec_pc = exec_pc;
+                g_sp_trail[k].exec_op = exec_op;
+                g_sp_trail_idx++;
+            }
+        }
+
         /* SP-LEDGER + SP-INTO-MMR probes RETIRÉS 2026-05-23 :
          * info diagnostic déjà extraite (irq_entries=1 sur 144s, SP wrap
          * via stack-relative writes en MMR). Ces probes fire à CHAQUE
@@ -7283,6 +7360,33 @@ int c54x_run(C54xState *s, int n_insns)
                         s->insn_count);
             }
         }
+        /* === TRAP-OOR firing point ===
+         * T1: dispatch PC out of legit whitelist (after exec_one moved PC).
+         * T2: SP edge-crossed below 0x1000 this instruction.
+         * BOTH: single instruction caused both — likely RET/RETF pourri
+         *       or dual-op stack-relative writing SP+PC together.
+         * Gated insn>=10M (we know PC was sane at 10M from HIST). */
+        {
+            static int trap_armed = -1;
+            static int tripped = 0;
+            if (trap_armed < 0) {
+                const char *e = getenv("CALYPSO_TRAP_OOR");
+                trap_armed = (e && *e == '1') ? 1 : 0;
+            }
+            if (trap_armed && !tripped && s->insn_count >= 10000000) {
+                bool t1 = !pc_is_legit(s->pc);
+                bool t2 = (sp_before >= 0x1000 && s->sp < 0x1000);
+                if (t1 || t2) {
+                    const char *trig = (t1 && t2) ? "BOTH"
+                                     : t1         ? "PC_OOR"
+                                     :              "SP_LOW";
+                    tripped = 1;
+                    dsp_trap_dump(s, exec_pc, exec_op, sp_before, trig);
+                    s->running = 0;
+                }
+            }
+        }
+
         /* === DUAL-OP-INTERPRET diagnostic ===
          * Compare current decoder's AR field interpretation (3-bit fields)
          * with SPRU172C's dual-operand encoding (2-bit AR fields + offset 2,
