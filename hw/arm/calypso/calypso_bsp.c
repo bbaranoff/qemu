@@ -124,16 +124,21 @@ static struct {
     uint64_t   wr_total;
     uint64_t   wr_last_logged;
 
-    /* Wall-clock drain timer (2026-05-24): decouple BSP→DSP DMA delivery
-     * from tdma_tick (virtual clock). Under icount=auto, tdma_tick runs at
-     * ~17 Hz wall (vs nominal 217 Hz) due to DSP emulator throughput, so
-     * delivery couplée au tick laissait les bursts BTS (arrivés à wall rate
-     * via UDP) stale/dropés en 3.7s wall avant que le tick virtuel ne les
-     * pull. Le drain REALTIME fire toutes les 5ms wall = match BTS rate. */
+    /* Virtual-clock drain timer (revised 2026-05-24 PM): decouple BSP→DSP
+     * DMA delivery from tdma_tick (which can be slow under icount=auto),
+     * but stay on QEMU_CLOCK_VIRTUAL so BSP and ARM cur_fn share the same
+     * time domain. Previously on REALTIME → drift ~1300 fr in 6 s wall
+     * vs ARM (BTS livré au rythme wall, ARM compté au rythme icount). */
     QEMUTimer *drain_timer;
 } bsp;
 
 #define BSP_DRAIN_PERIOD_MS  5
+/* 2026-05-24 fix drift BTS↔L1 : BSP drain timer passe REALTIME → VIRTUAL pour
+ * tourner sur la même horloge qu'ARM fn (via TINT0) et tdma_tick. Avec
+ * icount=auto, REALTIME avance ~9% plus vite que VIRTUAL → drift cumulatif
+ * (~1300 fr / 6 sec wall observé, "1 seconde d'écart BTS↔L1"). NS variant pour
+ * appairage avec QEMU_CLOCK_VIRTUAL (timer_new_ns / qemu_clock_get_ns). */
+#define BSP_DRAIN_PERIOD_NS  (BSP_DRAIN_PERIOD_MS * 1000000ULL)
 
 /* Incrémente le bucket selon `addr` puis émet une ligne stats périodiquement.
  * Appelé à chaque write DARAM côté BSP (rx_burst direct + deliver_buffered). */
@@ -362,25 +367,60 @@ static void bsp_trxd_readable(void *opaque)
      * cycle through {±1, 0}. We produce interleaved I,Q pairs.
      *
      * For FB (all-zero bits): phase advances π/2 per bit → pure tone.
-     * I/Q sequence: (1,0),(0,1),(-1,0),(0,-1),(1,0),... */
+     * I/Q sequence: (1,0),(0,1),(-1,0),(0,-1),(1,0),...
+     *
+     * IQ PASSTHROUGH (2026-05-24) : si le payload UDP fait >= 296 octets
+     * et que CALYPSO_BSP_IQ_PASSTHROUGH=1, on interprète buf[8..] comme
+     * int16 IQ pairs LE (bridge.py BRIDGE_BSP_IQ=1 envoie ce format,
+     * GMSK-modulé scipy BT=0.3 réaliste vs notre ±π/2 hard-modulation).
+     * Sinon : modulation interne historique (148 hard-bits → 296 int16). */
     int16_t iq[296];  /* 148 I/Q pairs = 296 values */
-    /* Q15 full-scale amplitude: real BSP/IOTA delivers near-full-range Q15
-     * samples. ±0x7FFE keeps one bit of headroom below INT16_MIN. */
-    static const int16_t cos_tab[4] = { 0x7FFE, 0, -0x7FFE, 0 };
-    static const int16_t sin_tab[4] = { 0, 0x7FFE, 0, -0x7FFE };
-    int phase_idx = 0;
     int iq_count = 0;
-    for (int i = 0; i < nbits; i++) {
-        /* Anomaly A fix (2026-05-08) : émettre AVANT advance, donc le premier
-         * sample est à phase=0 au lieu de phase=π/2. Le code original
-         * advance-then-emit décalait tout le burst de 90°, faisant que la
-         * corrélation cohérente du DSP correlator tombait dans la partie
-         * quadrature au lieu d'in-phase → d_fb_det principalement négatif
-         * (pattern observé : +23k, +20k occasionnel puis 4× -5k consécutifs).
-         * À valider sur le prochain run. */
-        iq[iq_count++] = cos_tab[phase_idx];  /* I — phase_idx avant advance */
-        iq[iq_count++] = sin_tab[phase_idx];  /* Q */
-        phase_idx = (phase_idx + (bits[i] ? 3 : 1)) & 3;
+
+    static int iq_pt_mode = -1;
+    if (iq_pt_mode < 0) {
+        const char *e = getenv("CALYPSO_BSP_IQ_PASSTHROUGH");
+        iq_pt_mode = (e && *e == '1') ? 1 : 0;
+        BSP_LOG("IQ_PASSTHROUGH=%d", iq_pt_mode);
+    }
+    int iq_bytes = (int)n - 8;  /* payload bytes after 8-byte hdr */
+    /* Bridge envoie 2 int16 par soft-bit (I,Q interleaved). Pour 148 bits
+     * = 296 int16 = 592 octets. Mais BTS peut envoyer 145..148 bits selon
+     * format → on accepte tout payload >= 2*nbits*sizeof(int16_t). */
+    int need_iq_bytes = 2 * nbits * (int)sizeof(int16_t);  /* = 4 × nbits */
+    if (iq_pt_mode && iq_bytes >= need_iq_bytes) {
+        /* Bridge pre-modulated path : copy 2*nbits I/Q values directly.
+         * Bytes are int16 LE on x86 host = same as int16_t native. */
+        int copy_count = 2 * nbits;
+        if (copy_count > 296) copy_count = 296;
+        memcpy(iq, buf + 8, copy_count * sizeof(int16_t));
+        iq_count = copy_count;
+        static int pt_log = 0;
+        if (pt_log < 10 || (pt_log % 5000) == 0) {
+            BSP_LOG("IQ passthrough #%d fn=%u tn=%u bytes=%d need=%d nbits=%d "
+                    "iq[0..3]=%d,%d,%d,%d",
+                    pt_log, fn, tn, iq_bytes, need_iq_bytes, nbits,
+                    iq[0], iq[1], iq[2], iq[3]);
+        }
+        pt_log++;
+    } else {
+        /* Q15 full-scale amplitude: real BSP/IOTA delivers near-full-range Q15
+         * samples. ±0x7FFE keeps one bit of headroom below INT16_MIN. */
+        static const int16_t cos_tab[4] = { 0x7FFE, 0, -0x7FFE, 0 };
+        static const int16_t sin_tab[4] = { 0, 0x7FFE, 0, -0x7FFE };
+        int phase_idx = 0;
+        for (int i = 0; i < nbits; i++) {
+            /* Anomaly A fix (2026-05-08) : émettre AVANT advance, donc le premier
+             * sample est à phase=0 au lieu de phase=π/2. Le code original
+             * advance-then-emit décalait tout le burst de 90°, faisant que la
+             * corrélation cohérente du DSP correlator tombait dans la partie
+             * quadrature au lieu d'in-phase → d_fb_det principalement négatif
+             * (pattern observé : +23k, +20k occasionnel puis 4× -5k consécutifs).
+             * À valider sur le prochain run. */
+            iq[iq_count++] = cos_tab[phase_idx];  /* I — phase_idx avant advance */
+            iq[iq_count++] = sin_tab[phase_idx];  /* Q */
+            phase_idx = (phase_idx + (bits[i] ? 3 : 1)) & 3;
+        }
     }
 
     /* Enqueue the burst FN-indexed for this TN. With BTS lookahead of up
@@ -396,9 +436,11 @@ static void bsp_trxd_readable(void *opaque)
 
 /* ---- Init ---- */
 
-/* Wall-clock drain callback: pulls BSP UDP queue into DSP DMA at wall rate,
- * independent of tdma_tick virtual cadence. Required under icount=auto where
- * tdma_tick is too slow to drain the BTS sample stream. */
+/* Virtual-clock drain callback: pulls BSP UDP queue into DSP DMA at virtual
+ * rate, locked to the same QEMU_CLOCK_VIRTUAL as TINT0/tdma_tick/ARM fn.
+ * Pre-2026-05-24 this timer ran on QEMU_CLOCK_REALTIME, which caused a
+ * cumulative drift vs ARM cur_fn under icount=auto (BTS delta grew ~1300 fr
+ * in 6 s wall). Locking to VIRTUAL eliminates the drift at the source. */
 static void bsp_drain_cb(void *opaque)
 {
     if (bsp.dsp) {
@@ -406,7 +448,7 @@ static void bsp_drain_cb(void *opaque)
         calypso_bsp_deliver_buffered(cur_fn);
     }
     timer_mod(bsp.drain_timer,
-              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + BSP_DRAIN_PERIOD_MS);
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + BSP_DRAIN_PERIOD_NS);
 }
 
 void calypso_bsp_init(C54xState *dsp)
@@ -489,11 +531,12 @@ void calypso_bsp_init(C54xState *dsp)
     (void)d_rach_word_offset();
     (void)rach_force_bsic();
 
-    /* Arm wall-clock drain timer (decoupled from tdma_tick virtual cadence). */
-    bsp.drain_timer = timer_new_ms(QEMU_CLOCK_REALTIME, bsp_drain_cb, NULL);
+    /* Arm virtual-clock drain timer — locked to QEMU_CLOCK_VIRTUAL like
+     * TINT0/tdma_tick/ARM fn. Fix 2026-05-24 e2e BTS↔L1 drift. */
+    bsp.drain_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, bsp_drain_cb, NULL);
     timer_mod(bsp.drain_timer,
-              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + BSP_DRAIN_PERIOD_MS);
-    BSP_LOG("BSP drain timer armed: %dms wall period (REALTIME clock)",
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + BSP_DRAIN_PERIOD_NS);
+    BSP_LOG("BSP drain timer armed: %dms virtual period (VIRTUAL clock, drift-locked)",
             BSP_DRAIN_PERIOD_MS);
 
     BSP_LOG("init dsp=%p daram_addr=0x%04x len=%u%s%s",

@@ -13,6 +13,7 @@
 #include "hw/arm/calypso/calypso_trx.h"
 #include "hw/arm/calypso/calypso_uart.h"
 #include "hw/arm/calypso/calypso_c54x.h"
+#include "hw/arm/calypso/calypso_full_pcb.h"  /* api_ram_lock pour MTTCG race fix */
 #include "hw/arm/calypso/calypso_bsp.h"
 #include "hw/arm/calypso/calypso_iota.h"
 #include "hw/arm/calypso/calypso_sim.h"
@@ -92,6 +93,13 @@ typedef struct CalypsoTRX {
 } CalypsoTRX;
 
 static CalypsoTRX *g_trx;
+
+/* PM emul sticky value : init via env CALYPSO_PM_INJECT (default 800) au
+ * 1er calypso_dsp_read. Lu par intercept pour retourner notre injection
+ * sur les a_pm offsets, peu importe ce que DSP écrit. Atomic pour MTTCG. */
+#include "qemu/atomic.h"
+static uint16_t g_pm_inject_val_init = 0;
+static uint16_t g_pm_inject_val = 0;
 
 /* FBSB host-side orchestration. Reintroduced after preNoCell refactor
  * (28 Apr) accidentally removed the wire. The bridge delivers I/Q from
@@ -175,6 +183,46 @@ static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
 {
     CalypsoTRX *s = opaque;
     if (offset >= CALYPSO_DSP_SIZE) return 0;
+
+    /* PM intercept (fix 2026-05-24 v5) : retourne pm_val inconditionnel
+     * sur les a_pm ARM MMIO byte offsets. Init lazy via env CALYPSO_PM_INJECT.
+     * Plus de dépendance MTTCG sur écriture par autre thread.
+     *
+     * R_PAGE_0 = ARM 0xFFD00050 → MMIO byte offset 0x50
+     * R_PAGE_1 = ARM 0xFFD00078 → MMIO byte offset 0x78
+     * a_pm[0..2] = 3 words à offset +8 (DSP<33) ou +12 (DSP≥33) dans la page.
+     * Couvre les 2 layouts :
+     *   DSP<33 p0 : ARM byte 0x58..0x5D
+     *   DSP≥33 p0 : ARM byte 0x5C..0x61
+     *   DSP<33 p1 : ARM byte 0x80..0x85
+     *   DSP≥33 p1 : ARM byte 0x84..0x89
+     * Union : 0x58..0x61 (p0) et 0x80..0x89 (p1). */
+    if ((offset >= 0x58 && offset <= 0x61) ||
+        (offset >= 0x80 && offset <= 0x89)) {
+        if (!g_pm_inject_val_init) {
+            const char *e = getenv("CALYPSO_PM_INJECT");
+            int v = (e && *e) ? atoi(e) : 800;
+            if (v < 0) v = 0;
+            if (v > 0xFFFF) v = 0xFFFF;
+            g_pm_inject_val = (uint16_t)v;
+            g_pm_inject_val_init = 1;
+        }
+        if (g_pm_inject_val == 0) {
+            /* env explicitly disabled — fall through to normal read */
+        } else {
+            static unsigned intercept_log = 0;
+            if (intercept_log++ < 5) {
+                TRX_LOG("PM intercept : ARM RD 0x%04x size=%u → %u (pm_val)",
+                        (unsigned)offset, size, g_pm_inject_val);
+            }
+            if (size == 4) {
+                return ((uint32_t)g_pm_inject_val) |
+                       ((uint32_t)g_pm_inject_val << 16);
+            }
+            return g_pm_inject_val;
+        }
+    }
+
     /* === FIX 2026-05-15 : DSP→ARM mirror was missing ===
      *
      * Bug : `s->dsp_ram[]` et `s->dsp->data[]` sont deux arrays distincts.
@@ -447,6 +495,99 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
                 calypso_fbsb_on_dsp_task_change(&g_fbsb,
                                                 (uint16_t)value,
                                                 (uint64_t)s->fn);
+            }
+
+            /* === PM emulator (DSP_TASK_PM = 1) =============================
+             * Le vrai DSP scanne une ARFCN, intègre I²+Q² sur N samples,
+             * écrit le résultat dans a_pm[0..2] de la DSP→MCU read page.
+             * Notre QEMU n'a pas de RF simulé : on injecte une valeur
+             * "strong signal" (PM=800 → ~-78 dBm RF après agc_inp_dbm8_by_pm)
+             * pour que le mobile considère qu'il y a une cell. Le bridge
+             * envoie déjà les bursts FB/SB → FBSB correlator peut lock.
+             *
+             * a_pm[0..2] dans dsp_api.h T_DB_DSP_TO_MCU — DEUX layouts :
+             *   DSP ≥ 33 (Calypso E88 / C115/C123) :
+             *     a_serv_demod[4] à offset 8..11
+             *     a_pm[3]         à offset 12..14   ← Compal_e88
+             *   DSP < 33 (legacy) :
+             *     a_pm[3]         à offset 8..10
+             *     a_serv_demod[4] à offset 11..14
+             * On écrit aux DEUX layouts pour être safe sur tous firmwares.
+             *
+             *   R_PAGE_0 = ARM 0xFFD00050 = api_ram[0x28]
+             *   R_PAGE_1 = ARM 0xFFD00078 = api_ram[0x3C]
+             *   DSP ≥ 33 : a_pm[0] page 0 = api_ram[0x28 + 12] = api_ram[0x34]
+             *              a_pm[0] page 1 = api_ram[0x3C + 12] = api_ram[0x48]
+             *   DSP < 33 : a_pm[0] page 0 = api_ram[0x28 +  8] = api_ram[0x30]
+             *              a_pm[0] page 1 = api_ram[0x3C +  8] = api_ram[0x44]
+             *
+             * Fix 2026-05-24 : PM scan retournait -138 dBm partout (a_pm[]
+             * jamais écrit) → mobile cell_log boucle sans candidate → FBSB
+             * jamais initié sur ARFCN trouvé. */
+            /* d_task_md = num_meas pour PM (prim_pm.c:64), petit entier 1..16.
+             * FB_DSP_TASK / SB_DSP_TASK = constantes > 4 (vu task=5 dominant).
+             * Donc value in [1..4] = PM scan (cover batch sizes typiques). */
+            if (value >= 1 && value <= 4 && s->dsp && s->dsp->api_ram) {
+                static unsigned pm_log = 0;
+                static int pm_inject = -1;
+                if (pm_inject < 0) {
+                    const char *e = getenv("CALYPSO_PM_INJECT");
+                    pm_inject = (e && *e) ? atoi(e) : 800;
+                }
+                uint16_t pm_val = (uint16_t)pm_inject;
+                /* Set sticky value pour intercept read côté ARM MMIO. */
+                g_pm_inject_val = pm_val;
+                /* MTTCG race fix : lock api_ram pendant écriture pour éviter
+                 * que ARM vCPU thread lise un état intermédiaire. Sans lock,
+                 * observé 2/46 fires vus par firmware (4% hit rate). */
+                qemu_mutex_lock(&calypso_pcb_api_ram_lock);
+                /* Write a_pm[0..2] aux DEUX layouts (DSP<33 ET DSP≥33)
+                 * sur les DEUX read pages (firmware swap page chaque frame).
+                 *
+                 * Fix 2026-05-24 v2 : double-write api_ram[] + dsp->data[].
+                 * Ce sont 2 arrays distincts (cf fix 2026-05-15
+                 * calypso_dsp_read qui lit dsp->data[offset/2+0x0800]).
+                 * Sans le double-write, ARM MMIO ne voit jamais notre
+                 * injection (race observée : PM MEAS 214/568 puis 0). */
+                /* Fix v4 2026-05-24 : offsets corrects.
+                 * a_pm est à +8 BYTES (DSP<33) ou +12 BYTES (DSP≥33) dans
+                 * la page, soit +4 ou +6 WORDS. Pas +8/+12 WORDS comme
+                 * l'ancien code (qui écrivait 16/24 bytes après page début).
+                 *
+                 * api_ram (= dsp_ram legacy) indexé par half-word :
+                 *   p0 base = api_ram[0x28] (ARM byte 0x50)
+                 *   p1 base = api_ram[0x3C] (ARM byte 0x78)
+                 * a_pm[0..2] DSP<33 p0 : api_ram[0x2C..0x2E] (ARM byte 0x58..0x5C)
+                 * a_pm[0..2] DSP≥33 p0 : api_ram[0x2E..0x30] (ARM byte 0x5C..0x60)
+                 * a_pm[0..2] DSP<33 p1 : api_ram[0x40..0x42] (ARM byte 0x80..0x84)
+                 * a_pm[0..2] DSP≥33 p1 : api_ram[0x42..0x44] (ARM byte 0x84..0x88)
+                 *
+                 * Union = api_ram[0x2C..0x30] et [0x40..0x44]. */
+                for (int i = 0x2C; i <= 0x30; i++) s->dsp->api_ram[i] = pm_val;
+                for (int i = 0x40; i <= 0x44; i++) s->dsp->api_ram[i] = pm_val;
+                /* Mirror to dsp->data[] (source de vérité pour ARM MMIO,
+                 * fix 2026-05-15). ARM byte offset → dsp->data word :
+                 * offset/2 + 0x0800.
+                 *   ARM byte 0x58 → dsp->data[0x082C]
+                 *   ARM byte 0x60 → dsp->data[0x0830]
+                 *   ARM byte 0x80 → dsp->data[0x0840]
+                 *   ARM byte 0x88 → dsp->data[0x0844] */
+                if (s->dsp->data) {
+                    for (int i = 0x082C; i <= 0x0830; i++)
+                        s->dsp->data[i] = pm_val;
+                    for (int i = 0x0840; i <= 0x0844; i++)
+                        s->dsp->data[i] = pm_val;
+                }
+                qemu_mutex_unlock(&calypso_pcb_api_ram_lock);
+                if (pm_log++ < 20 || (pm_log % 200) == 0) {
+                    TRX_LOG("PM emul : a_pm[0..2] = %u (~%d dBm) task=%u fn=%u #%u",
+                            pm_val, -138 + pm_val/8, (unsigned)value,
+                            (unsigned)s->fn, pm_log);
+                }
+                /* Raise IRQ_API to wake ARM L1 PM_resp scheduler.
+                 * Cross-thread under MTTCG : qemu_irq_raise est atomic-safe
+                 * via QEMU infrastructure (CPU interrupt_request bit). */
+                qemu_irq_raise(s->irqs[CALYPSO_IRQ_API]);
             }
         }
     }
@@ -933,8 +1074,17 @@ static void calypso_tdma_tick(void *opaque) {
                     s->fn, skipped, now - entry_t);
         }
 
-        if (s->tdma_running)
-            timer_mod_ns(s->tdma_timer, target);
+        if (s->tdma_running) {
+            /* Gate re-arm : si pcb tick thread actif, c'est lui qui ticke. */
+            static int pcb_threaded = -1;
+            if (pcb_threaded < 0) {
+                const char *e = getenv("CALYPSO_PCB_TICK_THREADS");
+                pcb_threaded = (e && e[0] == '1') ? 1 : 0;
+            }
+            if (!pcb_threaded) {
+                timer_mod_ns(s->tdma_timer, target);
+            }
+        }
     }
 
     {
@@ -986,7 +1136,16 @@ static void calypso_tdma_start(CalypsoTRX *s)
     s->tdma_running = true;
     s->fn = 0;
     TRX_LOG("TDMA started");
-    timer_mod_ns(s->tdma_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + GSM_TDMA_NS);
+    {
+        static int pcb_threaded = -1;
+        if (pcb_threaded < 0) {
+            const char *e = getenv("CALYPSO_PCB_TICK_THREADS");
+            pcb_threaded = (e && e[0] == '1') ? 1 : 0;
+        }
+        if (!pcb_threaded) {
+            timer_mod_ns(s->tdma_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + GSM_TDMA_NS);
+        }
+    }
 }
 
 /* ---- kick ----
@@ -1029,37 +1188,36 @@ static void calypso_kick_cb(void *o){
                 kick_n, (unsigned long)vt, (unsigned long)rt);
     }
 
-    /* === CALYPSO_FORCE_RX_DONE site A — RESTAURÉ 2026-05-23 ===
+    /* === rxDoneFlag periodic refresh (5 ms wall TDMA kick) ===
      *
-     * Premier retrait 2026-05-23 cleanup → osmocon stuck à "starting
-     * download" sous icount=auto. Hypothèse empirique : ce write a DEUX
-     * effets load-bearing, pas un seul :
+     * Complément au write SIM-driven précis dans calypso_sim.c (sur IT_WT).
+     * Ce write périodique 200 Hz a deux fonctions distinctes :
      *
-     *   (1) Set rxDoneFlag=1 → firmware exit busy-loop @ 0x822b90 (overcome
-     *       TCG STR bug à PC=0x8224ac, le STR conditionnel ne commit pas).
+     *   (1) Couvre les busy-loops firmware qui se forment AVANT l'IT_WT
+     *       SIM (e.g., entre clear rxDoneFlag=0 et le premier IT_WT) —
+     *       garantit que le polling firmware finit toujours par voir 1.
      *
-     *   (2) `cpu_physical_memory_write` side-effect — sous icount=auto, le
-     *       firmware busy-loop accumule des insns sans yield au main loop ;
-     *       le write physique invalide les caches TB/load, forçant ré-lecture
-     *       fraîche de rxDoneFlag par le busy-loop ré-exécuté. cpu_exit
-     *       SEUL est insuffisant (interrompt la TB mais ne flush pas les
-     *       caches).
+     *   (2) Side-effect cpu_physical_memory_write : sous icount=auto, le
+     *       firmware busy-loop accumule des insns sans yield ; le write
+     *       physique invalide TB/load caches, forçant ré-lecture fraîche.
+     *       cpu_exit SEUL est insuffisant (interrompt la TB mais ne flush
+     *       pas les caches).
      *
-     * Le retrait a tué l'effet (2), pas seulement (1) — d'où le block. À
-     * faire (Tier 2/3) : remplacer ce 200 Hz blind par PC-trap event-driven
-     * sur busy-loop entry (firmware-side), OU fix TCG STR commit (real fix).
-     * Voir REPORT_CLAUDE_WEB_20260523_FORCE_RX_DONE_CLEANUP.md.
-     *
-     * Pour l'instant : restoration tactique. Pivot 16 cette session
-     * (mon retrait précédent réfuté empiriquement par osmocon stuck). */
+     * Par défaut ON. Désactiver via CALYPSO_FORCE_RX_DONE=0 pour test.
+     * Adresse rxDoneFlag = 0x008302d4 (nm 2026-05-24), override via
+     * CALYPSO_RXDONE_ADDR. Doit rester aligné avec calypso_sim.c. */
     {
-        const char *env = getenv("CALYPSO_FORCE_RX_DONE");
-        if (env && env[0] == '1') {
+        static int disabled = -1;
+        if (disabled < 0) {
+            const char *env = getenv("CALYPSO_FORCE_RX_DONE");
+            disabled = (env && env[0] == '0') ? 1 : 0;
+        }
+        if (!disabled) {
             static uint32_t rxdone_addr;
             if (!rxdone_addr) {
                 const char *aenv = getenv("CALYPSO_RXDONE_ADDR");
                 rxdone_addr = aenv ? (uint32_t)strtoul(aenv, NULL, 0)
-                                   : 0x008302a0;
+                                   : 0x008302d4;
             }
             const uint32_t one = 1;
             cpu_physical_memory_write(rxdone_addr, &one, sizeof(one));
@@ -1067,7 +1225,37 @@ static void calypso_kick_cb(void *o){
     }
 
     CPUState*cpu=first_cpu;if(cpu)cpu_exit(cpu);qemu_notify_event();
-    timer_mod_ns(g_kick_timer,qemu_clock_get_ns(QEMU_CLOCK_REALTIME)+5000000);
+    {
+        static int pcb_threaded = -1;
+        if (pcb_threaded < 0) {
+            const char *e = getenv("CALYPSO_PCB_TICK_THREADS");
+            pcb_threaded = (e && e[0] == '1') ? 1 : 0;
+        }
+        if (!pcb_threaded) {
+            timer_mod_ns(g_kick_timer,qemu_clock_get_ns(QEMU_CLOCK_REALTIME)+5000000);
+        }
+    }
+}
+
+/* === Public invokers pour pcb tick threads ============================
+ * Appelés depuis calypso_full_pcb.c thread bodies, avec BQL held. */
+void calypso_trx_kick_invoke(void);
+void calypso_trx_tdma_tick_invoke(void);
+void calypso_trx_frame_irq_lower_invoke(void);
+
+void calypso_trx_kick_invoke(void)
+{
+    calypso_kick_cb(NULL);
+}
+
+void calypso_trx_tdma_tick_invoke(void)
+{
+    if (g_trx) calypso_tdma_tick(g_trx);
+}
+
+void calypso_trx_frame_irq_lower_invoke(void)
+{
+    if (g_trx) calypso_frame_irq_lower(g_trx);
 }
 
 /* ---- Sercomm burst transport (DLCI 4) ---- */
