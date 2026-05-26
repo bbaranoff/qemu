@@ -154,14 +154,14 @@ return g_l1ctl.burst_mode;
 Utilisé pour gater le forwarding TRXD UDP : on n'injecte des samples
 I/Q dans le DSP que quand le firmware est prêt à les recevoir.
 
-## 8. Conflit avec bridge.py
+## 8. Conflit avec calypso-ipc-device
 
 Commentaire dans `calypso_soc.c:228-229` :
-> "Having both QEMU and bridge.py write to the same socket interleaves
+> "Having both QEMU and calypso-ipc-device write to the same socket interleaves
 >  bytes and corrupts L1CTL headers (Short L1CTL message len=1)"
 
 Concrètement :
-- `bridge.py` lit le PTY de QEMU (sercomm UART) et écrit sur sa propre
+- `calypso-ipc-device` lit le PTY de QEMU (sercomm UART) et écrit sur sa propre
   socket Unix `/tmp/osmocom_l2_1` (en Python, même format len-prefix).
 - Si on active aussi `l1ctl_sock_init` → QEMU crée la même socket → race
   bind() OU bytes mobile arrivent dans une seule des deux instances → désync.
@@ -169,9 +169,9 @@ Concrètement :
 Solution pour réactiver QEMU L1CTL :
 1. Décommenter `l1ctl_sock_init(&s->uart_modem, ...)` dans
    `calypso_soc.c:230-233`.
-2. Modifier bridge.py pour **ne plus créer la socket Unix** : retire la
+2. Modifier calypso-ipc-device pour **ne plus créer la socket Unix** : retire la
    logique L1CTL bridge ↔ socket, ne garde que TRXD UDP + PTY (s'il y en
-   a encore besoin pour autre chose) — ou virer bridge.py complètement
+   a encore besoin pour autre chose) — ou virer calypso-ipc-device complètement
    du flow L1CTL.
 3. Vérifier que `l1ctl_sock_uart_tx_byte()` est bien hooké dans
    `calypso_uart.c` sur le chemin TX du firmware.
@@ -183,14 +183,14 @@ Solution pour réactiver QEMU L1CTL :
 Register) du UART, mais **uniquement pour le label `"modem"`** :
 
 ```c
-qemu_chr_fe_write_all(&s->chr, &ch, 1);   // → PTY (vu par bridge.py)
+qemu_chr_fe_write_all(&s->chr, &ch, 1);   // → PTY (vu par calypso-ipc-device)
 if (s->label && !strcmp(s->label, "modem")) {
     l1ctl_sock_uart_tx_byte(ch);          // → parser sercomm interne
 }
 ```
 
 Donc chaque byte TX du UART modem du firmware part **simultanément** vers
-deux destinations : le chardev PTY (que bridge.py lit) ET le parser sercomm
+deux destinations : le chardev PTY (que calypso-ipc-device lit) ET le parser sercomm
 interne `l1ctl_sock`. L'UART irda n'a pas ce double-tap.
 
 Si `l1ctl_sock_init` est désactivé (cas actuel), `l1ctl_sock_uart_tx_byte`
@@ -201,12 +201,12 @@ première ligne (`if (s->cli_fd < 0) return;`) → no-op silencieux.
 
 | Connexion           | Type                 | Master (server)                | Slave (client)            | État actuel                 |
 |---------------------|----------------------|--------------------------------|---------------------------|------------------------------|
-| `/tmp/osmocom_l2_1` | AF_UNIX SOCK_STREAM  | **bridge.py** (Python)         | mobile, ccch_scan         | actif                        |
+| `/tmp/osmocom_l2_1` | AF_UNIX SOCK_STREAM  | **calypso-ipc-device** (Python)         | mobile, ccch_scan         | actif                        |
 | `/tmp/osmocom_l2_1` | (alt) AF_UNIX        | QEMU `l1ctl_sock_init`         | mobile, ccch_scan         | **désactivé** (calypso_soc.c:230) |
-| PTY `/dev/pts/N`    | tty                  | QEMU (`-serial pty`, master)   | bridge.py (lit le slave)  | actif                        |
-| `udp:6700` (CLK)    | UDP datagram         | QEMU `sercomm_gate.c`          | bridge.py                 | actif                        |
-| `udp:6701` (TRXC)   | UDP datagram         | QEMU                           | bridge.py                 | actif                        |
-| `udp:6702` (TRXD)   | UDP datagram         | QEMU                           | bridge.py / inject_cfile  | actif                        |
+| PTY `/dev/pts/N`    | tty                  | QEMU (`-serial pty`, master)   | calypso-ipc-device (lit le slave)  | actif                        |
+| `udp:6700` (CLK)    | UDP datagram         | QEMU `sercomm_gate.c`          | calypso-ipc-device                 | actif                        |
+| `udp:6701` (TRXC)   | UDP datagram         | QEMU                           | calypso-ipc-device                 | actif                        |
+| `udp:6702` (TRXD)   | UDP datagram         | QEMU                           | calypso-ipc-device / inject_cfile  | actif                        |
 | `tcp:1234` (gdb)    | TCP gdb stub         | QEMU (`-gdb tcp::1234`)        | gdb / hack_gdb.py         | actif (run_all_debug.sh)     |
 
 **Ordre de démarrage `run_all_debug.sh`** :
@@ -218,7 +218,7 @@ première ligne (`if (s->cli_fd < 0) return;`) → no-op silencieux.
    ├─ ouvre gdb stub tcp:1234   (server)
    └─ VM paused (waiting for vm_start)
 
-2. bridge.py start
+2. calypso-ipc-device start
    ├─ bind /tmp/osmocom_l2_1   (server SOCK_STREAM)
    ├─ open(PTY)                 (slave reader/writer)
    └─ connect UDP 6700-6702     (client of QEMU UDP servers)
@@ -227,8 +227,8 @@ première ligne (`if (s->cli_fd < 0) return;`) → no-op silencieux.
    └─ connect UDP 6702          (client) — push I/Q samples
 
 4. mobile start (sleep 5)
-   └─ connect /tmp/osmocom_l2_1 (client) → bridge.py accept()
-       └─ bridge.py forward L1CTL bytes vers PTY → QEMU UART RX
+   └─ connect /tmp/osmocom_l2_1 (client) → calypso-ipc-device accept()
+       └─ calypso-ipc-device forward L1CTL bytes vers PTY → QEMU UART RX
 
 5. (hack_gdb.py désactivé)
    └─ aurait connecté tcp:1234 et posé des BP firmware
@@ -239,9 +239,9 @@ première ligne (`if (s->cli_fd < 0) return;`) → no-op silencieux.
 firmware code
   → write THR sur UART modem (calypso_uart.c)
   → qemu_chr_fe_write_all → PTY master
-  → bridge.py read PTY (slave fd)
-  → bridge.py parse sercomm (Python)
-  → bridge.py send len-prefix sur /tmp/osmocom_l2_1 (server fd)
+  → calypso-ipc-device read PTY (slave fd)
+  → calypso-ipc-device parse sercomm (Python)
+  → calypso-ipc-device send len-prefix sur /tmp/osmocom_l2_1 (server fd)
   → mobile recv (client fd)
   → mobile l1ctl_recv → L23 dispatch
 ```
@@ -252,9 +252,9 @@ mais drop tout puisque `cli_fd<0`.)
 **Path RX mobile → firmware** :
 ```
 mobile l1ctl_send → write sur /tmp/osmocom_l2_1 (client)
-  → bridge.py recv (server)
-  → bridge.py wrap sercomm
-  → bridge.py write PTY (slave)
+  → calypso-ipc-device recv (server)
+  → calypso-ipc-device wrap sercomm
+  → calypso-ipc-device write PTY (slave)
   → QEMU lit PTY → injection UART RX du firmware
   → comm/sercomm.c côté firmware → unwrap → l1ctl_recv firmware
 ```

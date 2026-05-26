@@ -19,7 +19,7 @@ sudo bash test-mobile.sh
  mobile (layer23)
     |  L1CTL (unix socket /tmp/osmocom_l2)
     v
- l1ctl_bridge.py
+ l1ctl_calypso-ipc-device
     |  sercomm frames (PTY /dev/pts/X)
     v
  QEMU Calypso
@@ -57,5 +57,5 @@ sudo bash test-mobile.sh
 |---------|-------------|
 | `run-layer1.sh` | Lance QEMU avec layer1.elf, affiche la sortie console |
 | `test-mobile.sh` | Test complet : QEMU + l1ctl_bridge + mobile |
-| `l1ctl_bridge.py` | Bridge sercomm (DLCI 4) <-> unix socket L1CTL |
+| `l1ctl_calypso-ipc-device` | Bridge sercomm (DLCI 4) <-> unix socket L1CTL |
 | `sercomm_relay.py` | Relay sercomm pour osmoload (loader phase) |

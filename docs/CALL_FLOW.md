@@ -10,7 +10,7 @@ locate which layer dropped the ball.
 mobile (osmocom-bb)                — userland L23
     │  AF_UNIX  /tmp/osmocom_l2_1  ← length-prefixed L1CTL frames
     ▼
-bridge.py (run_all server)         — Python broker / decoder
+calypso-ipc-device (run_all server)         — Python broker / decoder
     │  AF_UNIX  /tmp/calypso_modem.sock  (UART modem)
     │  UDP      127.0.0.1:5700/5701/5702 (BTS-side TRX)
     │  UDP      127.0.0.1:6700/6702/6802 (BB-side TRX)
@@ -30,7 +30,7 @@ DSP (TMS320C54x emulator)          — PROM0+PROM1, NDB mailbox at 0x0800
 | step | actor                | action                                                        |
 |------|----------------------|---------------------------------------------------------------|
 | 1    | run.sh               | kill_all → start tmux session `calypso`                       |
-| 2    | bridge.py            | bind UDP 5700/5701/5702 + 6802 ; AF_UNIX listen on `/tmp/calypso_modem.sock` and `/tmp/osmocom_l2_1` |
+| 2    | calypso-ipc-device            | bind UDP 5700/5701/5702 + 6802 ; AF_UNIX listen on `/tmp/calypso_modem.sock` and `/tmp/osmocom_l2_1` |
 | 3    | qemu-system-arm      | client connect to `/tmp/calypso_modem.sock` (`reconnect=1`)   |
 | 4    | calypso_soc.c        | realize uart_modem (label `modem`), set chardev handler `calypso_uart_receive` |
 | 5    | calypso_trx.c        | `calypso_trx_init` → `c54x_init` → `c54x_load_rom` → `calypso_bsp_init(dsp)` → `calypso_iota_init` |
@@ -118,7 +118,7 @@ The CMD never round-trips through QEMU — bridge is authoritative.
 mobile          ──┐
                   │ unix /tmp/osmocom_l2_1   (L1CTL length-prefixed)
                   ▼
-              bridge.py
+              calypso-ipc-device
               ├── server unix /tmp/calypso_modem.sock     ──► QEMU UART modem (sercomm DLCI 5/4)
               ├── server unix /tmp/osmocom_l2_1            ──► mobile
               ├── bind  UDP 5700  IND CLOCK out           ──► osmo-bts-trx 5800

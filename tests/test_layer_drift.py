@@ -28,7 +28,7 @@ import pytest
 
 CONTAINER = os.environ.get("CALYPSO_CONTAINER", "trying")
 QEMU_LOG    = os.environ.get("CALYPSO_QEMU_LOG",    "/root/qemu.log")
-BRIDGE_LOG  = os.environ.get("CALYPSO_BRIDGE_LOG",  "/tmp/bridge.log")
+(removed)  = os.environ.get("CALYPSO_(removed)",  "/tmp/bridge.log")
 OSMOCON_LOG = os.environ.get("CALYPSO_OSMOCON_LOG", "/tmp/osmocon.log")
 MOBILE_LOG  = os.environ.get("CALYPSO_MOBILE_LOG",  "/tmp/mobile.log")
 
@@ -120,7 +120,7 @@ def test_qemu_insn_rate_p1_above_1m(have_timestamps):
 def test_bridge_qfn_tracks_qemu_fn(have_timestamps):
     """At any wall timestamp, bridge.qfn should be within 200 frames of qemu fn."""
     b_samples = []
-    for ts, _, body in _parse_timestamped(BRIDGE_LOG, "wall_fn="):
+    for ts, _, body in _parse_timestamped((removed), "wall_fn="):
         mw = re.search(r'wall_fn=(\d+)', body)
         mq = re.search(r'qfn=(\d+)', body)
         if mw and mq:
@@ -150,7 +150,7 @@ def test_bridge_qfn_advances_steadily(have_timestamps):
     blocker — pas un soft warning à 150.
     """
     samples = []
-    for ts, _, body in _parse_timestamped(BRIDGE_LOG, "qfn="):
+    for ts, _, body in _parse_timestamped((removed), "qfn="):
         mq = re.search(r'qfn=(\d+)', body)
         if mq: samples.append((ts, int(mq.group(1))))
     if len(samples) < 10:
@@ -174,7 +174,7 @@ def test_bridge_qfn_advances_steadily(have_timestamps):
 @pytest.mark.drift
 @pytest.mark.parametrize("name,path,min_rate_per_30s", [
     ("qemu",    QEMU_LOG,    1000),
-    ("bridge",  BRIDGE_LOG,  10),
+    ("bridge",  (removed),  10),
     ("osmocon", OSMOCON_LOG, 1),
     # mobile is often quiet (no commands sent) — skip strict liveness
 ])
@@ -202,7 +202,7 @@ def test_log_start_within_10s(have_timestamps):
     activity is > 60s before the newest log's last activity — that log
     isn't part of the current run."""
     entries = {}  # name -> (first_ts, last_ts)
-    for name, path in [("qemu", QEMU_LOG), ("bridge", BRIDGE_LOG),
+    for name, path in [("qemu", QEMU_LOG), ("bridge", (removed)),
                        ("osmocon", OSMOCON_LOG), ("mobile", MOBILE_LOG)]:
         head = _parse_timestamped(path, tail_n=10)
         tail = _parse_timestamped(path, tail_n=10)
@@ -230,7 +230,7 @@ def test_log_start_within_10s(have_timestamps):
 @pytest.mark.drift
 @pytest.mark.parametrize("name,path,max_gap_s", [
     ("qemu",    QEMU_LOG,    5.0),
-    ("bridge",  BRIDGE_LOG,  10.0),
+    ("bridge",  (removed),  10.0),
 ])
 def test_no_long_gap(have_timestamps, name, path, max_gap_s):
     """No gap longer than `max_gap_s` between consecutive log lines."""

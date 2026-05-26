@@ -10,7 +10,7 @@
 - DSP : boot sequence, API RAM, re-boot apres reset
 - TPU : TDMA frame timer 4.615ms, IRQ TPU_FRAME
 - TRX bridge : ports UDP TRXC/TRXD compatibles osmo-bts-trx
-- l1ctl_bridge.py : relais sercomm <-> /tmp/osmocom_l2
+- l1ctl_calypso-ipc-device : relais sercomm <-> /tmp/osmocom_l2
 - mobile se connecte et envoie L1CTL_RESET_REQ
 - Le firmware recoit et lit les 12 bytes du L1CTL_RESET_REQ
 
