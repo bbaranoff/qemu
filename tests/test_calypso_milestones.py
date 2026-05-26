@@ -322,6 +322,13 @@ def test_dsp_throughput_5x(container_alive):
     p10 actuel — pass en steady state, fail sur régression POPM (qui
     descendrait à 5-10M/s) ou saturation host. Lit `INSN-COUNT-STATS`.
     """
+    from conftest import _probes_active
+    probe = _probes_active()
+    if probe:
+        pytest.skip(
+            f"sonde diag active ({probe}=1) — throughput gate confondu "
+            "par overhead probe, valider en run probes-off"
+        )
     # Fenêtre 20 samples (vs 5) : robuste aux dips host load. Cf
     # test_dsp_throughput_above_threshold pour la calibration détaillée.
     r = docker_exec([
