@@ -70,7 +70,7 @@ def indicators():
         "dsc":          _count(r"using DSC of", m),
         "err_q":        _count(r"ERR|FATAL|panic|assert", q),
         "err_m":        _count(r"ERR|FATAL|panic", m),
-        "bts_alive":    _count(r"Listening|RACH received|TRX online", b),
+        "bts_alive":    _count(r"phy0\.0: Opening|DL1C NOTICE|FN faster than TRX|RACH received|Listening|TRX online", b),
         "bts_poweroff": _count(r"No satisfactory.*POWEROFF", b),
         "ipc_handshake": _count(r"GREETING|OPEN_CNF|info_cnf", i),
         "ipc_err":      _count(r"DDEV ERROR|chan num mismatch|antenna not found", t),

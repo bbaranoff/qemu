@@ -137,7 +137,7 @@ rr_est=$(_grep_count 'RR_EST|RR EST_REQ' "$mobile_log") \
 lost=$(_grep_count 'LOST [0-9]' "$mobile_log") \
 err_q=$(_grep_count 'ERR|FATAL|panic|assert' "$qemu_log") \
 err_m=$(_grep_count 'ERR|FATAL|panic' "$mobile_log") \
-bts_ok=$(_grep_count 'Listening|RACH received|TRX online' "$bts_log") \
+bts_ok=$(_grep_count 'phy0\.0: Opening|DL1C NOTICE|FN faster than TRX|RACH received|Listening|TRX online' "$bts_log") \
 ipc_ok=$(_grep_count 'GREETING|OPEN_CNF|info_cnf' "$ipc_log") \
 ipc_err=$(_grep_count 'DDEV ERROR|chan num mismatch|antenna not found' "$trxipc_log")"
 

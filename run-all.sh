@@ -50,7 +50,9 @@ _extract_indicators() {
     local lost=$(_grep_count         "LOST [0-9]" "$mobile")
     local err_q=$(_grep_count        "ERR|FATAL|panic|assert" "$qemu")
     local err_m=$(_grep_count        "ERR|FATAL|panic" "$mobile")
-    local bts_ok=$(_grep_count       "Listening|RACH received|TRX online" "$bts")
+    # BTS alive markers: TRX connections opened, DL1C scheduler tick, FN compensating,
+    # or any RACH/sysinfo activity. Tolerant to multi-mode log content.
+    local bts_ok=$(_grep_count       "phy0\.0: Opening|DL1C NOTICE|FN faster than TRX|RACH received|Listening|TRX online" "$bts")
     local ipc_ok=$(_grep_count       "ipc_sock0|GREETING|OPEN_CNF" "$ipc")
     echo "shunt_latch=$shunt_latch shunt_disp=$shunt_disp fbsb_conf=$fbsb_conf rr_est=$rr_est lost=$lost err_q=$err_q err_m=$err_m bts_ok=$bts_ok ipc_ok=$ipc_ok"
 }
