@@ -96,13 +96,6 @@ def test_qemu_insn_rate_cv_below_0_4(have_timestamps):
 @pytest.mark.drift
 def test_qemu_insn_rate_p1_above_1m(have_timestamps):
     """p1(rate) should stay above 1M insn/s (no livelock)."""
-    from conftest import _probes_active
-    probe = _probes_active()
-    if probe:
-        pytest.skip(
-            f"sonde diag active ({probe}=1) — p1 rate confondu par overhead "
-            "probe et stuck-loop DSP qui spamme reads, valider en run probes-off"
-        )
     rates = []
     for _, _, body in _parse_timestamped(QEMU_LOG, "INSN-COUNT-STATS"):
         m = re.search(r'rate=(\d+)/s', body)
@@ -194,34 +187,18 @@ def test_log_still_growing(have_timestamps, name, path, min_rate_per_30s):
 # -----------------------------------------------------------------------------
 @pytest.mark.drift
 def test_log_start_within_10s(have_timestamps):
-    """All logs should have started within a 10s window.
-
-    Filter orphan logs : a process from a previous `run.sh` invocation can
-    leave a stale log file behind (mobile in particular survives between
-    runs because it's launched separately). Exclude any log whose last
-    activity is > 60s before the newest log's last activity — that log
-    isn't part of the current run."""
-    entries = {}  # name -> (first_ts, last_ts)
+    """All logs should have started within a 10s window."""
+    starts = {}
     for name, path in [("qemu", QEMU_LOG), ("bridge", (removed)),
                        ("osmocon", OSMOCON_LOG), ("mobile", MOBILE_LOG)]:
-        head = _parse_timestamped(path, tail_n=10)
-        tail = _parse_timestamped(path, tail_n=10)
-        if head and tail:
-            entries[name] = (head[0][0], tail[-1][0])
-    if len(entries) < 2:
-        pytest.skip(f"only {len(entries)} logs have timestamps")
-    newest_last = max(last for _, last in entries.values())
-    fresh = {name: first for name, (first, last) in entries.items()
-             if newest_last - last <= 60}
-    orphans = sorted(set(entries) - set(fresh))
-    if len(fresh) < 2:
-        pytest.skip(f"only {len(fresh)} fresh logs after orphan filter "
-                    f"(orphans={orphans})")
-    spread = max(fresh.values()) - min(fresh.values())
-    assert spread <= 30, (
-        f"log start spread = {spread:.1f}s > 30s — fresh starts: {fresh}"
-        + (f" (orphans excluded: {orphans})" if orphans else "")
-    )
+        samples = _parse_timestamped(path, tail_n=10)
+        if samples:
+            starts[name] = samples[0][0]
+    if len(starts) < 2:
+        pytest.skip(f"only {len(starts)} logs have timestamps")
+    spread = max(starts.values()) - min(starts.values())
+    assert spread <= 30, \
+        f"log start spread = {spread:.1f}s > 30s — starts: {starts}"
 
 
 # -----------------------------------------------------------------------------

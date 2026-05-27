@@ -76,29 +76,6 @@ if os.path.exists("/.dockerenv"):
     subprocess.run = _calypso_local_run
 
 
-# Heavy diag probes that materially slow the DSP emulator. When any of these
-# is set, perf assertions become noise (cf project_daram_lock_perf_debt). Used
-# by tests to skip throughput gates during diag runs.
-_DIAG_PROBE_ENVS = (
-    "CALYPSO_INT3_CYCLE_TRACE",
-    "CALYPSO_CORRELATOR_TRACE",
-    "CALYPSO_STUCK_PROBE",
-    "CALYPSO_FBDB_PROBE",
-    "CALYPSO_FORCE_INTM_ONESHOT",
-)
-
-
-def _probes_active() -> str | None:
-    """Return name of first active diag probe env var, or None if all off.
-    Treats value '1' or 'true' as active. Used by perf gates to skip cleanly
-    instead of fail when probes are inflating overhead."""
-    for v in _DIAG_PROBE_ENVS:
-        val = os.environ.get(v, "").strip().lower()
-        if val in ("1", "true", "yes", "on"):
-            return v
-    return None
-
-
 def pytest_configure(config):
     for marker in (
         # test_calypso_milestones.py

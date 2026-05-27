@@ -401,13 +401,6 @@ def test_dsp_throughput_above_threshold(capsys):
     2026-05-14 dans calypso_c54x.c, émission toutes les 1M insn).
     PASS si rate >= DSP_THROUGHPUT_MIN_INSN_PER_SEC (50M/s, marge ×2 sous 100M).
     """
-    from conftest import _probes_active
-    probe = _probes_active()
-    if probe:
-        pytest.skip(
-            f"sonde diag active ({probe}=1) — throughput gate confondu "
-            "par overhead probe, valider en run probes-off"
-        )
     # Fenêtre 20 samples : robuste aux dips temporaires (host load, GC, etc.)
     # Sur 2955 samples observés : median=36.7M, p10=25.3M, ~10% des samples
     # sous 25M (dips). tail-5 attrapait parfois un cluster de dips et failait
