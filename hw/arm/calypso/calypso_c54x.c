@@ -3089,6 +3089,26 @@ static uint16_t resolve_smem(C54xState *s, uint16_t opcode, bool *indirect)
         int cur_arp = nar;
         uint16_t addr = s->ar[cur_arp];
 
+        /* AR2-FLOOR guard : le pointeur d'écriture corrélateur (AR2) peut
+         * sous-déborder le buffer DARAM (0x0800) jusqu'à l'espace MMR
+         * (0x1E=XPC, 0x00=IMR) → clobber. WARN-log diag (token AR2-FLOOR) ;
+         * DROP expérimental (env CALYPSO_AR2_FLOOR_DROP=1) redirige l'accès
+         * vers un scratch pour voir si le corrélateur converge sans le crash. */
+        if (cur_arp == 2 && addr < 0x0820) {
+            static int ar2_drop = -1;
+            if (ar2_drop < 0) {
+                const char *e = getenv("CALYPSO_AR2_FLOOR_DROP");
+                ar2_drop = (e && *e == '1') ? 1 : 0;
+            }
+            if (calypso_debug_enabled("AR2-FLOOR"))
+                C54_DBG("AR2-FLOOR",
+                    "AR2=0x%04x < floor PC=0x%04x op=0x%04x BK=0x%04x A=%010llx insn=%u",
+                    addr, s->pc, prog_fetch(s, s->pc), s->bk,
+                    (unsigned long long)(s->a & 0xFFFFFFFFFFULL), s->insn_count);
+            if (ar2_drop && addr < 0x0800)
+                addr = 0xFFFF;  /* scratch : empêche le clobber MMR (expérience) */
+        }
+
         /* Post-modify */
         switch (mod) {
         case 0x0: /* *ARn */
@@ -4095,8 +4115,11 @@ static int c54x_exec_one(C54xState *s)
         if (op == 0xF4E4) {
             uint16_t ra = data_read(s, s->sp); s->sp++;
             uint16_t prev_xpc = s->xpc;
-            s->xpc = data_read(s, s->sp); s->sp++;
-            if (s->xpc > 3) s->xpc &= 3;
+            uint16_t nx = data_read(s, s->sp); s->sp++;
+            if (nx > 2)
+                C54_DBG("XPC-OOR", "FRET xpc=0x%04x PC=0x%04x SP=0x%04x insn=%u",
+                        nx, s->pc, s->sp, s->insn_count);
+            s->xpc = nx & 3;
             {
                 static uint64_t fret_count;
                 fret_count++;
@@ -9493,6 +9516,63 @@ int c54x_run(C54xState *s, int n_insns)
                 }
             }
             sd_prev_sp = s->sp;
+        }
+
+        /* CALLSITE probe (CALYPSO_DEBUG=CALLSITE) : à l'épilogue RCD 0x7707,
+         * dump l'adresse de retour que RCD va popper + l'opcode du call-site
+         * (FCALL F9xx vs CALL F074) + pc-ring pré-RETD = park-vs-crash. */
+        if (s->pc == 0x7707 && calypso_debug_enabled("CALLSITE")) {
+            static int n7707 = 0;
+            if (n7707 < 8) {
+                n7707++;
+                uint16_t ret = data_read(s, s->sp);
+                C54_DBG("CALLSITE",
+                    "RCD@7707 #%d SP=0x%04x ret=0x%04x caller[ret-2..ret-1]=0x%04x 0x%04x XPC=%d insn=%u",
+                    n7707, s->sp, ret, prog_read(s, (uint16_t)(ret-2)),
+                    prog_read(s, (uint16_t)(ret-1)), s->xpc, s->insn_count);
+                char buf[300]; int o=0;
+                for (int i=20;i>=1;i--)
+                    o+=snprintf(buf+o,sizeof(buf)-o,"%04x ", pc_ring[(pc_ring_idx-i)&255]);
+                C54_DBG("CALLSITE", "  pre-RETD pcring(20): %s", buf);
+            }
+        }
+
+        /* XPC-WR tracer (CALYPSO_DEBUG=XPC-WR) : toute transition de XPC avec
+         * l'instruction qui l'a causée (= origine du XPC=3 garbage). */
+        if (calypso_debug_enabled("XPC-WR")) {
+            static uint8_t xprev = 0xFF;
+            if (xprev != 0xFF && (uint8_t)s->xpc != xprev) {
+                C54_DBG("XPC-WR",
+                    "XPC %u->%u cause prev_exec PC=0x%04x op=0x%04x SP=0x%04x insn=%u",
+                    xprev, (unsigned)(s->xpc & 0xFF), s->last_exec_pc,
+                    s->last_exec_op, s->sp, s->insn_count);
+            }
+            xprev = (uint8_t)s->xpc;
+        }
+
+        /* AR2-WR tracer (CALYPSO_DEBUG=AR2-WR) : discrimine reset vs runaway.
+         * delta==-1 = post-décrément normal (progression, log tous les 200).
+         * delta!=-1 = reset/jump/load = LE discriminateur (#1 reset existe
+         * vs #2 jamais de reset). Reporte BK + la cible du reset. */
+        if (calypso_debug_enabled("AR2-WR")) {
+            static int      ar2_first = 1;
+            static uint16_t ar2_prev = 0;
+            static uint32_t ar2_dec  = 0;
+            uint16_t cur = s->ar[2];
+            if (!ar2_first && cur != ar2_prev) {
+                int delta = (int)(int16_t)(cur - ar2_prev);
+                if (delta == -1) {
+                    if ((++ar2_dec % 200) == 0)
+                        C54_DBG("AR2-WR", "AR2 dec #%u ->0x%04x (linear -1) PC=0x%04x insn=%u",
+                                ar2_dec, cur, s->last_exec_pc, s->insn_count);
+                } else {
+                    C54_DBG("AR2-WR",
+                        "AR2 %s 0x%04x->0x%04x (delta=%+d) cause PC=0x%04x op=0x%04x BK=0x%04x insn=%u",
+                        delta > 0 ? "RESET/UP" : "JUMP-DN", ar2_prev, cur, delta,
+                        s->last_exec_pc, s->last_exec_op, s->bk, s->insn_count);
+                }
+            }
+            ar2_first = 0; ar2_prev = cur;
         }
 
         /* TRACE: dump entry into 0xe260 loop (first 5 hits) */
