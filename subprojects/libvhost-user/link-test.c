@@ -39,6 +39,7 @@ main(int argc, const char *argv[])
 
     rc = vu_init(&dev, max_queues, socket, panic, NULL, set_watch, remove_watch, &iface);
     assert(rc == true);
+    (void)rc;  /* éviter -Wunused-but-set-variable quand assert() est no-op (NDEBUG sous-projet) */
     vu_deinit(&dev);
 
     return 0;
