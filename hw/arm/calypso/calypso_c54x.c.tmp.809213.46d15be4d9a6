@@ -6404,7 +6404,18 @@ static int c54x_exec_one(C54xState *s)
             case 0xA: /* F7Ax: LD #k8, ARP */
                 s->st0 = (s->st0 & ~ST0_ARP_MASK) | ((k & 7) << ST0_ARP_SHIFT); break;
             case 0xB: s->ar[7] = k; break; /* F7Bx: LD #k8, AR7 */
-            case 0xC: s->bk = k; break;
+            case 0xC:
+                {   /* PROBE 2026-06-01 : LD #k8,BK (F7Cx). cf BK-WR MMR. */
+                    static uint32_t bkw2_n = 0;
+                    if (bkw2_n < 40) {
+                        fprintf(stderr, "[c54x] BK-WR (LD#k) 0x%04x→0x%04x PC=0x%04x "
+                                "%s insn=%u\n", s->bk, k, s->pc,
+                                (k == 0) ? "<<< BK=0 (casse circular!)" : "",
+                                s->insn_count);
+                        bkw2_n++;
+                    }
+                }
+                s->bk = k; break;
             case 0xD: sp_abs_track(s, k, 1); s->sp = k; break;  /* LD #k8u, SP */
             }
             return consumed + s->lk_used;
