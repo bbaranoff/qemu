@@ -11,5 +11,18 @@
       "Bash(rm:*)",
       "Bash(chmod +x /home/nirvana/qemu/run-mobile.sh)"
     ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/nirvana/.claude/hooks/sync_calypso_mirrors.sh"
+          }
+        ]
+      }
+    ]
   }
 }
