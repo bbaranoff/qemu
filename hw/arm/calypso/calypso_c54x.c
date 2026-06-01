@@ -3707,10 +3707,13 @@ static struct {
  * (0x00-0x1F) — empirically observed at PC=0x8a46 op=0x9918 (STL B,*AR2)
  * 2026-05-23, stomp SP=0x4800→0x0000 cascading to IMR=0 → DSP idle forever.
  *
- * Known debt : xmod=3 (*AR+0%) implemented as linear `addr + AR0`, not
- * circular (modulo BK). Matches MVDD handler at L3724 which has same
- * `(no circular here)` comment. Circular addressing for all Xmem handlers
- * is tracked as known-open, to fix together. */
+ * Fix 2026-06-01 : xmod=3 (*AR+0%) désormais CIRCULAIRE modulo BK via
+ * c54x_circ_ref (BK=0→linéaire, règle #6396). Appliqué à tous les handlers
+ * duaux (resolve_xmem, MVDD, MAC D0-D9, MASA DB, SQDST DC) — était linéaire
+ * `addr + AR0` → drift 16-bit (runaway AR2 @0xfa98, op 0xd3dc Ymem *AR2+0%).
+ * Cohérent avec le handler ST||LD C8-CB qui wrappait déjà correctement.
+ * NB : la convention 1/2 (±) diffère entre handlers (MVDD 1=- 2=+ vs MAC
+ * 1=+ 2=-) — incohérence séparée NON traitée ici, à mesurer (sonde). */
 static uint16_t resolve_xmem(C54xState *s, uint16_t op)
 {
     uint8_t xmem  = (op >> 4) & 0xF;
@@ -3721,7 +3724,7 @@ static uint16_t resolve_xmem(C54xState *s, uint16_t op)
     case 0: break;
     case 1: s->ar[xar] = addr - 1; break;
     case 2: s->ar[xar] = addr + 1; break;
-    case 3: s->ar[xar] = addr + s->ar[0]; break; /* *AR+0% (no circular here) */
+    case 3: s->ar[xar] = c54x_circ_ref(addr, +(int16_t)s->ar[0], s->bk); break; /* *AR+0% circulaire modulo BK (BK=0→linéaire) — fix 2026-06-01 */
     }
     return addr;
 }
@@ -6850,13 +6853,13 @@ static int c54x_exec_one(C54xState *s)
                 case 0: break;                        /* *AR     */
                 case 1: s->ar[xar] = xa - 1; break;   /* *AR-    */
                 case 2: s->ar[xar] = xa + 1; break;   /* *AR+    */
-                case 3: s->ar[xar] = xa + s->ar[0]; break; /* *AR+0% (no circular here) */
+                case 3: s->ar[xar] = c54x_circ_ref(xa, +(int16_t)s->ar[0], s->bk); break; /* *AR+0% circ modulo BK — fix 2026-06-01 */
             }
             switch (ymod) {
                 case 0: break;
                 case 1: s->ar[yar] = ya - 1; break;
                 case 2: s->ar[yar] = ya + 1; break;
-                case 3: s->ar[yar] = ya + s->ar[0]; break;
+                case 3: s->ar[yar] = c54x_circ_ref(ya, +(int16_t)s->ar[0], s->bk); break; /* *AR+0% circ modulo BK — fix 2026-06-01 */
             }
             return consumed + s->lk_used;
         }
@@ -8470,13 +8473,13 @@ ba_handler:
             case 0: break;
             case 1: s->ar[xar_c]++; break;
             case 2: s->ar[xar_c]--; break;
-            case 3: s->ar[xar_c] += s->ar[0]; break;
+            case 3: s->ar[xar_c] = c54x_circ_ref(s->ar[xar_c], +(int16_t)s->ar[0], s->bk); break; /* *AR+0% circ — fix 2026-06-01 */
             }
             switch (ymod_c) {
             case 0: break;
             case 1: s->ar[yar_c]++; break;
             case 2: s->ar[yar_c]--; break;
-            case 3: s->ar[yar_c] += s->ar[0]; break;
+            case 3: s->ar[yar_c] = c54x_circ_ref(s->ar[yar_c], +(int16_t)s->ar[0], s->bk); break; /* *AR+0% circ (Ymem 0xd3dc @0xfa98) — fix 2026-06-01 */
             }
             /* MAC dual-mem formula : T × Xmem (pas X × Y per SPRU pure).
              *
@@ -8524,13 +8527,13 @@ ba_handler:
             case 0: break;
             case 1: s->ar[xar_db]++; break;
             case 2: s->ar[xar_db]--; break;
-            case 3: s->ar[xar_db] += s->ar[0]; break;
+            case 3: s->ar[xar_db] = c54x_circ_ref(s->ar[xar_db], +(int16_t)s->ar[0], s->bk); break; /* *AR+0% circ — fix 2026-06-01 */
             }
             switch (ymod_db) {
             case 0: break;
             case 1: s->ar[yar_db]++; break;
             case 2: s->ar[yar_db]--; break;
-            case 3: s->ar[yar_db] += s->ar[0]; break;
+            case 3: s->ar[yar_db] = c54x_circ_ref(s->ar[yar_db], +(int16_t)s->ar[0], s->bk); break; /* *AR+0% circ — fix 2026-06-01 */
             }
             int64_t prod_db = (int64_t)(int16_t)s->t * (int64_t)(int16_t)xval_db;
             if (s->st1 & ST1_FRCT) prod_db <<= 1;
@@ -8553,13 +8556,13 @@ ba_handler:
             case 0: break;
             case 1: s->ar[xar_dc]++; break;
             case 2: s->ar[xar_dc]--; break;
-            case 3: s->ar[xar_dc] += s->ar[0]; break;
+            case 3: s->ar[xar_dc] = c54x_circ_ref(s->ar[xar_dc], +(int16_t)s->ar[0], s->bk); break; /* *AR+0% circ — fix 2026-06-01 */
             }
             switch (ymod_dc) {
             case 0: break;
             case 1: s->ar[yar_dc]++; break;
             case 2: s->ar[yar_dc]--; break;
-            case 3: s->ar[yar_dc] += s->ar[0]; break;
+            case 3: s->ar[yar_dc] = c54x_circ_ref(s->ar[yar_dc], +(int16_t)s->ar[0], s->bk); break; /* *AR+0% circ — fix 2026-06-01 */
             }
             s->t = xval_dc;
             int64_t prod_dc = (int64_t)(int16_t)xval_dc * (int64_t)(int16_t)xval_dc;
