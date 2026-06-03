@@ -1738,14 +1738,11 @@ echo " OK ($PTY_MODEM, QEMU_PID=$QEMU_PID)"
 # Tee bidirectionnel du lien série CP210x (PTY série0 qemu) → osmocon + trxcon.
 # osmocon prend /tmp/cp210x_osmocon ; trxcon prend /tmp/cp210x_trxcon.
 OSMOCON_SERIAL="$PTY_MODEM"
-if [ "$CALYPSO_MODE" = "full-grgsm" ] && [ -n "$PTY_MODEM" ]; then
-    tmux new-window -t "$SESSION" -n cp210x-tee
-    tmux send-keys -t "$SESSION:cp210x-tee" \
-        "python3 /opt/GSM/cp210x_tee.py $PTY_MODEM 2>&1 | $TSLOG" C-m
-    echo -n "Waiting for CP210x tee (/tmp/cp210x_osmocon)..."
-    for i in $(seq 1 20); do [ -e /tmp/cp210x_osmocon ] && break; sleep 0.3; echo -n "."; done
-    if [ -e /tmp/cp210x_osmocon ]; then echo " OK"; OSMOCON_SERIAL="/tmp/cp210x_osmocon"; else echo " WARN -- tee absent"; fi
-fi
+# full-grgsm : trxcon RETIRE -> PAS de cp210x_tee, PAS de socket trxcon.
+# Le tee 3-voies (osmocon+trxcon) ne servait qu'a partager le PTY serie entre
+# osmocon ET trxcon. Sans trxcon c'est un middleman Python qui PERD des octets
+# quand le firmware flood l'UART -> osmocon "LOST" en masse -> freeze mobile.
+# osmocon parle DIRECT au PTY serie du firmware ($PTY_MODEM). "osmocon only".
 
 # ---------- 1bis. IrDA capture (UART_IRDA = serial1, IRQ 18, 0xFFFF5000) ----------
 # Phase 3 du plan PLAN_CLAUDE_CODE_20260516_IRDA_DEBUG_CHANNEL.md :
@@ -1950,16 +1947,17 @@ if [ "$CALYPSO_MOBILE_DEBUG" = "all" ]; then
     CALYPSO_MOBILE_DEBUG="DCS:DNB:DPLMN:DRR:DMM:DSIM:DCC:DMNCC:DSS:DLSMS:DPAG:DSUM:DSAP:DGPS:DMOB:DPRIM:DLUA:DGAPK"
 fi
 
-# ---------- 3ter. décodeur gr-gsm (mode full-grgsm) ----------
-# DÉCODEUR (pas transceiver, pas de trxcon) : lit l'I/Q continu relayée par le
-# device (5810) → gsm.receiver (FCCH/SCH sync + démod) → BCCH/CCCH decode →
-# GSMTAP → le listener du shunt (4730) → feed_si → a_cd → le mobile (osmocon)
-# campe sur la VRAIE SI décodée par gr-gsm. mmap = fix shmat conteneur.
+# ---------- 3ter. DSP gr-gsm shm (mode full-grgsm) ----------
+# gr-gsm EST le DSP, branché sur le BUFFER SHM (pas UDP/relay) : le BSP publie
+# l'I/Q d'entrée du DSP shunté dans /dev/shm/calypso_dsp_shunt (ring, via
+# feed_iq) ; grgsm_shm_decode.py lit le ring -> demod (theta) + decode BCCH ->
+# ecrit le SI dans la zone sortie -> shunt_poll_si_shm -> feed_si -> a_cd -> le
+# mobile (osmocon) campe sur la VRAIE SI decodee. mmap = fix shmat conteneur.
 if [ "$CALYPSO_MODE" = "full-grgsm" ]; then
     tmux new-window -t "$SESSION" -n grgsm-decode
     tmux send-keys -t "$SESSION:grgsm-decode" \
-        "source /root/.env/bin/activate 2>/dev/null; GR_VMCIRCBUF_DEFAULT_FACTORY=mmap CALYPSO_TRX_OSR=4 python3 /opt/GSM/grgsm_relay_decode.py 2>&1 | $TSLOG | tee /tmp/grgsm_decode.log" C-m
-    echo "[run.sh] full-grgsm : décodeur gr-gsm (I/Q relayée 5810 → GSMTAP 4730 → feed_si) lancé"
+        "source /root/.env/bin/activate 2>/dev/null; GR_VMCIRCBUF_DEFAULT_FACTORY=mmap python3 /opt/GSM/grgsm_shm_decode.py 2>&1 | $TSLOG | tee /tmp/grgsm_decode.log" C-m
+    echo "[run.sh] full-grgsm : DSP gr-gsm shm (ring feed_iq -> demod/decode -> si[] -> a_cd) lance"
 fi
 
 if [ "${CALYPSO_SKIP_L2:-0}" != "1" ]; then

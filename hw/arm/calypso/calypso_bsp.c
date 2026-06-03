@@ -387,6 +387,15 @@ static void bsp_trxd_readable(void *opaque)
                 inet_ntoa(addr.sin_addr), ntohs(addr.sin_port));
     }
 
+    /* "le shunt dsp ne doit pas shunt l'ipc" : shunt actif = le vrai DSP ne
+     * consomme JAMAIS la DARAM (gr-gsm decode via le shm feed_iq). On a deja
+     * draine l'UDP (recvfrom) + publie l'I/Q (feed_iq) + appris le peer UL.
+     * On NE remplit donc PAS la queue DARAM (bsp_enqueue) -> sinon elle sature
+     * (bursts_dropped_queue_full) -> backpressure qui remonte et TUE l'IPC/BTS.
+     * On rend la main : l'IPC continue de couler, le shm est nourri. */
+    if (calypso_dsp_shunt_active())
+        return;
+
     /* TRXDv0 DL: tn(1) fn(4) rssi(1) toa(2) bits(148) = 156 bytes.
      * (Confirmed empirically 2026-05-07 — earlier "asymmetric 6-byte
      * header" hypothesis was wrong : RX header IS 8 bytes like TX.
