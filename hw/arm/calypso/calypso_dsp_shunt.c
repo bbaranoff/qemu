@@ -156,6 +156,8 @@ static inline uint32_t rp_base(uint8_t page_idx) {
     return page_idx ? BASE_API_R_PAGE_1 : BASE_API_R_PAGE_0;
 }
 
+static void shunt_dispatch_pm(uint8_t page_idx);   /* fwd : appelé depuis le latch */
+
 /* ---- LATCH : called on ARM write to NDB+0 (d_dsp_page) ---- */
 static void shunt_latch_task(uint16_t new_d_dsp_page)
 {
@@ -174,6 +176,12 @@ static void shunt_latch_task(uint16_t new_d_dsp_page)
     g_shunt.d_task_ra = shunt_read_w(wp + WP_D_TASK_RA);
     g_shunt.d_fn      = shunt_read_w(wp + WP_D_FN);
     g_shunt.pending   = true;
+
+    /* PM : valeur statique, écrite IMMÉDIATEMENT (pas de service déféré au
+     * prochain frame IRQ). Sinon le firmware lit a_pm AVANT le dispatch déféré
+     * → 0 stale → rxlev=-110. On écrit a_pm sur la page lue tout de suite. */
+    if (g_shunt.d_task_md == PM_DSP_TASK)
+        shunt_dispatch_pm(page_idx);
 
     fprintf(stderr,
         "[dsp-shunt] LATCH page=%u task_md=%u task_d=%u task_ra=%u fn=%u\n",
