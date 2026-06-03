@@ -1121,7 +1121,10 @@ case "$CALYPSO_MODE" in
         : "${CALYPSO_SKIP_BRIDGE_PY:=1}"
         ;;
     full-grgsm)
-        # qemu (Calypso) GARDÉ. gr-gsm en plus pour la radio/décode.
+        # qemu (Calypso) GARDÉ (firmware chargé par osmocon + lien série CP210x),
+        # mais la RADIO du mobile passe par gr-gsm : device en RELAIS I/Q continu
+        # → grgsm_trx → trxcon → mobile. La BSP de qemu est donc starvée (normal :
+        # le mobile n'utilise pas la L1 de qemu mais celle de trxcon).
         : "${CALYPSO_DSP_SHUNT:=0}"
         : "${CALYPSO_SKIP_IPC_DEVICE:=0}"
         : "${CALYPSO_SKIP_TRX_IPC:=0}"
@@ -1129,6 +1132,8 @@ case "$CALYPSO_MODE" in
         : "${CALYPSO_SKIP_L2:=0}"
         : "${CALYPSO_SKIP_GSMTAP:=0}"
         : "${CALYPSO_SKIP_BRIDGE_PY:=1}"
+        : "${CALYPSO_IPC_RELAY:=1}"        # device relaie l'I/Q vers grgsm_trx
+        export CALYPSO_IPC_RELAY
         ;;
     shunt)
         : "${CALYPSO_DSP_SHUNT:=1}"
@@ -1920,6 +1925,23 @@ CALYPSO_MOBILE_DEBUG="${CALYPSO_MOBILE_DEBUG:-DCS:DNB:DPLMN:DRR:DMM:DSIM:DCC:DMN
 # Note : separateur = `:` pour osmocom-bb mobile (pas `,`).
 if [ "$CALYPSO_MOBILE_DEBUG" = "all" ]; then
     CALYPSO_MOBILE_DEBUG="DCS:DNB:DPLMN:DRR:DMM:DSIM:DCC:DMNCC:DSS:DLSMS:DPAG:DSUM:DSAP:DGPS:DMOB:DPRIM:DLUA:DGAPK"
+fi
+
+# ---------- 3ter. grgsm_trx + trxcon (mode full-grgsm) ----------
+# La radio gr-gsm (grgsm_trx --driver udp) reçoit l'I/Q du BTS relayée par
+# le device (5810), et trxcon en fait la L1 du mobile (L1CTL /tmp/osmocon_l2_1).
+if [ "$CALYPSO_MODE" = "full-grgsm" ]; then
+    tmux new-window -t "$SESSION" -n grgsm-trx
+    tmux send-keys -t "$SESSION:grgsm-trx" \
+        "source /root/.env/bin/activate 2>/dev/null; CALYPSO_TRX_OSR=1 python3 /opt/GSM/gr-gsm/apps/grgsm_trx --driver udp -s 270833 -p 6700 2>&1 | $TSLOG | tee /tmp/grgsm_trx.log" C-m
+    echo "[run.sh] full-grgsm : grgsm_trx (--driver udp, RX 5810 / TX 5811, TRX @6700) lancé"
+    sleep 2
+    tmux new-window -t "$SESSION" -n trxcon
+    tmux send-keys -t "$SESSION:trxcon" \
+        "trxcon -i 127.0.0.1 -p 6700 -s /tmp/osmocon_l2_1 2>&1 | $TSLOG | tee /tmp/trxcon.log" C-m
+    echo -n "Waiting for trxcon L1CTL (/tmp/osmocon_l2_1)..."
+    for i in $(seq 1 20); do [ -S /tmp/osmocon_l2_1 ] && break; sleep 0.3; echo -n "."; done
+    if [ -S /tmp/osmocon_l2_1 ]; then echo " OK"; else echo " WARN -- trxcon L1CTL absent"; fi
 fi
 
 if [ "${CALYPSO_SKIP_L2:-0}" != "1" ]; then
