@@ -473,10 +473,10 @@ if [ "$MENU_MODE" = "1" ]; then
         _PRE_DOC=ON;    _PRE_MTTCG=OFF
         ;;
       full-grgsm)
-        # Pas de DSP : mobile = trxcon + gr-gsm. IPC + osmo-trx pour le BTS,
-        # device en mode relais I/Q continu. Pas de L2 qemu (mobile via trxcon).
+        # qemu gardé (fw+CP210x). Mobile = trxcon + gr-gsm (radio). L2 ON
+        # (le mobile tourne, mais sa L1CTL vient de trxcon, pas d'osmocon).
         _PRE_SHUNT=OFF; _PRE_IPC=ON;  _PRE_TRX=ON;  _PRE_BRIDGE=OFF
-        _PRE_BTS=ON;    _PRE_L2=OFF;  _PRE_GSMTAP=OFF; _PRE_IRDA=OFF
+        _PRE_BTS=ON;    _PRE_L2=ON;   _PRE_GSMTAP=OFF; _PRE_IRDA=OFF
         _PRE_DOC=OFF;   _PRE_MTTCG=OFF
         ;;
       shunt)
@@ -1031,7 +1031,10 @@ if [ -f "$MOBILE_CFG_VERSIONED" ] && [ "${CALYPSO_SYNC_MOBILE_CFG:-1}" = "1" ]; 
     # full-grgsm : le mobile parle à la L1CTL de TRXCON, pas d'osmocon.
     # Redirige layer2-socket vers /tmp/osmocon_l2_1 (sans toucher le cfg de base).
     if [ "$CALYPSO_MODE" = "full-grgsm" ]; then
-        sed -i 's|^ *layer2-socket .*| layer2-socket /tmp/osmocon_l2_1|' "$MOBILE_CFG"
+        # cat > (truncate en place, PAS de rename) : le cfg est bind/busy, sed -i échoue.
+        sed 's|^ *layer2-socket .*| layer2-socket /tmp/osmocon_l2_1|' "$MOBILE_CFG" \
+            > /tmp/_mobcfg_grgsm.tmp && cat /tmp/_mobcfg_grgsm.tmp > "$MOBILE_CFG"
+        rm -f /tmp/_mobcfg_grgsm.tmp
         echo "[run.sh] full-grgsm : mobile layer2-socket → /tmp/osmocon_l2_1 (trxcon)"
     fi
 fi
