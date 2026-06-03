@@ -1936,12 +1936,12 @@ fi
 if [ "$CALYPSO_MODE" = "full-grgsm" ]; then
     tmux new-window -t "$SESSION" -n grgsm-trx
     tmux send-keys -t "$SESSION:grgsm-trx" \
-        "source /root/.env/bin/activate 2>/dev/null; CALYPSO_TRX_OSR=1 python3 /opt/GSM/gr-gsm/apps/grgsm_trx --driver udp -s 270833 -p 6700 2>&1 | $TSLOG | tee /tmp/grgsm_trx.log" C-m
+        "source /root/.env/bin/activate 2>/dev/null; CALYPSO_TRX_OSR=1 python3 /opt/GSM/gr-gsm/apps/grgsm_trx --driver udp -s 270833 -p 6800 2>&1 | $TSLOG | tee /tmp/grgsm_trx.log" C-m
     echo "[run.sh] full-grgsm : grgsm_trx (--driver udp, RX 5810 / TX 5811, TRX @6700) lancé"
     sleep 2
     tmux new-window -t "$SESSION" -n trxcon
     tmux send-keys -t "$SESSION:trxcon" \
-        "trxcon -i 127.0.0.1 -p 6700 -s /tmp/osmocon_l2_1 2>&1 | $TSLOG | tee /tmp/trxcon.log" C-m
+        "trxcon -i 127.0.0.1 -p 6800 -s /tmp/osmocon_l2_1 2>&1 | $TSLOG | tee /tmp/trxcon.log" C-m
     echo -n "Waiting for trxcon L1CTL (/tmp/osmocon_l2_1)..."
     for i in $(seq 1 20); do [ -S /tmp/osmocon_l2_1 ] && break; sleep 0.3; echo -n "."; done
     if [ -S /tmp/osmocon_l2_1 ]; then echo " OK"; else echo " WARN -- trxcon L1CTL absent"; fi
