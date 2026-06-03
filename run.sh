@@ -1028,6 +1028,12 @@ if [ -f "$MOBILE_CFG_VERSIONED" ] && [ "${CALYPSO_SYNC_MOBILE_CFG:-1}" = "1" ]; 
     mkdir -p "$(dirname "$MOBILE_CFG")"
     cp "$MOBILE_CFG_VERSIONED" "$MOBILE_CFG"
     echo "[run.sh] mobile_group1.cfg synced from $MOBILE_CFG_VERSIONED"
+    # full-grgsm : le mobile parle à la L1CTL de TRXCON, pas d'osmocon.
+    # Redirige layer2-socket vers /tmp/osmocon_l2_1 (sans toucher le cfg de base).
+    if [ "$CALYPSO_MODE" = "full-grgsm" ]; then
+        sed -i 's|^ *layer2-socket .*| layer2-socket /tmp/osmocon_l2_1|' "$MOBILE_CFG"
+        echo "[run.sh] full-grgsm : mobile layer2-socket → /tmp/osmocon_l2_1 (trxcon)"
+    fi
 fi
 
 # Override stick ARFCN si CALYPSO_STICK_ARFCN set (default = garde cfg versionnee).
