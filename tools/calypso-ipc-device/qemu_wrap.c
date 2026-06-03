@@ -495,9 +495,7 @@ double uhdwrap_set_txatt(void *dev, double a, size_t chan)
  * L'alignement FN fin se règle quand le mobile TX réellement (post-camp).
  * ============================================================================ */
 #include <math.h>
-#define UL_PORT          5702
 #define UL_TRXD_HDR      8
-static int  g_ul_fd   = -1;            /* socket UDP UL (bind 5702) */
 static int  g_ul_on   = -1;            /* CALYPSO_IPC_UL */
 static int16_t g_ul_iq[CALYPSO_BSP_BURSTLEN * 2];   /* dernier burst modulé */
 static volatile int g_ul_pending = 0;  /* 1 = un burst à injecter */
@@ -514,15 +512,16 @@ static void ul_gmsk_mod(const int8_t *bits, int16_t *iq)
     }
 }
 
-/* Draine la socket UL (non-bloquant), module le dernier burst dispo. */
+/* Draine l'UL sur g_bsp_fd (le BSP renvoie l'UL à la source du DL = nous,
+ * cf. calypso_bsp.c:381), module le dernier burst dispo. Non-bloquant. */
 static void ul_drain(void)
 {
-    if (g_ul_fd < 0) return;
+    if (g_bsp_fd < 0) return;
     uint8_t pkt[UL_TRXD_HDR + CALYPSO_BSP_BURSTLEN + 16];
     int got = 0;
     for (;;) {
-        ssize_t n = recvfrom(g_ul_fd, pkt, sizeof(pkt), MSG_DONTWAIT, NULL, NULL);
-        if (n < UL_TRXD_HDR + CALYPSO_BSP_BURSTLEN) break;
+        ssize_t n = recvfrom(g_bsp_fd, pkt, sizeof(pkt), MSG_DONTWAIT, NULL, NULL);
+        if (n < (ssize_t)(UL_TRXD_HDR + CALYPSO_BSP_BURSTLEN)) break;
         ul_gmsk_mod((const int8_t *)(pkt + UL_TRXD_HDR), g_ul_iq);
         got = 1;
     }
@@ -543,26 +542,14 @@ int32_t uhdwrap_read(void *dev, uint32_t num_chans)
         zeros_init = true;
     }
 
-    /* UL (IPC TX) init : bind 5702 pour recevoir les bursts UL du BSP. */
+    /* UL (IPC TX) init : pas de bind — l'UL arrive sur g_bsp_fd (le BSP renvoie
+     * l'UL à la source du DL). On se contente du flag + drain. */
     if (g_ul_on < 0) {
         const char *e = getenv("CALYPSO_IPC_UL");
         g_ul_on = (e && *e == '1') ? 1 : 0;
-        if (g_ul_on) {
-            g_ul_fd = socket(AF_INET, SOCK_DGRAM, 0);
-            int one = 1;
-            setsockopt(g_ul_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-            struct sockaddr_in a; memset(&a, 0, sizeof(a));
-            a.sin_family = AF_INET; a.sin_port = htons(UL_PORT);
-            a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-            if (bind(g_ul_fd, (struct sockaddr *)&a, sizeof(a)) < 0) {
-                LOGP(DDEV, LOGL_ERROR, "UL bind(:%d) failed — UL off\n", UL_PORT);
-                close(g_ul_fd); g_ul_fd = -1; g_ul_on = 0;
-            } else {
-                LOGP(DDEV, LOGL_NOTICE,
-                     "UL (IPC TX) ON : bind :%d → mod GMSK → ios_rx_from_device\n",
-                     UL_PORT);
-            }
-        }
+        if (g_ul_on)
+            LOGP(DDEV, LOGL_NOTICE,
+                 "UL (IPC TX) ON : g_bsp_fd → mod GMSK → ios_rx_from_device\n");
     }
     if (g_ul_on) ul_drain();
 
@@ -597,8 +584,16 @@ int32_t uhdwrap_read(void *dev, uint32_t num_chans)
      * → les deux pacing restent alignés tant que le host kernel est
      * stable (= toujours, sauf charge extrême). */
     static struct timespec next_deadline = { .tv_sec = 0, .tv_nsec = 0 };
-    /* 625 samples / 270833 sps = 2307.692 µs exact = 2307692 ns. */
-    static const long PERIOD_NS = 2307692L;
+    /* 625 samples / 270833 sps = 2307.692 µs exact = 2307692 ns (= WALL_TDMA_NS/2,
+     * le heartbeat est une demi-frame). Configurable via CALYPSO_TDMA_NS (la
+     * MÊME var que le clk_master QEMU) pour ralentir la timeline uniformément
+     * si l'émulation ne tient pas le temps réel → cohérence osmo-trx ↔ QEMU. */
+    static long PERIOD_NS = 0;
+    if (PERIOD_NS == 0) {
+        PERIOD_NS = 2307692L;
+        const char *e = getenv("CALYPSO_TDMA_NS");
+        if (e && *e) { long long v = atoll(e); if (v >= 4615384LL) PERIOD_NS = (long)(v / 2); }
+    }
 
     if (next_deadline.tv_sec == 0) {
         clock_gettime(CLOCK_MONOTONIC, &next_deadline);
