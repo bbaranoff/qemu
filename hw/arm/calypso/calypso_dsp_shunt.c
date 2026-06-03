@@ -103,6 +103,7 @@
 #define B_GSM_TASK          (1 << 1)
 #define B_SCH_CRC           8
 
+#define PM_DSP_TASK         1     /* power measurement (l1s pm_cmd) — lit a_pm */
 #define FB_DSP_TASK         5
 #define SB_DSP_TASK         6
 #define ALLC_DSP_TASK       24
@@ -367,6 +368,30 @@ static void shunt_dispatch_allc(uint8_t page_idx)
         "a_serv_demod canned\n", page_idx, g_shunt.d_burst_d);
 }
 
+/* ---- DISPATCH PM : tâche power-measurement (md=1). Écrit a_pm[3] @ +0x18,
+ * que le power scan (l1s pm_cmd) lit pour dériver le rxlev. Sans ça a_pm=0 →
+ * rxlev=-110 (plancher) → la cellule est rejetée AVANT même la sync, quel que
+ * soit le SI. Valeur réglable via CALYPSO_SHUNT_PM (défaut SHUNT_CANNED_PM,
+ * haut → rxlev fort). C'est le pendant "scan" du PM canné FB/SB. ---- */
+static void shunt_dispatch_pm(uint8_t page_idx)
+{
+    uint32_t rp = rp_base(page_idx);
+    static int pm_val = -1;
+    if (pm_val < 0) {
+        const char *e = getenv("CALYPSO_SHUNT_PM");
+        pm_val = (e && *e) ? (int)strtol(e, NULL, 0) : SHUNT_CANNED_PM;
+    }
+    shunt_write_w(rp + RP_A_PM + 0 * 2, (uint16_t)pm_val);
+    shunt_write_w(rp + RP_A_PM + 1 * 2, (uint16_t)pm_val);
+    shunt_write_w(rp + RP_A_PM + 2 * 2, (uint16_t)pm_val);
+    shunt_write_w(rp + RP_D_TASK_MD, PM_DSP_TASK);
+    static unsigned pm_log = 0;
+    if (pm_log++ < 5)
+        fprintf(stderr,
+                "[dsp-shunt] DISPATCH PM page=%u → a_pm[0..2]=0x%04x (rxlev)\n",
+                page_idx, (uint16_t)pm_val);
+}
+
 static void shunt_dispatch_nb(uint8_t page_idx, uint16_t task_d)
 {
     /* TODO : NB DL = decoded BCCH/CCCH burst payload into NDB a_cd[].
@@ -390,7 +415,9 @@ void calypso_dsp_shunt_on_frame_tick(void)
 
     /* Priority order: md tasks (FB/SB) > NB DL > NB UL > ALLC.
      * Refine when canned policies land. */
-    if (md == FB_DSP_TASK) {
+    if (md == PM_DSP_TASK) {
+        shunt_dispatch_pm(page);
+    } else if (md == FB_DSP_TASK) {
         shunt_dispatch_fb(page);
     } else if (md == SB_DSP_TASK) {
         shunt_dispatch_sb(page);
