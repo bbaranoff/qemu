@@ -26,7 +26,7 @@ OUT="${OUT:-/tmp/diag_all.txt}"
 SESS=calypso
 QEMU_BIN=qemu-system-arm
 FW_ELF="${FW_ELF:-/opt/GSM/firmware/board/compal_e88/layer1.highram.elf}"
-MODES="${MODES:-shunt-ipc}"                  # défaut SANS HACK : BTS réel + bridge gr-gsm démod → vrai SI → a_cd
+MODES="${MODES:-full}"                       # défaut NORMAL sans hack : vrai DSP c54x + I/Q réel (passthrough=1)
 REGMODES="${REGMODES:-c54x}"                 # n/a en shunt (c54x bypassé) ; c54x utile en MODES=full
 IDLEMODES="${IDLEMODES:-1}"                  # set "1 0" to compare governor on/off
 L2CLIENTS="${L2CLIENTS:-mobile}"             # seul client qui drive un FBSB ciblé 514

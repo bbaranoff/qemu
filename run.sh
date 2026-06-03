@@ -1078,12 +1078,14 @@ IPC_MSOCK_PATH="${IPC_MSOCK_PATH:-/tmp/ipc_sock0}"
 #
 #   bare       -- QEMU + osmocon seulement. Pour debug fw isole, gdb,
 #                tests qui n'ont pas besoin du L2/L3.
-# Défaut = shunt-ipc : le meilleur chemin SANS HACK. Le DSP c54x (FB/SB) reste
-# shunté (il est cassé), mais la chaîne radio BTS tourne et émet l'I/Q RÉELLE ;
-# le bridge gr-gsm la démodule/décode → vrai SI → a_cd → le mobile campe. Le SI
-# canned est désactivé (CALYPSO_SHUNT_NO_CANNED=1) → seul le SI démodulé compte.
-# Pour l'ancien chemin c54x complet : CALYPSO_MODE=full ./run.sh
-CALYPSO_MODE="${CALYPSO_MODE:-shunt-ipc}"
+# Défaut = full : le chemin NORMAL, ZÉRO HACK. Le vrai DSP c54x reçoit l'I/Q
+# RÉELLE (BSP_IQ_PASSTHROUGH=1) et fait FB/SB/BCCH lui-même → vrais SI → a_cd →
+# le mobile campe pour de vrai. Aucun shunt, aucun bridge, aucune injection.
+# Chemins de debug opt-in : CALYPSO_MODE=shunt-ipc (bridge gr-gsm, démod externe),
+# CALYPSO_MODE=shunt (FB/SB cannés). À n'utiliser que pour diag, pas par défaut.
+CALYPSO_MODE="${CALYPSO_MODE:-full}"
+# icount OFF par défaut (wall-clock) : plus rapide/fluide pour le full mode DSP.
+: "${CALYPSO_ICOUNT:=off}"; export CALYPSO_ICOUNT
 case "$CALYPSO_MODE" in
     full|shunt|shunt-ipc|bridge|bare|free) ;;
     *) echo "[run.sh] ERR : CALYPSO_MODE=$CALYPSO_MODE inconnu (full|shunt|shunt-ipc|bridge|bare|free)" >&2; exit 1 ;;
@@ -1226,6 +1228,13 @@ export CALYPSO_SKIP_IPC_DEVICE CALYPSO_SKIP_TRX_IPC CALYPSO_SKIP_BTS \
 # ---- DSP / DIAG instruments (override at command line if needed) ----
 # CALYPSO_DSP_ROM (legacy single-txt) supprime — utilise CALYPSO_DSP_ROM_TXT
 # pour la source .txt auto-splitee en per-section bins (cf L1422+).
+# Défaut 0x2a00 : adresse CORRECTE du buffer DMA I/Q du BSP, confirmée par
+#   - le canary 0xCAFE E2E (DSP READS 0x2a00..0x2a13 via PC=0x93a5),
+#   - le IQ-READ tracer calypso_c54x.c:1596 ([0x2a00..0x2b27] = buffer DMA).
+# NB : 0x2bc0..0x2bff = coefficients corrélateur (PAS l'I/Q) ; 0x80..0x3A3 =
+# pattern de réf FB (AR3 sweep). Le blocage FB-det (fb0_att=0) n'est PAS une
+# question d'adresse mais un bug DSP (timing/coeffs/fenêtre compute, cf.
+# instrumentation 2026-05-14 calypso_c54x.c:147).
 CALYPSO_BSP_DARAM_ADDR="${CALYPSO_BSP_DARAM_ADDR:-0x2a00}"
 CALYPSO_SIM_CFG="${CALYPSO_SIM_CFG:-$MOBILE_CFG}"
 # tdma_timer = REALTIME by default (revert 2026-05-29 v2).
