@@ -366,6 +366,16 @@ static void bsp_trxd_readable(void *opaque)
         if (tee_fd >= 0)
             sendto(tee_fd, buf, n, MSG_DONTWAIT,
                    (struct sockaddr *)&tee_dst, sizeof(tee_dst));
+
+        /* Buffer shm (pas UDP) : publie l'I/Q d'entree du DSP shunte pour
+         * gr-gsm. buf[8..] = int16 I/Q entrelaces (cs16, mode passthrough),
+         * comme le tee. gr-gsm lit ce buffer cote shm. */
+        if (n > 8) {
+            uint32_t _fn = ((uint32_t)buf[1] << 24) | ((uint32_t)buf[2] << 16) |
+                           ((uint32_t)buf[3] << 8)  |  (uint32_t)buf[4];
+            calypso_dsp_shunt_feed_iq(_fn, (const int16_t *)(buf + 8),
+                                      (int)((n - 8) / 2));
+        }
     }
 
     /* Diag : log first 10 recv sizes pour vérifier que bridge envoie bien
