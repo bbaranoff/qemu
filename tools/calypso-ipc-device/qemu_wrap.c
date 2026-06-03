@@ -528,6 +528,47 @@ static void ul_drain(void)
     if (got) g_ul_pending = 1;
 }
 
+/* === RELAIS I/Q CONTINU (mode full-grgsm) ===
+ * CALYPSO_IPC_RELAY=1 : au lieu d'extraire un burst TS0 → TRXDv0 → BSP Calypso,
+ * on RELAIE l'I/Q CONTINU (fc32) entre osmo-trx et le transceiver gr-gsm du
+ * mobile (radio_if_udp). DL : chunk osmo-trx (cs16) → fc32 → UDP RX_PORT.
+ * UL : UDP TX_PORT (fc32) → cs16 → ios_rx_from_device → osmo-trx.
+ * Plus de DSP Calypso → plus de congestion. */
+static int  g_relay_on    = -1;
+static int  g_relay_dl_fd = -1;   /* send DL fc32 → radio_if_udp RX (5810) */
+static struct sockaddr_in g_relay_dl_dst;
+static int  g_relay_ul_fd = -1;   /* recv UL fc32 ← radio_if_udp TX (5811) */
+static float g_relay_fbuf[CALYPSO_SHM_BUFSIZE * 2];
+
+static void relay_init(void)
+{
+    if (g_relay_on >= 0) return;
+    const char *e = getenv("CALYPSO_IPC_RELAY");
+    g_relay_on = (e && *e == '1') ? 1 : 0;
+    if (!g_relay_on) return;
+    const char *host = getenv("CALYPSO_TRX_IQ_HOST");
+    if (!host || !*host) host = "127.0.0.1";
+    const char *rxp = getenv("CALYPSO_TRX_IQ_RX_PORT");
+    const char *txp = getenv("CALYPSO_TRX_IQ_TX_PORT");
+    int rx_port = (rxp && *rxp) ? atoi(rxp) : 5810;
+    int tx_port = (txp && *txp) ? atoi(txp) : 5811;
+    g_relay_dl_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    memset(&g_relay_dl_dst, 0, sizeof(g_relay_dl_dst));
+    g_relay_dl_dst.sin_family = AF_INET;
+    g_relay_dl_dst.sin_port   = htons(rx_port);
+    g_relay_dl_dst.sin_addr.s_addr = inet_addr(host);
+    g_relay_ul_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    int one = 1; setsockopt(g_relay_ul_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    struct sockaddr_in a; memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET; a.sin_port = htons(tx_port);
+    a.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (bind(g_relay_ul_fd, (struct sockaddr *)&a, sizeof(a)) < 0)
+        LOGP(DDEV, LOGL_ERROR, "RELAY UL bind(:%d) failed\n", tx_port);
+    LOGP(DDEV, LOGL_NOTICE,
+         "IPC RELAY ON : DL fc32 → %s:%d, UL fc32 ← :%d (full-grgsm)\n",
+         host, rx_port, tx_port);
+}
+
 /* ---- RX (uplink_thread loop) : produces UL heartbeat zeros to osmo-trx ---- */
 
 int32_t uhdwrap_read(void *dev, uint32_t num_chans)
@@ -605,6 +646,26 @@ int32_t uhdwrap_read(void *dev, uint32_t num_chans)
     }
     clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_deadline, NULL);
 
+    /* RELAIS UL : I/Q fc32 du transceiver gr-gsm → cs16 → osmo-trx. Si rien
+     * ce tick, zéros (le clock doit avancer). Buffer local (thread DL séparé). */
+    relay_init();
+    int16_t relay_ul[CALYPSO_SHM_BUFSIZE * 2];
+    if (g_relay_on && g_relay_ul_fd >= 0) {
+        float ulf[CALYPSO_SHM_BUFSIZE * 2];
+        ssize_t n = recvfrom(g_relay_ul_fd, ulf, sizeof(ulf), MSG_DONTWAIT, NULL, NULL);
+        memset(relay_ul, 0, sizeof(relay_ul));
+        if (n > 0) {
+            int ns = (int)(n / (2 * sizeof(float)));
+            if (ns > CALYPSO_SHM_BUFSIZE) ns = CALYPSO_SHM_BUFSIZE;
+            for (int i = 0; i < ns * 2; i++) {
+                float v = ulf[i] * 32768.0f;
+                if (v > 32767.0f) v = 32767.0f; else if (v < -32768.0f) v = -32768.0f;
+                relay_ul[i] = (int16_t)v;
+            }
+        }
+        ul_src = relay_ul;
+    }
+
     for (uint32_t c = 0; c < num_chans && c < 8; c++) {
         if (!ios_rx_from_device[c]) continue;
         int32_t rc = ipc_shm_enqueue(ios_rx_from_device[c],
@@ -656,6 +717,21 @@ int32_t uhdwrap_write(void *dev, uint32_t num_chans, bool *underrun)
             continue;
         }
         any = true;
+
+        /* RELAIS : I/Q continu (TOUS les samples du chunk, tous TS) → fc32 →
+         * UDP vers le transceiver gr-gsm. gsm.receiver trouve lui-même le bon
+         * timeslot/timing. On NE fait PAS l'extraction per-burst TRXDv0. */
+        relay_init();
+        if (g_relay_on) {
+            int ns = (rv < DL_READ_SAMPLES) ? rv : DL_READ_SAMPLES;
+            for (int i = 0; i < ns * 2; i++)
+                g_relay_fbuf[i] = (float)((int16_t)dl_read_buf[i]) / 32768.0f;
+            if (g_relay_dl_fd >= 0)
+                sendto(g_relay_dl_fd, g_relay_fbuf, (size_t)ns * 2 * sizeof(float),
+                       MSG_DONTWAIT, (struct sockaddr *)&g_relay_dl_dst,
+                       sizeof(g_relay_dl_dst));
+            continue;   /* relais pur : pas de TRXDv0/BSP */
+        }
 
         /* TS=0 slice : SAMPLES_PER_FRAME=1250 at 1 SPS = 8 × 156.25.
          * osmo-trx commits half-frames (625 samples) → chunks pair at
