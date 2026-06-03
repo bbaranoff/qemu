@@ -454,12 +454,13 @@ if [ "$MENU_MODE" = "1" ]; then
  Fine override: env vars CALYPSO_SKIP_*, CALYPSO_DSP_SHUNT, ...\
 " \
       20 84 7 \
-      "full"      "Full radio pipeline (default legacy)" \
-      "shunt"     "DSP shunt canned -- bissection FBSB" \
-      "shunt-ipc" "DSP shunt + radio chain" \
-      "bridge"    "Legacy bridge.py Python" \
-      "bare"      "QEMU + osmocon only" \
-      "free"      "Free mode -- pick everything yourself" \
+      "full"       "Full radio pipeline (default legacy)" \
+      "full-grgsm" "gr-gsm transceiver (mobile) -- IPC pour BTS seul, NO DSP" \
+      "shunt"      "DSP shunt canned -- bissection FBSB" \
+      "shunt-ipc"  "DSP shunt + radio chain" \
+      "bridge"     "Legacy bridge.py Python" \
+      "bare"       "QEMU + osmocon only" \
+      "free"       "Free mode -- pick everything yourself" \
       3>&1 1>&2 2>&3) || _cancel
     export CALYPSO_MODE
 
@@ -470,6 +471,13 @@ if [ "$MENU_MODE" = "1" ]; then
         _PRE_SHUNT=OFF; _PRE_IPC=ON;  _PRE_TRX=ON;  _PRE_BRIDGE=OFF
         _PRE_BTS=ON;    _PRE_L2=ON;   _PRE_GSMTAP=ON; _PRE_IRDA=ON
         _PRE_DOC=ON;    _PRE_MTTCG=OFF
+        ;;
+      full-grgsm)
+        # Pas de DSP : mobile = trxcon + gr-gsm. IPC + osmo-trx pour le BTS,
+        # device en mode relais I/Q continu. Pas de L2 qemu (mobile via trxcon).
+        _PRE_SHUNT=OFF; _PRE_IPC=ON;  _PRE_TRX=ON;  _PRE_BRIDGE=OFF
+        _PRE_BTS=ON;    _PRE_L2=OFF;  _PRE_GSMTAP=OFF; _PRE_IRDA=OFF
+        _PRE_DOC=OFF;   _PRE_MTTCG=OFF
         ;;
       shunt)
         _PRE_SHUNT=ON;  _PRE_IPC=OFF; _PRE_TRX=OFF; _PRE_BRIDGE=OFF
@@ -1090,14 +1098,24 @@ CALYPSO_MODE="${CALYPSO_MODE:-full}"
 # (BSP→5702) en GMSK et les injecte vers osmo-trx→BTS (sinon UL = zéros).
 : "${CALYPSO_IPC_UL:=1}"; export CALYPSO_IPC_UL
 case "$CALYPSO_MODE" in
-    full|shunt|shunt-ipc|bridge|bare|free) ;;
-    *) echo "[run.sh] ERR : CALYPSO_MODE=$CALYPSO_MODE inconnu (full|shunt|shunt-ipc|bridge|bare|free)" >&2; exit 1 ;;
+    full|full-grgsm|shunt|shunt-ipc|bridge|bare|free) ;;
+    *) echo "[run.sh] ERR : CALYPSO_MODE=$CALYPSO_MODE inconnu (full|full-grgsm|shunt|shunt-ipc|bridge|bare|free)" >&2; exit 1 ;;
 esac
 
 # Defaults derives du preset. Chaque var peut etre overridee explicitement
 # par l'env avant l'invocation (l'override gagne sur le preset).
 case "$CALYPSO_MODE" in
     full)
+        : "${CALYPSO_DSP_SHUNT:=0}"
+        : "${CALYPSO_SKIP_IPC_DEVICE:=0}"
+        : "${CALYPSO_SKIP_TRX_IPC:=0}"
+        : "${CALYPSO_SKIP_BTS:=0}"
+        : "${CALYPSO_SKIP_L2:=0}"
+        : "${CALYPSO_SKIP_GSMTAP:=0}"
+        : "${CALYPSO_SKIP_BRIDGE_PY:=1}"
+        ;;
+    full-grgsm)
+        # qemu (Calypso) GARDÉ. gr-gsm en plus pour la radio/décode.
         : "${CALYPSO_DSP_SHUNT:=0}"
         : "${CALYPSO_SKIP_IPC_DEVICE:=0}"
         : "${CALYPSO_SKIP_TRX_IPC:=0}"
@@ -1682,6 +1700,19 @@ if [ -z "$PTY_MODEM" ]; then
 fi
 echo " OK ($PTY_MODEM, QEMU_PID=$QEMU_PID)"
 
+# ---------- 1ter. CP210x tee (mode full-grgsm) ----------
+# Tee bidirectionnel du lien série CP210x (PTY série0 qemu) → osmocon + trxcon.
+# osmocon prend /tmp/cp210x_osmocon ; trxcon prend /tmp/cp210x_trxcon.
+OSMOCON_SERIAL="$PTY_MODEM"
+if [ "$CALYPSO_MODE" = "full-grgsm" ] && [ -n "$PTY_MODEM" ]; then
+    tmux new-window -t "$SESSION" -n cp210x-tee
+    tmux send-keys -t "$SESSION:cp210x-tee" \
+        "python3 /opt/GSM/cp210x_tee.py $PTY_MODEM 2>&1 | $TSLOG" C-m
+    echo -n "Waiting for CP210x tee (/tmp/cp210x_osmocon)..."
+    for i in $(seq 1 20); do [ -e /tmp/cp210x_osmocon ] && break; sleep 0.3; echo -n "."; done
+    if [ -e /tmp/cp210x_osmocon ]; then echo " OK"; OSMOCON_SERIAL="/tmp/cp210x_osmocon"; else echo " WARN -- tee absent"; fi
+fi
+
 # ---------- 1bis. IrDA capture (UART_IRDA = serial1, IRQ 18, 0xFFFF5000) ----------
 # Phase 3 du plan PLAN_CLAUDE_CODE_20260516_IRDA_DEBUG_CHANNEL.md :
 # le firmware compal_e88 fait deja `cons_bind_uart(UART_IRDA)` (init.c:105),
@@ -1737,7 +1768,7 @@ fi
 # ---------- 2. osmocon ----------
 tmux new-window -t "$SESSION" -n osmocon
 tmux send-keys -t "$SESSION:osmocon" \
-    ": > $OSMOCON_LOG && stdbuf -oL -eL $OSMOCON -m romload -i 100 -p $PTY_MODEM -s $L1CTL_SOCK $FW_BIN -d tr 2>&1 | $TSLOG | tee $OSMOCON_LOG" C-m
+    ": > $OSMOCON_LOG && stdbuf -oL -eL $OSMOCON -m romload -i 100 -p $OSMOCON_SERIAL -s $L1CTL_SOCK $FW_BIN -d tr 2>&1 | $TSLOG | tee $OSMOCON_LOG" C-m
 
 echo -n "Waiting for osmocon to expose $L1CTL_SOCK..."
 for i in $(seq 1 30); do
