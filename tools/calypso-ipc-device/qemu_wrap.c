@@ -515,18 +515,30 @@ double uhdwrap_set_txatt(void *dev, double a, size_t chan)
 #include <math.h>
 #define UL_TRXD_HDR      8
 static int  g_ul_on   = -1;            /* CALYPSO_IPC_UL */
-static int16_t g_ul_iq[CALYPSO_BSP_BURSTLEN * 2];   /* dernier burst modulé */
+/* FIX OSR 2026-06-04 : osmo-trx tourne a CALYPSO_TRX_OSR=4 SPS. Le modulateur
+ * DOIT produire 148 symboles * OSR samples (= 592 @ 4 SPS), sinon les 148
+ * samples 1-SPS sont lus comme ~37 symboles de charabia -> aucune correlation
+ * d'access-burst cote osmo-trx -> NOPE -> RACH jamais detectee. */
+static int16_t g_ul_iq[CALYPSO_BSP_BURSTLEN * CALYPSO_TRX_OSR * 2];   /* dernier burst modulé @ OSR */
 static volatile int g_ul_pending = 0;  /* 1 = un burst à injecter */
 
-/* GMSK/MSK mod : 148 soft-bits (±127) → 148 cs16 I/Q. Phase ±π/2 par bit
- * (convention osmo-trx : bit 1 → +π/2). Amplitude ~0.6 full-scale. */
+/* MSK phase-continue a OSR samples/symbole : 148 soft-bits (±127) -> 148*OSR
+ * cs16 I/Q. Increment de phase ±(π/2)/OSR par SAMPLE (convention osmo-trx :
+ * bit 1 → +π/2 par symbole). Amplitude ~0.6 full-scale (override CALYPSO_UL_AMP). */
 static void ul_gmsk_mod(const int8_t *bits, int16_t *iq)
 {
+    static double AMP = -1.0;
+    if (AMP < 0.0) { const char *e = getenv("CALYPSO_UL_AMP"); AMP = (e && *e) ? atof(e) : 20000.0; }
     double ph = 0.0;
+    int idx = 0;
     for (int i = 0; i < CALYPSO_BSP_BURSTLEN; i++) {
-        iq[2 * i]     = (int16_t)(cos(ph) * 20000.0);
-        iq[2 * i + 1] = (int16_t)(sin(ph) * 20000.0);
-        ph += ((bits[i] > 0) ? 1.0 : -1.0) * (M_PI / 2.0);
+        double step = ((bits[i] > 0) ? 1.0 : -1.0) * (M_PI / 2.0) / (double)CALYPSO_TRX_OSR;
+        for (int s = 0; s < CALYPSO_TRX_OSR; s++) {
+            iq[2 * idx]     = (int16_t)(cos(ph) * AMP);
+            iq[2 * idx + 1] = (int16_t)(sin(ph) * AMP);
+            ph += step;
+            idx++;
+        }
     }
 }
 
@@ -540,8 +552,26 @@ static void ul_drain(void)
     for (;;) {
         ssize_t n = recvfrom(g_bsp_fd, pkt, sizeof(pkt), MSG_DONTWAIT, NULL, NULL);
         if (n < (ssize_t)(UL_TRXD_HDR + CALYPSO_BSP_BURSTLEN)) break;
-        ul_gmsk_mod((const int8_t *)(pkt + UL_TRXD_HDR), g_ul_iq);
+        const int8_t *bits = (const int8_t *)(pkt + UL_TRXD_HDR);
+        ul_gmsk_mod(bits, g_ul_iq);
         got = 1;
+        /* INSTR 2026-06-04 : dump one-shot des 1ers bursts UL recus du BSP pour
+         * VOIR si c'est un vrai access-burst (sync RACH 41b) ou autre chose, et
+         * confirmer la sortie OSR=4. Couper via CALYPSO_UL_DEBUG=0. */
+        static int ul_dbg = -1, ul_seen = 0;
+        if (ul_dbg < 0) { const char *e = getenv("CALYPSO_UL_DEBUG"); ul_dbg = (!e || *e!='0'); }
+        if (ul_dbg && ul_seen < 8) {
+            ul_seen++;
+            char bs[CALYPSO_BSP_BURSTLEN + 1];
+            int nz = 0;
+            for (int i = 0; i < CALYPSO_BSP_BURSTLEN; i++) { bs[i] = bits[i] > 0 ? '1':'0'; if (bits[i]) nz++; }
+            bs[CALYPSO_BSP_BURSTLEN] = 0;
+            int s0 = g_ul_iq[0], s1 = g_ul_iq[1], smid = g_ul_iq[CALYPSO_BSP_BURSTLEN*CALYPSO_TRX_OSR];
+            LOGP(DDEV, LOGL_NOTICE,
+                 "UL-DBG #%d in=%db(nz=%d) out=%d samp [%d,%d..mid=%d] bits=%s\n",
+                 ul_seen, CALYPSO_BSP_BURSTLEN, nz,
+                 CALYPSO_BSP_BURSTLEN*CALYPSO_TRX_OSR, s0, s1, smid, bs);
+        }
     }
     if (got) g_ul_pending = 1;
 }
@@ -696,8 +726,9 @@ int32_t uhdwrap_read(void *dev, uint32_t num_chans)
     if (g_relay_on && g_relay_ul_fd >= 0) {
         float ulf[CALYPSO_SHM_BUFSIZE * 2];
         ssize_t n = recvfrom(g_relay_ul_fd, ulf, sizeof(ulf), MSG_DONTWAIT, NULL, NULL);
-        memset(relay_ul, 0, sizeof(relay_ul));
         if (n > 0) {
+            /* Le relais (transceiver gr-gsm, 5811) a des donnees -> prioritaire. */
+            memset(relay_ul, 0, sizeof(relay_ul));
             int ns = (int)(n / (2 * sizeof(float)));
             if (ns > CALYPSO_SHM_BUFSIZE) ns = CALYPSO_SHM_BUFSIZE;
             for (int i = 0; i < ns * 2; i++) {
@@ -705,8 +736,17 @@ int32_t uhdwrap_read(void *dev, uint32_t num_chans)
                 if (v > 32767.0f) v = 32767.0f; else if (v < -32768.0f) v = -32768.0f;
                 relay_ul[i] = (int16_t)v;
             }
+            ul_src = relay_ul;
+        } else if (ul_src != ul_chunk) {
+            /* Pas de RACH injectee par IPC_UL ce tick -> zeros (l'horloge avance). */
+            memset(relay_ul, 0, sizeof(relay_ul));
+            ul_src = relay_ul;
         }
-        ul_src = relay_ul;
+        /* FIX LU 2026-06-04 : sinon (relais vide MAIS IPC_UL a injecte une RACH)
+         * on GARDE ul_chunk. Avant, ce bloc ecrasait INCONDITIONNELLEMENT ul_src
+         * par relay_ul (vide en full-grgsm : transceiver 5811 absent) -> la RACH
+         * du mobile (BSP -> ul_gmsk_mod -> ul_chunk) etait jetee -> osmo-trx
+         * envoyait des NOPE -> BTS jamais de CHAN RQD -> Location Update echouait. */
     }
 
     for (uint32_t c = 0; c < num_chans && c < 8; c++) {

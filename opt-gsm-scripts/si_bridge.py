@@ -55,15 +55,22 @@ for line in p.stdout:
     mfn = re.search(r"\bFN[:=]?\s*(\d+)", line)
     if mfn: last_fn = int(mfn.group(1))
     # --- ligne SI hexa ---
-    m = re.search(r":\s+([0-9a-fA-F][0-9a-fA-F ]+)$", line.strip())
+    lstr = line.strip()
+    m = re.search(r":\s+([0-9a-fA-F][0-9a-fA-F ]+)$", lstr)
     if not m: continue
     try: by = bytes(int(x,16) for x in m.group(1).split())
     except: continue
     if len(by) >= 3 and by[1] == 0x06 and by[2] in SI:     # RR PD + SI type
+        # FN REEL de CETTE ligne : grgsm_decode -v imprime "<FN> <count>:  hh..."
+        # (message_printer prepend_fnr). Repli sur last_fn (horloge SCH) si absent.
+        # NB: le shunt IGNORE ce FN (feed_si n'a pas de param FN) -> correction
+        # d'affichage/log (BCCH au lieu de position SCH), pas un fix du LU.
+        mline_fn = re.match(r"^\s*(\d+)\b", lstr)
+        si_fn = int(mline_fn.group(1)) if mline_fn else last_fn
         L2 = (by[:23] + b"\x2b"*23)[:23]
-        s.sendto(gsmtap(last_fn, GSMTAP_BCCH, L2), ("127.0.0.1", 4730))
+        s.sendto(gsmtap(si_fn, GSMTAP_BCCH, L2), ("127.0.0.1", 4730))
         n += 1
         if n <= 20 or n % 50 == 0:
             print("[si-bridge] %s (mt=0x%02x) FN=%d (%%51=%d %s) -> feed_si (4730)  #%d"
-                  % (SI[by[2]], by[2], last_fn, last_fn%51, fn51_role(last_fn), n), flush=True)
+                  % (SI[by[2]], by[2], si_fn, si_fn%51, fn51_role(si_fn), n), flush=True)
 print("[si-bridge] fini, %d SI / %d SCH transmis" % (n, nsch), flush=True)
