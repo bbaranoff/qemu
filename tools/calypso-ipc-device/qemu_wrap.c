@@ -629,6 +629,27 @@ static void ul_build_rach(int8_t *ab)
     /* p==88 ; [88..147]=-1 -> ul_gmsk_mod auto-detecte active=88 + guard silence */
 }
 
+/* Construit le burst NORMAL #bid (0..3) du bloc SDCCH/SACCH depuis la L2 (23o) :
+ * gsm0503_xcch_encode -> 4*116 bits e[] (GSM 05.03 conv+FIRE+interleave). Burst normal
+ * = [3 tail][58 e (57 data + steal)][26 TSC7][58 e][3 tail] en soft-bits +/-1. Tout actif
+ * (148) -> ul_gmsk_mod fait du GMSK plein (le motif != access-burst -> pas de guard). */
+static void ul_build_sdcch_burst(int8_t *ab, const uint8_t *l2, int bid)
+{
+    static const uint8_t TSC7[26] = {
+        1,1,1,0,1,1,1,1,0,0,0,1,0,0,1,0,1,1,1,0,1,1,1,1,0,0 };
+    ubit_t e[4 * 116];
+    memset(e, 0, sizeof(e));
+    gsm0503_xcch_encode(e, l2);
+    const ubit_t *cB = e + (bid & 3) * 116;
+    int p = 0;
+    for (int i = 0; i < 3;  i++) ab[p++] = -1;                  /* tail */
+    for (int i = 0; i < 58; i++) ab[p++] = cB[i]      ? 1 : -1; /* data 1 (57 + steal) */
+    for (int i = 0; i < 26; i++) ab[p++] = TSC7[i]    ? 1 : -1; /* midamble TSC7 */
+    for (int i = 0; i < 58; i++) ab[p++] = cB[58 + i] ? 1 : -1; /* data 2 */
+    for (int i = 0; i < 3;  i++) ab[p++] = -1;                  /* tail */
+    /* p==148, tout actif -> GMSK plein */
+}
+
 /* Sideband RACH (NO-HARDCODE) : lit la VRAIE RA+BSIC+FN publiee par QEMU
  * (calypso_trx.c calypso_rach_publish) dans /dev/shm/calypso_rach. Fichier
  * REGULIER (pas un FIFO -> jamais bloquant). Layout 16o fige, partage avec QEMU :
@@ -645,6 +666,24 @@ static int calypso_rach_read(uint8_t *ra, uint8_t *bsic, uint32_t *fn)
     if (ra)   *ra   = buf[4];
     if (bsic) *bsic = buf[5];
     if (fn)   memcpy(fn, buf + 8, sizeof(*fn));
+    return 1;
+}
+
+/* SDCCH/SACCH UL sideband (#12 PIÈCE 2) : lit la L2 montante (a_cu) publiée par QEMU
+ * (calypso_dsp_shunt) dans /dev/shm/calypso_sdcch_ul. Layout 48o : seq@0(u32)
+ * l1s_fn@4(u32) fn@8(u32) task_u@12(u16) l1s%51@14(u8) l2[23]@16. Retourne 1 si seq>0. */
+static int calypso_sdcch_ul_read(uint8_t *l2, uint8_t *l1s_mod51, uint32_t *l1s_fn)
+{
+    static int fd = -1;
+    if (fd < 0) fd = open("/dev/shm/calypso_sdcch_ul", O_RDONLY);
+    if (fd < 0) return 0;
+    uint8_t buf[48];
+    if (pread(fd, buf, sizeof(buf), 0) != (ssize_t)sizeof(buf)) return 0;
+    uint32_t seq; memcpy(&seq, buf + 0, sizeof(seq));
+    if (seq == 0) return 0;
+    if (l1s_fn)    memcpy(l1s_fn, buf + 4, sizeof(*l1s_fn));
+    if (l1s_mod51) *l1s_mod51 = buf[14];
+    if (l2)        memcpy(l2, buf + 16, 23);
     return 1;
 }
 
@@ -888,6 +927,39 @@ int32_t uhdwrap_read(void *dev, uint32_t num_chans)
             LOGP(DDEV, LOGL_NOTICE,
                  "UL inject #%u → internal_fn=%u osmo_fn=%u (%%51=%u) slotoff=%d ts=%llu\n",
                  ul_inj, internal_fn, osmo_fn, m51, off, (unsigned long long)d->rx_ts);
+    }
+
+    /* === SDCCH/SACCH UL (#12 PIÈCE 2) : burst NORMAL encodé sur le slot dédié =======
+     * Le firmware met la L2 montante (SABM/SACCH/idle) dans a_cu -> sideband. On
+     * l'encode (gsm0503_xcch + TSC7) et on l'injecte sur le slot SDCCH/4 SS0 UL
+     * (osmo_fn%51 ∈ {37..40}, burst bid = osmo_fn%51-37). Priorité sur le relay
+     * (ul_src=ul_chunk -> le relay 5811 skip via `ul_src != ul_chunk`). N'écrase PAS
+     * le RACH (gate ul_src != ul_chunk). Tunables CALYPSO_UL_SDCCH(=1), _SDCCH_OFS. */
+    static int ul_sdcch = -1, sd_ofs = -99999;
+    if (ul_sdcch < 0)    { const char *e = getenv("CALYPSO_UL_SDCCH");     ul_sdcch = (!e || *e != '0') ? 1 : 0; }
+    if (sd_ofs == -99999){ const char *e = getenv("CALYPSO_UL_SDCCH_OFS"); sd_ofs = e ? atoi(e) : 0; }
+    if (ul_sdcch && ul_src != ul_chunk &&
+        (d->rx_ts % ((uint64_t)CALYPSO_FRAME_SAMPLES)) == 0) {
+        uint32_t s51 = (uint32_t)((((long)osmo_fn + sd_ofs) % 51 + 51) % 51);
+        if (s51 >= 37 && s51 <= 40) {                     /* SDCCH/4 SS0 UL block */
+            uint8_t l2[23], l1s51 = 0xff; uint32_t lfn = 0;
+            if (calypso_sdcch_ul_read(l2, &l1s51, &lfn) && l1s51 >= 37 && l1s51 <= 40) {
+                int bid = (int)s51 - 37;
+                int8_t ab[CALYPSO_BSP_BURSTLEN];
+                ul_build_sdcch_burst(ab, l2, bid);
+                ul_gmsk_mod(ab, g_ul_iq);
+                memset(ul_chunk, 0, sizeof(ul_chunk));
+                int off = ul_slotoff < 0 ? 0 : ul_slotoff;
+                if (2 * off + (int)sizeof(g_ul_iq) > (int)sizeof(ul_chunk)) off = 0;
+                memcpy(ul_chunk + 2 * off, g_ul_iq, sizeof(g_ul_iq));
+                ul_src = ul_chunk;
+                static unsigned sd_inj = 0;
+                if (sd_inj++ < 40 || (sd_inj % 200) == 0)
+                    LOGP(DDEV, LOGL_NOTICE,
+                         "UL SDCCH inject #%u bid=%d osmo%%51=%u l1s%%51=%u L2=%02x %02x %02x\n",
+                         sd_inj, bid, s51, l1s51, l2[0], l2[1], l2[2]);
+            }
+        }
     }
 
     /* ---- WALL-PACED UL heartbeat (clock_nanosleep ABSTIME) ----
