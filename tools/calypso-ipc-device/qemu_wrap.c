@@ -1038,21 +1038,34 @@ int32_t uhdwrap_read(void *dev, uint32_t num_chans)
     static int ul_sdcch = -1, sd_ofs = -99999;
     if (ul_sdcch < 0)    { const char *e = getenv("CALYPSO_UL_SDCCH");     ul_sdcch = (!e || *e != '0') ? 1 : 0; }
     if (sd_ofs == -99999){ const char *e = getenv("CALYPSO_UL_SDCCH_OFS"); sd_ofs = e ? atoi(e) : 0; }
-    if (ul_sdcch && ul_src != ul_chunk &&
+    if (ul_sdcch &&
         (d->rx_ts % ((uint64_t)CALYPSO_FRAME_SAMPLES)) == 0) {
+        /* POLL le sideband a CHAQUE frame (pas seulement aux slots inject). La SABM
+         * (ctrl 0x3f) est publiee a l1s%51={36-39} mais l'offset l1s<->osmo_fn faisait
+         * que les reads gates sur les slots SDCCH tombaient sur de l'idle -> SABM
+         * jamais vue. Poller chaque frame la capture des qu'elle est publiee -> cache
+         * sticky, tenu CALYPSO_UL_SABM_TTL blocs, prefere a l'idle au latch bid 0 ->
+         * elle part sur un bloc complet aligne -> osmo-bts Rx SABM -> UA.
+         * CALYPSO_UL_SABM_STICKY=0 desactive. */
+        static uint8_t sabm_l2[23]; static int sabm_ttl = 0, sticky = -1, sttl0 = -1;
+        static uint8_t last_l2[23]; static int last_have = 0;
+        static uint8_t l1s51 = 0xff;
+        if (sticky < 0) { const char *e = getenv("CALYPSO_UL_SABM_STICKY"); sticky = (!e || *e != '0') ? 1 : 0; }
+        if (sttl0 < 0)  { const char *e = getenv("CALYPSO_UL_SABM_TTL");    sttl0 = e ? atoi(e) : 16; }
+        { uint8_t l2[23]; uint32_t lfn = 0;
+          if (calypso_sdcch_ul_read(l2, &l1s51, &lfn)) {
+              memcpy(last_l2, l2, sizeof(last_l2)); last_have = 1;
+              if (sticky && l2[1] == 0x3f) { memcpy(sabm_l2, l2, sizeof(sabm_l2)); sabm_ttl = sttl0; }
+          } }
         uint32_t s51 = (uint32_t)((((long)osmo_fn + sd_ofs) % 51 + 51) % 51);
-        if (s51 >= 37 && s51 <= 40) {                     /* SDCCH/4 SS0 UL block */
+        if (ul_src != ul_chunk && s51 >= 37 && s51 <= 40) {   /* SDCCH/4 SS0 UL block */
             int bid = (int)s51 - 37;
-            uint8_t l2[23], l1s51 = 0xff; uint32_t lfn = 0;
-            int have = calypso_sdcch_ul_read(l2, &l1s51, &lfn);
-            /* COHÉRENCE DE BLOC : on latch la L2 a bid 0 et on REUTILISE blk_l2 pour
-             * bid 1..3. Le gate `l1s%51 ∈ {37-40}` est VIRÉ : osmo_fn et l1s_fn sont
-             * decales d'un offset ~constant, donc le gate double sautait certains bid
-             * (ex offset+1 -> bid 3 jamais) -> osmo-bts assemblait bid 0..3 de blocs
-             * DIFFERENTS -> bloc xcch incoherent -> BER 456/456. Le slot = osmo_fn%51
-             * (l'horloge contre laquelle osmo-trx/osmo-bts schedulent). */
+            /* COHÉRENCE DE BLOC : latch a bid 0, reutilise blk_l2 pour bid 1..3. */
             static uint8_t blk_l2[23]; static int blk_valid = 0;
-            if (bid == 0 && have) { memcpy(blk_l2, l2, sizeof(blk_l2)); blk_valid = 1; }
+            if (bid == 0) {
+                if (sticky && sabm_ttl > 0) { memcpy(blk_l2, sabm_l2, sizeof(blk_l2)); blk_valid = 1; sabm_ttl--; }
+                else if (last_have)         { memcpy(blk_l2, last_l2, sizeof(blk_l2)); blk_valid = 1; }
+            }
             if (blk_valid) {
                 int8_t ab[CALYPSO_BSP_BURSTLEN];
                 ul_build_sdcch_burst(ab, blk_l2, bid);
