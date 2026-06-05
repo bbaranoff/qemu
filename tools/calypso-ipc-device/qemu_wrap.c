@@ -1048,13 +1048,14 @@ int32_t uhdwrap_read(void *dev, uint32_t num_chans)
          * elle part sur un bloc complet aligne -> osmo-bts Rx SABM -> UA.
          * CALYPSO_UL_SABM_STICKY=0 desactive. */
         static uint8_t sabm_l2[23]; static int sabm_ttl = 0, sticky = -1, sttl0 = -1;
-        static uint8_t last_l2[23]; static int last_have = 0;
         static uint8_t l1s51 = 0xff;
         if (sticky < 0) { const char *e = getenv("CALYPSO_UL_SABM_STICKY"); sticky = (!e || *e != '0') ? 1 : 0; }
         if (sttl0 < 0)  { const char *e = getenv("CALYPSO_UL_SABM_TTL");    sttl0 = e ? atoi(e) : 16; }
         { uint8_t l2[23]; uint32_t lfn = 0;
           if (calypso_sdcch_ul_read(l2, &l1s51, &lfn)) {
-              memcpy(last_l2, l2, sizeof(last_l2)); last_have = 1;
+              /* On ne garde QUE la SABM (ctrl 0x3f). Le reste (idle SDCCH, et surtout
+               * le SACCH `07 04` SAPI1 que le poll voyait aussi) est ignore -> le
+               * fallback sera un idle SDCCH FIXE, plus de pollution "SAPI 1". */
               if (sticky && l2[1] == 0x3f) { memcpy(sabm_l2, l2, sizeof(sabm_l2)); sabm_ttl = sttl0; }
           } }
         uint32_t s51 = (uint32_t)((((long)osmo_fn + sd_ofs) % 51 + 51) % 51);
@@ -1064,7 +1065,8 @@ int32_t uhdwrap_read(void *dev, uint32_t num_chans)
             static uint8_t blk_l2[23]; static int blk_valid = 0;
             if (bid == 0) {
                 if (sticky && sabm_ttl > 0) { memcpy(blk_l2, sabm_l2, sizeof(blk_l2)); blk_valid = 1; sabm_ttl--; }
-                else if (last_have)         { memcpy(blk_l2, last_l2, sizeof(blk_l2)); blk_valid = 1; }
+                else { blk_l2[0] = 0x01; blk_l2[1] = 0x03; blk_l2[2] = 0x01;   /* idle UI SDCCH FIXE SAPI0 */
+                       memset(blk_l2 + 3, 0x2b, sizeof(blk_l2) - 3); blk_valid = 1; }
             }
             if (blk_valid) {
                 int8_t ab[CALYPSO_BSP_BURSTLEN];
