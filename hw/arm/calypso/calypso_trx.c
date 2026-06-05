@@ -29,6 +29,7 @@
 
 extern CalypsoUARTState *g_uart_modem;
 extern CalypsoUARTState *g_uart_irda;
+extern void calypso_dsp_shunt_record_rach(uint8_t ra);   /* SONDE B (req-ref) */
 
 #include "hw/arm/calypso/calypso_debug.h"
 #define TRX_LOG(fmt, ...) \
@@ -553,8 +554,9 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
             dr_byte = w * 2;   /* 0x023A word -> 0x0474 ARM byte */
         }
         if (offset == dr_byte && value != 0 && (size == 2 || size == 4)) {
-            calypso_rach_publish((uint8_t)((value >> 8) & 0xFF),
-                                 (uint8_t)((value & 0xFF) >> 2), s->fn);
+            uint8_t ra = (uint8_t)((value >> 8) & 0xFF);
+            calypso_rach_publish(ra, (uint8_t)((value & 0xFF) >> 2), s->fn);
+            calypso_dsp_shunt_record_rach(ra);   /* SONDE B : l1s.current_time.fn par RA */
         }
     }
 

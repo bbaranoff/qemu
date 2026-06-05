@@ -530,6 +530,7 @@ static int  g_ul_on   = -1;            /* CALYPSO_IPC_UL */
  * d'access-burst cote osmo-trx -> NOPE -> RACH jamais detectee. */
 static int16_t g_ul_iq[CALYPSO_BSP_BURSTLEN * CALYPSO_TRX_OSR * 2];   /* dernier burst modulé @ OSR */
 static volatile int g_ul_pending = 0;  /* 1 = un burst à injecter */
+static volatile uint32_t g_ul_real_fn = 0;  /* FN firmware (sideband) du dernier RACH -> FN-lock */
 
 /* MSK phase-continue a OSR samples/symbole : 148 soft-bits (±127) -> 148*OSR
  * cs16 I/Q. Increment de phase ±(π/2)/OSR par SAMPLE (convention osmo-trx :
@@ -678,6 +679,7 @@ static void ul_drain(void)
         if (rach_enc) {
             uint8_t real_ra = 0xff, real_bsic = 0; uint32_t real_fn = 0;
             if (calypso_rach_read(&real_ra, &real_bsic, &real_fn) && real_ra < 16) {
+                g_ul_real_fn = real_fn;            /* stash pour le FN-lock (uhdwrap_read) */
                 if (ref_n[real_ra] <= 0) {          /* lazy load + cache (retry tant qu'absent) */
                     char path[64];
                     snprintf(path, sizeof(path), "/root/rach_ref_RA%02x.cs16", real_ra);
@@ -843,7 +845,38 @@ int32_t uhdwrap_read(void *dev, uint32_t num_chans)
     uint32_t osmo_fn = internal_fn + (uint32_t)ul_fnoff;     /* FN tel que vu par osmo-trx */
     uint32_t m51 = osmo_fn % 51;
     int fn_ok = !ul_fngate || (m51 == 4 || m51 == 5 || (m51 >= 14 && m51 <= 36) || m51 == 45 || m51 == 46);
-    if (g_ul_on && g_ul_pending && fn_ok && (d->rx_ts % ((uint64_t)CALYPSO_FRAME_SAMPLES)) == 0) {
+
+    /* === FN-LOCK (NO-HARDCODE, env CALYPSO_UL_FN_LOCK=1 ; OFF par defaut) =======
+     * Le mobile matche la request-reference de l'IMM ASSIGN sur (ra, T1/T2/T3) =
+     * FN mod 42432 (=32*26*51). Il a memorise (real_fn-1) [prim_rach.c:94] ; osmo-trx
+     * tamponne le burst injecte avec SA FN (= internal_fn + K_trx). Les 3 horloges
+     * sont rate-lockees 1:1 (offset constant verifie ~2016926). On auto-mesure UNE
+     * FOIS la congruence cible cal_off au 1er RACH (ZERO FN hardcode), puis on
+     * n'injecte que sur le slot ou (internal_fn+cal_off)%42432 == (real_fn-1)%42432.
+     * CALYPSO_UL_FN_ADJ = sweep +/- frames (le -1 prim_rach + SB2_LATENCY peut
+     * decaler de 1-2). Invisible tant que l'IMM ASSIGN AGCH n'atteint pas le mobile. */
+    static int ul_fnlock = -1, fn_adj = -99999;
+    if (ul_fnlock < 0)      { const char *e = getenv("CALYPSO_UL_FN_LOCK"); ul_fnlock = (e && *e == '1') ? 1 : 0; }
+    if (fn_adj == -99999)   { const char *e = getenv("CALYPSO_UL_FN_ADJ");  fn_adj = e ? atoi(e) : 0; }
+    int fnlock_ok = 1;
+    if (ul_fnlock) {
+        uint32_t real_fn = g_ul_real_fn;
+        static int cal_done = 0; static uint32_t cal_off = 0;
+        if (!cal_done && real_fn && g_ul_pending) {
+            cal_off = ((real_fn - 1u) - internal_fn) % 42432u;   /* live, magic-free */
+            cal_done = 1;
+            LOGP(DDEV, LOGL_NOTICE, "UL FN-LOCK cal_off=%u (internal_fn=%u real_fn=%u)\n",
+                 cal_off, internal_fn, real_fn);
+        }
+        if (cal_done && real_fn) {
+            int64_t w = ((int64_t)real_fn - 1 + fn_adj) % 42432; if (w < 0) w += 42432;
+            uint32_t have = (internal_fn + cal_off) % 42432u;
+            fnlock_ok = ((uint32_t)w == have);
+        } else {
+            fnlock_ok = 0;                /* pas encore calibre -> attendre un RACH */
+        }
+    }
+    if (g_ul_on && g_ul_pending && fn_ok && fnlock_ok && (d->rx_ts % ((uint64_t)CALYPSO_FRAME_SAMPLES)) == 0) {
         memset(ul_chunk, 0, sizeof(ul_chunk));
         int off = ul_slotoff < 0 ? 0 : ul_slotoff;
         if (2 * off + (int)sizeof(g_ul_iq) > (int)sizeof(ul_chunk)) off = 0;  /* borne */
