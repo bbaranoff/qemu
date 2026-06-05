@@ -27,6 +27,7 @@
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -35,6 +36,8 @@
 #include <unistd.h>
 
 #include <osmocom/core/logging.h>
+#include <osmocom/core/bits.h>
+#include <osmocom/coding/gsm0503_coding.h>
 
 #include "debug.h"
 #include "ipc_shm.h"
@@ -57,6 +60,12 @@
 #define CALYPSO_DL_BURSTLEN   (CALYPSO_BSP_BURSTLEN * CALYPSO_TRX_OSR)  /* 592 I/Q @ 4 SPS */
 #define CALYPSO_FRAME_SAMPLES (1250 * CALYPSO_TRX_OSR)              /* 5000 samples/frame @ 4 SPS */
 #define CALYPSO_BSP_BURSTLEN  148         /* samples per UDP datagram to QEMU BSP (= correlator window) */
+/* FIX LU 2026-06-05 : guard de tete (complex samples) AVANT les bits actifs de
+ * la RACH UL. Le correlateur RACH osmo-trx (sigProcLib.cpp:1683 TOA gate <3*sps,
+ * :1788 target ~sym48) rejette un burst place a l'offset 0 du slot (pic en bord
+ * -> rejete -> NOPE/-110). Un vrai access-burst a ~68 sym de guard avant la sync.
+ * ~32 sym @ OSR4 = 128 samples placent la sync dans la fenetre du correlateur. */
+#define CALYPSO_UL_SLOT_OFFSET 128
 
 /* ---- Timing frame CANONIQUE (logique GSM, robuste) ----
  * 1 frame TDMA = CALYPSO_FRAME_QBITS qbits (1250 symboles x 4) = CALYPSO_FRAME_NS.
@@ -528,18 +537,114 @@ static volatile int g_ul_pending = 0;  /* 1 = un burst à injecter */
 static void ul_gmsk_mod(const int8_t *bits, int16_t *iq)
 {
     static double AMP = -1.0;
+    static int ACT = -2;
     if (AMP < 0.0) { const char *e = getenv("CALYPSO_UL_AMP"); AMP = (e && *e) ? atof(e) : 20000.0; }
-    double ph = 0.0;
-    int idx = 0;
-    for (int i = 0; i < CALYPSO_BSP_BURSTLEN; i++) {
-        double step = ((bits[i] > 0) ? 1.0 : -1.0) * (M_PI / 2.0) / (double)CALYPSO_TRX_OSR;
-        for (int s = 0; s < CALYPSO_TRX_OSR; s++) {
-            iq[2 * idx]     = (int16_t)(cos(ph) * AMP);
-            iq[2 * idx + 1] = (int16_t)(sin(ph) * AMP);
-            ph += step;
-            idx++;
-        }
+    if (ACT == -2) { const char *e = getenv("CALYPSO_UL_ACTIVE_SYMS"); ACT = (e && *e) ? atoi(e) : -1; }
+    /* ACCESS BURST (RACH) : seulement 88 symboles ACTIFS (8 tail + 41 sync etendu
+     * + 36 data + 3 tail), puis 60 symboles de GUARD = SILENCE (IQ=0, PAS du GMSK :
+     * un 0 GMSK-module est un tone fc/4, le correlateur RACH veut un gap d'energie).
+     * 88*OSR=352 GMSK + 60*OSR=240 zeros = 592 = burst. Auto-detection access-vs-
+     * normal : tail[0..7]==0 ET guard[88..147]==0 -> access burst. Override
+     * CALYPSO_UL_ACTIVE_SYMS (>0 force, -1/unset = auto). */
+    static int INV = -1, USEG = -1;
+    if (INV < 0)  { const char *e = getenv("CALYPSO_UL_INVERT"); INV = (e && *e == '1') ? 1 : 0; }
+    if (USEG < 0) { const char *e = getenv("CALYPSO_UL_GMSK");   USEG = (!e || *e != '0'); }  /* defaut GMSK */
+    const int N = CALYPSO_BSP_BURSTLEN, OSR = CALYPSO_TRX_OSR, NS = N * OSR;
+    int active = N;
+    if (ACT > 0) active = ACT;
+    else {
+        int tail0 = 1, guard0 = 1;
+        for (int i = 0; i < 8 && i < N; i++) if (bits[i] > 0) { tail0 = 0; break; }
+        for (int i = 88; i < N; i++) if (bits[i] > 0) { guard0 = 0; break; }
+        if (tail0 && guard0) active = 88;   /* access burst (RACH) */
     }
+    if (active > N) active = N;
+
+    if (!USEG) {
+        /* MSK fallback (CALYPSO_UL_GMSK=0) */
+        double ph = 0.0; int idx = 0;
+        for (int i = 0; i < N; i++) {
+            if (i >= active) { for (int s=0;s<OSR;s++){iq[2*idx]=0;iq[2*idx+1]=0;idx++;} continue; }
+            int b = ((bits[i] > 0) ? 1 : 0) ^ INV;
+            double step = (b ? 1.0 : -1.0) * (M_PI/2.0)/(double)OSR;
+            for (int s=0;s<OSR;s++){iq[2*idx]=(int16_t)(cos(ph)*AMP);iq[2*idx+1]=(int16_t)(sin(ph)*AMP);ph+=step;idx++;}
+        }
+        return;
+    }
+
+    /* GMSK BT=0.3 : pulse de frequence gaussien (osmo-trx correle du GMSK, pas du MSK).
+     * freq[n] = Sum_k alpha[k]*g(n-k*OSR) ; phi = cumsum(freq)*pi/2 ; I/Q=AMP*(cos,sin). */
+    #define GMSK_L 4
+    static double g_pulse[GMSK_L * CALYPSO_TRX_OSR];
+    static int g_init = 0;
+    if (!g_init) {
+        const double BT = 0.3, ln2 = 0.6931471805599453, kk = 2.0*M_PI*BT/sqrt(ln2);
+        int Lo = GMSK_L*OSR; double sum = 0;
+        for (int m = 0; m < Lo; m++) {
+            double t = ((double)m - Lo/2.0 + 0.5)/OSR;   /* symboles, centre */
+            double q1 = 0.5*erfc(kk*(t-0.5)/sqrt(2.0));
+            double q2 = 0.5*erfc(kk*(t+0.5)/sqrt(2.0));
+            g_pulse[m] = q1 - q2; sum += g_pulse[m];
+        }
+        if (sum != 0.0) for (int m = 0; m < Lo; m++) g_pulse[m] /= sum;  /* Sigma=1 -> pi/2 par symbole */
+        g_init = 1;
+    }
+    static double freq[CALYPSO_BSP_BURSTLEN * CALYPSO_TRX_OSR];
+    for (int n = 0; n < NS; n++) freq[n] = 0.0;
+    int Lo = GMSK_L*OSR;
+    for (int k = 0; k < active; k++) {
+        double al = (((bits[k] > 0) ? 1 : 0) ^ INV) ? 1.0 : -1.0;
+        int base = k*OSR - Lo/2;
+        for (int m = 0; m < Lo; m++) { int pos = base+m; if (pos >= 0 && pos < NS) freq[pos] += al*g_pulse[m]; }
+    }
+    double phi = 0.0; int active_end = active*OSR + Lo; if (active_end > NS) active_end = NS;
+    for (int n = 0; n < NS; n++) {
+        phi += (M_PI/2.0)*freq[n];
+        if (n < active_end) { iq[2*n] = (int16_t)(cos(phi)*AMP); iq[2*n+1] = (int16_t)(sin(phi)*AMP); }
+        else { iq[2*n] = 0; iq[2*n+1] = 0; }   /* guard silence */
+    }
+}
+
+/* RACH access-burst complet en soft-bits +/-1 pour ul_gmsk_mod :
+ * [8 tail][41 sync TS0][36 bits codes gsm0503_rach_ext_encode][3 tail], reste guard.
+ * La sync = GSM::gRACHSynchSequenceTS0 (exactement ce que correle osmo-trx). Le DSP
+ * Calypso fait normalement ce codage+sync ; shunte, on le refait ici. RA/BSIC env :
+ * CALYPSO_UL_RA (defaut 3, fixe pour prouver rc>0), CALYPSO_UL_BSIC (defaut 7 = BSIC
+ * reel ; colore la parite -> requis pour CHAN RQD cote osmo-bts, pas pour rc). */
+static void ul_build_rach(int8_t *ab)
+{
+    static const char SYNC[] = "01001011011111111001100110101010001111000";  /* 41 */
+    static int RA = -1, BSIC = -1;
+    if (RA < 0)   { const char *e = getenv("CALYPSO_UL_RA");   RA   = (e && *e) ? (int)strtol(e, 0, 0) : 3; }
+    if (BSIC < 0) { const char *e = getenv("CALYPSO_UL_BSIC"); BSIC = (e && *e) ? atoi(e) : 7; }
+    ubit_t coded[40]; memset(coded, 0, sizeof(coded));
+    gsm0503_rach_ext_encode(coded, (uint16_t)RA, (uint8_t)BSIC, false);   /* 36 bits codes */
+    for (int i = 0; i < CALYPSO_BSP_BURSTLEN; i++) ab[i] = -1;            /* tail/guard par defaut */
+    int p = 0;
+    for (int i = 0; i < 8;  i++) ab[p++] = -1;                            /* extended tail */
+    for (int i = 0; i < 41; i++) ab[p++] = (SYNC[i] == '1') ? 1 : -1;     /* synch sequence */
+    for (int i = 0; i < 36; i++) ab[p++] = coded[i] ? 1 : -1;            /* RA codee (BSIC color) */
+    for (int i = 0; i < 3;  i++) ab[p++] = -1;                            /* tail */
+    /* p==88 ; [88..147]=-1 -> ul_gmsk_mod auto-detecte active=88 + guard silence */
+}
+
+/* Sideband RACH (NO-HARDCODE) : lit la VRAIE RA+BSIC+FN publiee par QEMU
+ * (calypso_trx.c calypso_rach_publish) dans /dev/shm/calypso_rach. Fichier
+ * REGULIER (pas un FIFO -> jamais bloquant). Layout 16o fige, partage avec QEMU :
+ *   [0..3]=seq(u32 LE)  [4]=ra  [5]=bsic  [8..11]=fn(u32 LE). Retourne 1 si seq>0. */
+static int calypso_rach_read(uint8_t *ra, uint8_t *bsic, uint32_t *fn)
+{
+    static int fd = -1;
+    if (fd < 0) fd = open("/dev/shm/calypso_rach", O_RDONLY);   /* retry tant que QEMU ne l'a pas cree */
+    if (fd < 0) return 0;
+    uint8_t buf[16];
+    if (pread(fd, buf, sizeof(buf), 0) != (ssize_t)sizeof(buf)) return 0;
+    uint32_t seq; memcpy(&seq, buf + 0, sizeof(seq));
+    if (seq == 0) return 0;
+    if (ra)   *ra   = buf[4];
+    if (bsic) *bsic = buf[5];
+    if (fn)   memcpy(fn, buf + 8, sizeof(*fn));
+    return 1;
 }
 
 /* Draine l'UL sur g_bsp_fd (le BSP renvoie l'UL à la source du DL = nous,
@@ -553,7 +658,86 @@ static void ul_drain(void)
         ssize_t n = recvfrom(g_bsp_fd, pkt, sizeof(pkt), MSG_DONTWAIT, NULL, NULL);
         if (n < (ssize_t)(UL_TRXD_HDR + CALYPSO_BSP_BURSTLEN)) break;
         const int8_t *bits = (const int8_t *)(pkt + UL_TRXD_HDR);
-        ul_gmsk_mod(bits, g_ul_iq);
+        /* RACH ENC (defaut ON) : reconstruit l'access-burst code+sync (le DSP shunte
+         * ne le fait plus), au lieu de moduler les bits firmware (sans sync). */
+        static int rach_enc = -1;
+        if (rach_enc < 0) { const char *e = getenv("CALYPSO_UL_RACH_ENC"); rach_enc = (!e || *e != '0'); }
+
+        /* === NO-HARDCODE : TABLE de modulation per-RA ===========================
+         * La VRAIE RA du mobile (d_rach@0x0474, plombee via /dev/shm/calypso_rach)
+         * varie a chaque burst. osmo-trx a pre-genere /root/rach_ref_RA<nn>.cs16
+         * (sa modulation Laurent EXACTE, qui correle son detecteur) pour chaque RA.
+         * On selectionne le ref de la VRAIE RA -> le BTS voit la bonne RA, plus le
+         * RA=3 fixe. Repli : ancien rach_ref.cs16 (RA fixe), puis GMSK maison. */
+        static int16_t ref_tab[16][CALYPSO_BSP_BURSTLEN * CALYPSO_TRX_OSR * 2];
+        static int     ref_n[16];          /* 0=pas charge, <0=absent, >0=samples */
+        static int     ref_init = 0;
+        if (!ref_init) { for (int i = 0; i < 16; i++) ref_n[i] = 0; ref_init = 1; }
+
+        int used_tab = 0;
+        if (rach_enc) {
+            uint8_t real_ra = 0xff, real_bsic = 0; uint32_t real_fn = 0;
+            if (calypso_rach_read(&real_ra, &real_bsic, &real_fn) && real_ra < 16) {
+                if (ref_n[real_ra] <= 0) {          /* lazy load + cache (retry tant qu'absent) */
+                    char path[64];
+                    snprintf(path, sizeof(path), "/root/rach_ref_RA%02x.cs16", real_ra);
+                    FILE *rf = fopen(path, "rb");
+                    if (rf) {
+                        size_t g2 = fread(ref_tab[real_ra], 2 * sizeof(int16_t),
+                                          CALYPSO_BSP_BURSTLEN * CALYPSO_TRX_OSR, rf);
+                        fclose(rf);
+                        ref_n[real_ra] = (int)g2;
+                        LOGP(DDEV, LOGL_NOTICE,
+                             "RACH-TAB charge RA=0x%02x : %d samples\n", real_ra, ref_n[real_ra]);
+                    } else {
+                        ref_n[real_ra] = -1;
+                    }
+                }
+                if (ref_n[real_ra] > 0) {
+                    memset(g_ul_iq, 0, sizeof(g_ul_iq));
+                    int cp = ref_n[real_ra];
+                    if (cp > CALYPSO_BSP_BURSTLEN * CALYPSO_TRX_OSR) cp = CALYPSO_BSP_BURSTLEN * CALYPSO_TRX_OSR;
+                    memcpy(g_ul_iq, ref_tab[real_ra], cp * 2 * sizeof(int16_t));
+                    used_tab = 1;
+                    static int last_ra = -1;
+                    if ((int)real_ra != last_ra) {
+                        last_ra = real_ra;
+                        LOGP(DDEV, LOGL_NOTICE,
+                             "UL RACH RA REELLE=0x%02x bsic=0x%02x (sideband, fn=%u)\n",
+                             real_ra, real_bsic, real_fn);
+                    }
+                }
+            }
+        }
+
+        /* Repli sur l'ancienne reference unique (RA fixe) si la table indispo. */
+        static int16_t g_rach_ref[CALYPSO_BSP_BURSTLEN * CALYPSO_TRX_OSR * 2];
+        static int g_rach_ref_n = -1;   /* <0 = pas encore charge ; 0 = absent ; >0 = N samples */
+        if (!used_tab && rach_enc && g_rach_ref_n <= 0) {
+            FILE *rf = fopen("/root/rach_ref.cs16", "rb");
+            if (rf) {
+                size_t got2 = fread(g_rach_ref, 2 * sizeof(int16_t),
+                                    CALYPSO_BSP_BURSTLEN * CALYPSO_TRX_OSR, rf);
+                fclose(rf);
+                g_rach_ref_n = (int)got2;
+                LOGP(DDEV, LOGL_NOTICE, "RACH-REF charge : %d samples (repli RA fixe)\n", g_rach_ref_n);
+            } else {
+                g_rach_ref_n = 0;
+            }
+        }
+        if (used_tab) {
+            /* g_ul_iq deja rempli par la table per-RA */
+        } else if (rach_enc && g_rach_ref_n > 0) {
+            memset(g_ul_iq, 0, sizeof(g_ul_iq));
+            int cp = g_rach_ref_n; if (cp > CALYPSO_BSP_BURSTLEN * CALYPSO_TRX_OSR) cp = CALYPSO_BSP_BURSTLEN * CALYPSO_TRX_OSR;
+            memcpy(g_ul_iq, g_rach_ref, cp * 2 * sizeof(int16_t));
+        } else if (rach_enc) {
+            int8_t ab[CALYPSO_BSP_BURSTLEN];
+            ul_build_rach(ab);
+            ul_gmsk_mod(ab, g_ul_iq);
+        } else {
+            ul_gmsk_mod(bits, g_ul_iq);
+        }
         got = 1;
         /* INSTR 2026-06-04 : dump one-shot des 1ers bursts UL recus du BSP pour
          * VOIR si c'est un vrai access-burst (sync RACH 41b) ou autre chose, et
@@ -646,15 +830,31 @@ int32_t uhdwrap_read(void *dev, uint32_t num_chans)
      * un chunk TS0 (ts%1250==0), on l'injecte dans le slot TS0 (samples 0..147). */
     static int16_t ul_chunk[CALYPSO_SHM_BUFSIZE * 2];
     int16_t *ul_src = zeros_iq;
-    if (g_ul_on && g_ul_pending && (d->rx_ts % ((uint64_t)CALYPSO_FRAME_SAMPLES)) == 0) {
+    /* --- reglages UL (sweepables sans rebuild) ---
+     * CALYPSO_UL_FN_OFFSET : decalage FN device->osmo-trx (observe = 31).
+     * CALYPSO_UL_FN_GATE   : 1 = n'injecter que sur un FN RACH-eligible (combined
+     *                        CCCH+SDCCH4 : osmo_fn%51 in {4,5,14..36,45,46}).
+     * CALYPSO_UL_SLOT_OFFSET : offset intra-slot (samples) du burst (TOA). */
+    static int ul_fnoff = -99999, ul_fngate = -1, ul_slotoff = -1;
+    if (ul_fnoff == -99999) { const char *e = getenv("CALYPSO_UL_FN_OFFSET"); ul_fnoff = e ? atoi(e) : 31; }
+    if (ul_fngate < 0)      { const char *e = getenv("CALYPSO_UL_FN_GATE");   ul_fngate = (!e || *e != '0'); }
+    if (ul_slotoff < 0)     { const char *e = getenv("CALYPSO_UL_SLOT_OFFSET"); ul_slotoff = e ? atoi(e) : 0; }
+    uint32_t internal_fn = (uint32_t)(d->rx_ts / (uint64_t)CALYPSO_FRAME_SAMPLES);
+    uint32_t osmo_fn = internal_fn + (uint32_t)ul_fnoff;     /* FN tel que vu par osmo-trx */
+    uint32_t m51 = osmo_fn % 51;
+    int fn_ok = !ul_fngate || (m51 == 4 || m51 == 5 || (m51 >= 14 && m51 <= 36) || m51 == 45 || m51 == 46);
+    if (g_ul_on && g_ul_pending && fn_ok && (d->rx_ts % ((uint64_t)CALYPSO_FRAME_SAMPLES)) == 0) {
         memset(ul_chunk, 0, sizeof(ul_chunk));
-        memcpy(ul_chunk, g_ul_iq, sizeof(g_ul_iq));   /* TS0 = 148 samples */
+        int off = ul_slotoff < 0 ? 0 : ul_slotoff;
+        if (2 * off + (int)sizeof(g_ul_iq) > (int)sizeof(ul_chunk)) off = 0;  /* borne */
+        memcpy(ul_chunk + 2 * off, g_ul_iq, sizeof(g_ul_iq));
         ul_src = ul_chunk;
         g_ul_pending = 0;
         static unsigned ul_inj = 0;
-        if (ul_inj++ < 20 || (ul_inj % 200) == 0)
-            LOGP(DDEV, LOGL_INFO, "UL inject #%u burst → ts=%llu (TS0)\n",
-                 ul_inj, (unsigned long long)d->rx_ts);
+        if (ul_inj++ < 30 || (ul_inj % 100) == 0)
+            LOGP(DDEV, LOGL_NOTICE,
+                 "UL inject #%u → internal_fn=%u osmo_fn=%u (%%51=%u) slotoff=%d ts=%llu\n",
+                 ul_inj, internal_fn, osmo_fn, m51, off, (unsigned long long)d->rx_ts);
     }
 
     /* ---- WALL-PACED UL heartbeat (clock_nanosleep ABSTIME) ----
@@ -723,7 +923,12 @@ int32_t uhdwrap_read(void *dev, uint32_t num_chans)
      * ce tick, zéros (le clock doit avancer). Buffer local (thread DL séparé). */
     relay_init();
     int16_t relay_ul[CALYPSO_SHM_BUFSIZE * 2];
-    if (g_relay_on && g_relay_ul_fd >= 0) {
+    /* FIX LU 2026-06-05 : PRIORITE ABSOLUE a la RACH injectee. Si ul_src==ul_chunk
+     * (IPC_UL a injecte une RACH ce tick), on SAUTE entierement le bloc relais —
+     * sinon recvfrom(5811) (le flowgraph gr-gsm emet sur 5811 en full-grgsm) renvoie
+     * n>0 et `ul_src = relay_ul` ECRASAIT la RACH -> enqueue de zeros -> NOPE/-110.
+     * (l'ancien garde ne protegeait que n<=0, pas n>0.) */
+    if (g_relay_on && g_relay_ul_fd >= 0 && ul_src != ul_chunk) {
         float ulf[CALYPSO_SHM_BUFSIZE * 2];
         ssize_t n = recvfrom(g_relay_ul_fd, ulf, sizeof(ulf), MSG_DONTWAIT, NULL, NULL);
         if (n > 0) {
@@ -749,6 +954,20 @@ int32_t uhdwrap_read(void *dev, uint32_t num_chans)
          * envoyait des NOPE -> BTS jamais de CHAN RQD -> Location Update echouait. */
     }
 
+    /* INSTR : a l'enqueue, quand le burst RACH est dans ul_src (==ul_chunk),
+     * prouver qu'il porte de l'energie ET qu'il part vers un stream RX valide. */
+    {
+        static int eqdbg = -1; if (eqdbg < 0) { const char *e = getenv("CALYPSO_UL_DEBUG"); eqdbg = (!e || *e != '0'); }
+        if (eqdbg && ul_src == ul_chunk) {
+            static unsigned eqn = 0;
+            int nz = 0; for (int i = 0; i < CALYPSO_SHM_BUFSIZE * 2; i++) if (ul_src[i]) nz++;
+            if (eqn++ < 40)
+                LOGP(DDEV, LOGL_NOTICE,
+                     "ENQ-RACH #%u ts=%llu num_chans=%u rx0=%p nz=%d s0=[%d,%d]\n",
+                     eqn, (unsigned long long)d->rx_ts, num_chans,
+                     (void *)ios_rx_from_device[0], nz, ul_src[0], ul_src[1]);
+        }
+    }
     for (uint32_t c = 0; c < num_chans && c < 8; c++) {
         if (!ios_rx_from_device[c]) continue;
         int32_t rc = ipc_shm_enqueue(ios_rx_from_device[c],

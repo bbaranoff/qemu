@@ -18,7 +18,11 @@ CF = sys.argv[1] if len(sys.argv) > 1 else "/tmp/iq_grgsm.fifo"
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
 SI = {0x1b:"SI3",0x1a:"SI2",0x1c:"SI4",0x21:"SI13",0x19:"SI1",0x1d:"SI2bis",0x1e:"SI2ter",0x06:"RR"}
+# CCCH/AGCH downlink (PORTE 3a) : l'IMM ASSIGN doit etre forwarde au mobile, pas
+# seulement les SI. gr-gsm le decode (06 3f) mais si_bridge ne forwardait que les SI.
+CCCH = {0x3f:"IMM-ASSIGN", 0x39:"IMM-ASSIGN-EXT", 0x3a:"IMM-ASSIGN-REJ"}
 GSMTAP_BCCH = 0x01
+GSMTAP_AGCH = 0x04
 
 def fn51_role(fn):
     m = fn % 51
@@ -60,17 +64,16 @@ for line in p.stdout:
     if not m: continue
     try: by = bytes(int(x,16) for x in m.group(1).split())
     except: continue
-    if len(by) >= 3 and by[1] == 0x06 and by[2] in SI:     # RR PD + SI type
-        # FN REEL de CETTE ligne : grgsm_decode -v imprime "<FN> <count>:  hh..."
-        # (message_printer prepend_fnr). Repli sur last_fn (horloge SCH) si absent.
-        # NB: le shunt IGNORE ce FN (feed_si n'a pas de param FN) -> correction
-        # d'affichage/log (BCCH au lieu de position SCH), pas un fix du LU.
+    if len(by) >= 3 and by[1] == 0x06 and (by[2] in SI or by[2] in CCCH):  # RR PD + SI ou IMM ASSIGN
         mline_fn = re.match(r"^\s*(\d+)\b", lstr)
         si_fn = int(mline_fn.group(1)) if mline_fn else last_fn
         L2 = (by[:23] + b"\x2b"*23)[:23]
-        s.sendto(gsmtap(si_fn, GSMTAP_BCCH, L2), ("127.0.0.1", 4730))
+        is_imm = by[2] in CCCH
+        chan = GSMTAP_AGCH if is_imm else GSMTAP_BCCH          # AGCH pour IMM ASSIGN, BCCH pour SI
+        s.sendto(gsmtap(si_fn, chan, L2), ("127.0.0.1", 4730))
         n += 1
-        if n <= 20 or n % 50 == 0:
+        name = CCCH.get(by[2]) or SI.get(by[2])
+        if is_imm or n <= 20 or n % 50 == 0:                  # toujours logger l'IMM ASSIGN
             print("[si-bridge] %s (mt=0x%02x) FN=%d (%%51=%d %s) -> feed_si (4730)  #%d"
-                  % (SI[by[2]], by[2], si_fn, si_fn%51, fn51_role(si_fn), n), flush=True)
+                  % (name, by[2], si_fn, si_fn%51, fn51_role(si_fn), n), flush=True)
 print("[si-bridge] fini, %d SI / %d SCH transmis" % (n, nsch), flush=True)

@@ -867,7 +867,7 @@ static void shunt_shm_init(void)
      * /tmp/dsp_iq.cfile ; CALYPSO_SHUNT_IQ_CFILE= (vide) pour desactiver. */
     const char *cf = getenv("CALYPSO_SHUNT_IQ_CFILE");
     if (!cf)
-        cf = "/tmp/dsp_iq.cfile";
+        cf = "/root/dsp_iq.cfile";
     if (*cf) {
         g_iq_cfile = fopen(cf, "wb");
         if (g_iq_cfile)
