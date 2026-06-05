@@ -598,11 +598,84 @@ static void ul_gmsk_mod(const int8_t *bits, int16_t *iq)
         int base = k*OSR - Lo/2;
         for (int m = 0; m < Lo; m++) { int pos = base+m; if (pos >= 0 && pos < NS) freq[pos] += al*g_pulse[m]; }
     }
+    /* ROTATION GMSK (osmo-trx GMSKRotate) : +pi/2 par SYMBOLE = +pi/(2*OSR) par sample.
+     * Sans elle, le signal est decale de fs/(2*OSR) -> le demod osmo-trx (qui dé-rote
+     * de la meme quantite) recoit du garbage -> BER 456/456. C'etait LA piece manquante
+     * (le RACH echouait pareil). Gate CALYPSO_UL_ROT (def 1), signe CALYPSO_UL_ROT_SGN. */
+    static int ROT = -2; static double ROTSGN = 1.0;
+    if (ROT == -2) {
+        const char *e = getenv("CALYPSO_UL_ROT");     ROT = (!e || *e != '0') ? 1 : 0;
+        const char *s = getenv("CALYPSO_UL_ROT_SGN"); ROTSGN = (s && atoi(s) < 0) ? -1.0 : 1.0;
+    }
+    const double ROTSTEP = ROTSGN * (M_PI / 2.0) / (double)OSR;   /* pi/8 @ OSR=4 */
     double phi = 0.0; int active_end = active*OSR + Lo; if (active_end > NS) active_end = NS;
     for (int n = 0; n < NS; n++) {
         phi += (M_PI/2.0)*freq[n];
-        if (n < active_end) { iq[2*n] = (int16_t)(cos(phi)*AMP); iq[2*n+1] = (int16_t)(sin(phi)*AMP); }
+        double pt = ROT ? (phi + ROTSTEP * (double)n) : phi;
+        if (n < active_end) { iq[2*n] = (int16_t)(cos(pt)*AMP); iq[2*n+1] = (int16_t)(sin(pt)*AMP); }
         else { iq[2*n] = 0; iq[2*n+1] = 0; }   /* guard silence */
+    }
+}
+
+/* === Modulateur GMSK Laurent EXACT d'osmo-trx (port C de sigProcLib::modulateBurstLaurent).
+ * Le GMSK maison ne correle pas le detecteur osmo-trx (BER 456/456) ; CE modulateur si
+ * (la table RACH = son dump -> rc=3). bits[nbits] soft +/-1 -> symboles +/-1 @ sps=4,
+ * rotation pi/(2*sps)/sample, convolution pulse Laurent c0 (+ c1 = j*XOR(b[i-1],b[i-2])),
+ * somme. Sortie cs16 (scale CALYPSO_UL_AMP, def 20000) sur CALYPSO_BSP_BURSTLEN*OSR samples.
+ * convolve START_ONLY : out[n] = sum_{j=0}^{H-1} in[n-(H-1)+j]*h[j] (in=0 si index<0). */
+static void ul_mod_laurent(const int8_t *bits, int nbits, int16_t *iq)
+{
+    const int sps = CALYPSO_TRX_OSR;        /* 4 */
+    const int BL  = 625;                     /* burst_len osmo-trx */
+    static const double C0[16] = {
+        0.0, 4.46348606e-03, 2.84385729e-02, 1.03184855e-01, 2.56065552e-01,
+        4.76375085e-01, 7.05961177e-01, 8.71291644e-01, 9.29453645e-01,
+        8.71291644e-01, 7.05961177e-01, 4.76375085e-01, 2.56065552e-01,
+        1.03184855e-01, 2.84385729e-02, 4.46348606e-03 };
+    static const double C1[8] = {
+        0.0, 8.16373112e-03, 2.84385729e-02, 5.64158904e-02,
+        7.05463553e-02, 5.64158904e-02, 2.84385729e-02, 8.16373112e-03 };
+    static double AMP = -1.0;
+    if (AMP < 0.0) { const char *e = getenv("CALYPSO_UL_AMP"); AMP = (e && *e) ? atof(e) : 20000.0; }
+    if (nbits > 156) nbits = 156;
+
+    static double sym[625], c0r[625], c0i[625], c1r[625], c1i[625];
+    for (int n = 0; n < BL; n++) { sym[n]=0; c0r[n]=0; c0i[n]=0; c1r[n]=0; c1i[n]=0; }
+    int b[160]; for (int i = 0; i < nbits; i++) b[i] = (bits[i] > 0) ? 1 : 0;
+
+    /* symboles +/-1 : index 0 = padding tail(-1), sps,2sps.. = 2*bit-1, puis padding tail. */
+    int idx = 0;
+    sym[idx] = -1.0; idx += sps;
+    for (int i = 0; i < nbits; i++) { sym[idx] = 2.0*b[i]-1.0; idx += sps; }
+    if (idx < BL) sym[idx] = -1.0;
+
+    /* rotation GMSK : c0[n] = sym[n] * e^(j n pi/(2*sps)) */
+    const double rstep = (M_PI/2.0)/(double)sps;
+    for (int n = 0; n < BL; n++) { double ph = rstep*(double)n; c0r[n] = sym[n]*cos(ph); c0i[n] = sym[n]*sin(ph); }
+
+    /* c1[k] = c0[k] * (j*phase) = -phase*c0i + j*phase*c0r ; phase=2*(b[i-1]^b[i-2])-1.
+     * start magic (k=sps*2, phase=-1), i=2..nbits-1, end magic (i=nbits). */
+    if (nbits >= 2) {
+        int k = sps*2; double phase = -1.0;
+        c1r[k] = -phase*c0i[k]; c1i[k] = phase*c0r[k]; k += sps;
+        for (int i = 2; i < nbits; i++) {
+            phase = 2.0*(double)(b[i-1]^b[i-2]) - 1.0;
+            if (k < BL) { c1r[k] = -phase*c0i[k]; c1i[k] = phase*c0r[k]; }
+            k += sps;
+        }
+        phase = 2.0*(double)(b[nbits-1]^b[nbits-2]) - 1.0;
+        if (k < BL) { c1r[k] = -phase*c0i[k]; c1i[k] = phase*c0r[k]; }
+    }
+
+    int NS = CALYPSO_BSP_BURSTLEN * sps;     /* 592 */
+    for (int n = 0; n < NS; n++) {
+        double or_ = 0.0, oi_ = 0.0;
+        for (int j = 0; j < 16; j++) { int s = n-15+j; if (s>=0 && s<BL) { or_ += c0r[s]*C0[j]; oi_ += c0i[s]*C0[j]; } }
+        for (int j = 0; j < 8;  j++) { int s = n-7+j;  if (s>=0 && s<BL) { or_ += c1r[s]*C1[j]; oi_ += c1i[s]*C1[j]; } }
+        double I = or_*AMP, Q = oi_*AMP;
+        if (I>32767.0) I=32767.0; else if (I<-32768.0) I=-32768.0;
+        if (Q>32767.0) Q=32767.0; else if (Q<-32768.0) Q=-32768.0;
+        iq[2*n] = (int16_t)I; iq[2*n+1] = (int16_t)Q;
     }
 }
 
@@ -650,6 +723,31 @@ static void ul_build_sdcch_burst(int8_t *ab, const uint8_t *l2, int bid)
     /* p==148, tout actif -> GMSK plein */
 }
 
+/* SELF-TEST (#12) : module l'access-burst (le MÊME que rach_ref.cs16 = dump du vrai
+ * modulateBurst osmo-trx) avec ul_mod_laurent et compare. maxdiff~0 => port correct.
+ * Le pattern du diff isole le bug : echelle (AMP), decalage (convolution/TOA),
+ * conjugue (signe rotation), renverse (sens convol). Appelé 1x. */
+static void ul_laurent_selftest(void)
+{
+    int8_t ab[CALYPSO_BSP_BURSTLEN];
+    ul_build_rach(ab);                                   /* 88 bits actifs = ceux de rach_ref */
+    static int16_t my[CALYPSO_BSP_BURSTLEN * CALYPSO_TRX_OSR * 2];
+    ul_mod_laurent(ab, 88, my);
+    FILE *f = fopen("/root/rach_ref.cs16", "rb");
+    if (!f) { LOGP(DDEV, LOGL_NOTICE, "LAURENT-SELFTEST: pas de /root/rach_ref.cs16\n"); return; }
+    static int16_t ref[CALYPSO_BSP_BURSTLEN * CALYPSO_TRX_OSR * 2];
+    size_t got = fread(ref, 2 * sizeof(int16_t), CALYPSO_BSP_BURSTLEN * CALYPSO_TRX_OSR, f);
+    fclose(f);
+    int N = (int)got; if (N > CALYPSO_BSP_BURSTLEN * CALYPSO_TRX_OSR) N = CALYPSO_BSP_BURSTLEN * CALYPSO_TRX_OSR;
+    long maxd = 0, sumd = 0;
+    for (int i = 0; i < N * 2; i++) { long d = labs((long)my[i] - (long)ref[i]); if (d > maxd) maxd = d; sumd += d; }
+    LOGP(DDEV, LOGL_NOTICE,
+         "LAURENT-SELFTEST: N=%d maxdiff=%ld avgdiff=%ld | mine[0..7]=%d,%d %d,%d %d,%d %d,%d "
+         "ref[0..7]=%d,%d %d,%d %d,%d %d,%d\n", N, maxd, sumd / (N * 2 + 1),
+         my[0],my[1],my[2],my[3],my[4],my[5],my[6],my[7],
+         ref[0],ref[1],ref[2],ref[3],ref[4],ref[5],ref[6],ref[7]);
+}
+
 /* Sideband RACH (NO-HARDCODE) : lit la VRAIE RA+BSIC+FN publiee par QEMU
  * (calypso_trx.c calypso_rach_publish) dans /dev/shm/calypso_rach. Fichier
  * REGULIER (pas un FIFO -> jamais bloquant). Layout 16o fige, partage avec QEMU :
@@ -691,6 +789,8 @@ static int calypso_sdcch_ul_read(uint8_t *l2, uint8_t *l1s_mod51, uint32_t *l1s_
  * cf. calypso_bsp.c:381), module le dernier burst dispo. Non-bloquant. */
 static void ul_drain(void)
 {
+    static int _stdone = 0;
+    if (!_stdone) { _stdone = 1; ul_laurent_selftest(); }   /* #12 : valide le port Laurent 1x */
     if (g_bsp_fd < 0) return;
     uint8_t pkt[UL_TRXD_HDR + CALYPSO_BSP_BURSTLEN + 16];
     int got = 0;
@@ -942,12 +1042,21 @@ int32_t uhdwrap_read(void *dev, uint32_t num_chans)
         (d->rx_ts % ((uint64_t)CALYPSO_FRAME_SAMPLES)) == 0) {
         uint32_t s51 = (uint32_t)((((long)osmo_fn + sd_ofs) % 51 + 51) % 51);
         if (s51 >= 37 && s51 <= 40) {                     /* SDCCH/4 SS0 UL block */
+            int bid = (int)s51 - 37;
             uint8_t l2[23], l1s51 = 0xff; uint32_t lfn = 0;
-            if (calypso_sdcch_ul_read(l2, &l1s51, &lfn) && l1s51 >= 37 && l1s51 <= 40) {
-                int bid = (int)s51 - 37;
+            int have = calypso_sdcch_ul_read(l2, &l1s51, &lfn);
+            /* COHÉRENCE DE BLOC : on latch la L2 a bid 0 et on REUTILISE blk_l2 pour
+             * bid 1..3. Le gate `l1s%51 ∈ {37-40}` est VIRÉ : osmo_fn et l1s_fn sont
+             * decales d'un offset ~constant, donc le gate double sautait certains bid
+             * (ex offset+1 -> bid 3 jamais) -> osmo-bts assemblait bid 0..3 de blocs
+             * DIFFERENTS -> bloc xcch incoherent -> BER 456/456. Le slot = osmo_fn%51
+             * (l'horloge contre laquelle osmo-trx/osmo-bts schedulent). */
+            static uint8_t blk_l2[23]; static int blk_valid = 0;
+            if (bid == 0 && have) { memcpy(blk_l2, l2, sizeof(blk_l2)); blk_valid = 1; }
+            if (blk_valid) {
                 int8_t ab[CALYPSO_BSP_BURSTLEN];
-                ul_build_sdcch_burst(ab, l2, bid);
-                ul_gmsk_mod(ab, g_ul_iq);
+                ul_build_sdcch_burst(ab, blk_l2, bid);
+                ul_mod_laurent(ab, CALYPSO_BSP_BURSTLEN, g_ul_iq);  /* modulateur EXACT osmo-trx */
                 memset(ul_chunk, 0, sizeof(ul_chunk));
                 int off = ul_slotoff < 0 ? 0 : ul_slotoff;
                 if (2 * off + (int)sizeof(g_ul_iq) > (int)sizeof(ul_chunk)) off = 0;
@@ -957,7 +1066,7 @@ int32_t uhdwrap_read(void *dev, uint32_t num_chans)
                 if (sd_inj++ < 40 || (sd_inj % 200) == 0)
                     LOGP(DDEV, LOGL_NOTICE,
                          "UL SDCCH inject #%u bid=%d osmo%%51=%u l1s%%51=%u L2=%02x %02x %02x\n",
-                         sd_inj, bid, s51, l1s51, l2[0], l2[1], l2[2]);
+                         sd_inj, bid, s51, l1s51, blk_l2[0], blk_l2[1], blk_l2[2]);
             }
         }
     }
