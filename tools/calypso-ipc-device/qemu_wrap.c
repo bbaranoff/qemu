@@ -1058,7 +1058,15 @@ int32_t uhdwrap_read(void *dev, uint32_t num_chans)
                 ul_build_sdcch_burst(ab, blk_l2, bid);
                 ul_mod_laurent(ab, CALYPSO_BSP_BURSTLEN, g_ul_iq);  /* modulateur EXACT osmo-trx */
                 memset(ul_chunk, 0, sizeof(ul_chunk));
-                int off = ul_slotoff < 0 ? 0 : ul_slotoff;
+                /* offset ÉCHANTILLON dédié au burst NORMAL (≠ access-burst RACH) : le
+                 * détecteur normal-burst d'osmo-trx corrèle le TSC à une position
+                 * différente du détecteur RACH -> au même offset que le RACH, le TSC
+                 * tombe hors fenêtre. CALYPSO_UL_SDCCH_SMP_OFS=N (échantillons, sweepable,
+                 * peut être négatif) décale le burst normal pour caler le TSC. */
+                static int sd_smp = -999999;
+                if (sd_smp == -999999) { const char *e = getenv("CALYPSO_UL_SDCCH_SMP_OFS"); sd_smp = e ? atoi(e) : 0; }
+                int off = (ul_slotoff < 0 ? 0 : ul_slotoff) + sd_smp;
+                if (off < 0) off = 0;
                 if (2 * off + (int)sizeof(g_ul_iq) > (int)sizeof(ul_chunk)) off = 0;
                 memcpy(ul_chunk + 2 * off, g_ul_iq, sizeof(g_ul_iq));
                 ul_src = ul_chunk;
