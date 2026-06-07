@@ -146,11 +146,6 @@ struct dsp_shunt_state {
     uint32_t   sb_fn;                 /* FN reelle du SCH */
     int16_t    sb_toa;                /* TOA reel mesure du SCH (base 23 = on-time) */
     bool       sb_valid;              /* gr-gsm a poste au moins un SCH reel */
-    /* AGCH (#11) : IMM ASSIGN (si_bridge GSMTAP AGCH 0x04). Stocke a part des SI
-     * (pas de clobber) ; presente dans a_cd sur un bloc CCCH -> firmware chan_nr=0x90. */
-    uint8_t    agch_buf[23];
-    bool       agch_valid;
-    uint32_t   agch_tick;            /* tick_cnt a l'arrivee (TTL anti-stale) */
 };
 
 /* FN TDMA reelle (calypso_trx.c) pour recoder la FN du shunt (LATCH d_fn=0). */
@@ -171,59 +166,6 @@ static inline void shunt_write_w(uint32_t addr, uint16_t v)
 {
     uint16_t le = cpu_to_le16(v);
     dma_memory_write(g_shunt.as, addr, &le, sizeof(le), MEMTXATTRS_UNSPECIFIED);
-}
-
-/* Lit l1s.current_time.fn (FN L1 du firmware) en ARM RAM. current_time = champ 0
- * de struct l1s_state @ 0x836508 ; fn = champ 0 de struct gsm_time -> offset 0.
- * C'est LE FN que le firmware utilise pour ses blocs (BCCH/CCCH) et mémorise pour
- * la RACH. On gate la présentation a_cd dessus (et NON s->fn = calypso_trx_get_fn,
- * qui diffère de l1s d'un offset run-variant -> blocs CCCH décalés -> AGCH raté). */
-static uint32_t shunt_l1s_fn(void)
-{
-    static uint32_t addr = 0;
-    if (!addr) {
-        const char *e = getenv("CALYPSO_L1S_FN_ADDR");
-        addr = (e && *e) ? (uint32_t)strtoul(e, NULL, 0) : 0x836508;
-    }
-    uint32_t v = 0;
-    dma_memory_read(g_shunt.as, addr, &v, sizeof(v), MEMTXATTRS_UNSPECIFIED);
-    return le32_to_cpu(v);
-}
-
-/* SONDE B : table RA -> FN L1 firmware (l1s.current_time.fn) au moment de la RACH.
- * Remplie par calypso_trx.c (hook write d_rach). Sert à réécrire la req-ref de
- * l'IMM ASSIGN au FN exact que le mobile a mémorisé (preuve que le FN = dernier mur). */
-static uint32_t g_rach_l1s_fn[256];
-static uint8_t  g_rach_l1s_valid[256];
-void calypso_dsp_shunt_record_rach(uint8_t ra)
-{
-    if (!g_shunt.active) return;
-    g_rach_l1s_fn[ra]    = shunt_l1s_fn();
-    g_rach_l1s_valid[ra] = 1;
-}
-
-/* SDCCH/SACCH UL sideband (#12) : QEMU publie la L2 montante (a_cu[3..], 23o) vers
- * qemu_wrap via /dev/shm/calypso_sdcch_ul (fichier régulier, pas un FIFO). qemu_wrap
- * l'encode (gsm0503_xcch) + module (burst normal TSC7) + injecte sur le slot UL.
- * Layout 48o : seq@0(u32) l1s_fn@4(u32) fn@8(u32) task_u@12(u16) l1s%51@14(u8) l2[23]@16. */
-static void calypso_sdcch_ul_publish(const uint8_t *l2, uint16_t task_u,
-                                     uint32_t fn, uint32_t l1s_fn)
-{
-    static int fd = -2;
-    if (fd == -2) {
-        fd = open("/dev/shm/calypso_sdcch_ul", O_CREAT | O_RDWR, 0644);
-        if (fd >= 0 && ftruncate(fd, 48) < 0) { /* best-effort */ }
-    }
-    if (fd < 0) return;
-    static uint32_t seq = 0; seq++;
-    uint8_t buf[48] = {0};
-    memcpy(buf + 4,  &l1s_fn, sizeof(l1s_fn));
-    memcpy(buf + 8,  &fn,     sizeof(fn));
-    memcpy(buf + 12, &task_u, sizeof(task_u));
-    buf[14] = (uint8_t)(l1s_fn % 51);
-    memcpy(buf + 16, l2, 23);
-    memcpy(buf + 0,  &seq, sizeof(seq));   /* seq en dernier (publication) */
-    if (pwrite(fd, buf, sizeof(buf), 0) < 0) { /* best-effort */ }
 }
 
 static inline uint32_t wp_base(uint8_t page_idx) {
@@ -260,34 +202,6 @@ static void shunt_latch_task(uint16_t new_d_dsp_page)
         g_shunt.d_fn = (uint16_t)(calypso_trx_get_fn() & 0xFFFF);
     g_shunt.pending   = true;
 
-    /* SDCCH/SACCH UL (#12 PIÈCE 1) : quand un NB UL est posté (d_task_u != 0,
-     * DUL_DSP_TASK=12 en dédié), lire la L2 a_cu[3..] (23o @ NDB 0x264+6, octets
-     * packés 2/mot) et la PUBLIER vers le sideband pour qemu_wrap (encode+module+
-     * injecte). a_cu[0..2]=header. La L2 porte le SABM / SACCH meas / I-frames. */
-    if (g_shunt.d_task_u != 0) {
-        uint8_t l2[23];
-        uint32_t acu3 = BASE_API_NDB + 0x264u + 6u;   /* a_cu[3] = 1er octet L2 */
-        for (int i = 0; i < 23; i += 2) {
-            uint16_t w = shunt_read_w(acu3 + i);
-            l2[i] = (uint8_t)(w & 0xff);
-            if (i + 1 < 23) l2[i + 1] = (uint8_t)((w >> 8) & 0xff);
-        }
-        calypso_sdcch_ul_publish(l2, g_shunt.d_task_u,
-                                 calypso_trx_get_fn(), shunt_l1s_fn());
-        /* Log : quelques idle pour sanity (capé), mais TOUJOURS les frames NON-IDLE
-         * (ctrl=l2[1] != 0x03) -> capte le SABM (ctrl 0x3F) et les I-frames. */
-        static int ul_log = 0;
-        int non_idle = (l2[1] != 0x03);
-        if (non_idle || ul_log < 6) {
-            if (!non_idle) ul_log++;
-            fprintf(stderr, "[dsp-shunt] SDCCH-UL%s task_u=0x%04x l1s%%51=%u "
-                    "L2: %02x %02x %02x %02x %02x %02x %02x %02x\n",
-                    non_idle ? " *NONIDLE*" : "", g_shunt.d_task_u,
-                    (unsigned)(shunt_l1s_fn() % 51),
-                    l2[0], l2[1], l2[2], l2[3], l2[4], l2[5], l2[6], l2[7]);
-        }
-    }
-
     /* PM : valeur statique, écrite IMMÉDIATEMENT (pas de service déféré au
      * prochain frame IRQ). Sinon le firmware lit a_pm AVANT le dispatch déféré
      * → 0 stale → rxlev=-110. On écrit a_pm sur la page lue tout de suite. */
@@ -295,8 +209,8 @@ static void shunt_latch_task(uint16_t new_d_dsp_page)
         shunt_dispatch_pm(page_idx);
 
     fprintf(stderr,
-        "[dsp-shunt] LATCH page=%u task_md=%u task_d=%u task_u=%u task_ra=%u fn=%u\n",
-        page_idx, g_shunt.d_task_md, g_shunt.d_task_d, g_shunt.d_task_u,
+        "[dsp-shunt] LATCH page=%u task_md=%u task_d=%u task_ra=%u fn=%u\n",
+        page_idx, g_shunt.d_task_md, g_shunt.d_task_d,
         g_shunt.d_task_ra, g_shunt.d_fn);
 }
 
@@ -555,55 +469,6 @@ static void shunt_dispatch_allc(uint8_t page_idx)
     if (no_canned && !g_shunt.si_valid)
         return;
 
-    /* === AGCH (#11) : IMM ASSIGN présenté dans a_cd sur un bloc CCCH ===========
-     * Si un IMM ASSIGN est en attente, on le présente A LA PLACE du SI sur les
-     * blocs CCCH (combiné CCCH+SDCCH4 : fn%51 ∈ {6-9,12-19}). Le firmware, sur son
-     * read CCCH_COMB, tague chan_nr=0x90 -> gsm48_rr_rx_pch_agch -> rx_imm_ass ->
-     * gsm48_match_ra. Présenté sur CHAQUE bloc CCCH tant que valide (TTL) : le
-     * firmware le lit une fois, multi-présentation = robuste à l'alignement FN
-     * (RR dédup via cr_hist). Les SI restent inchangés (blocs BCCH). Tunables :
-     * CALYPSO_SHUNT_AGCH(=1 def), _AGCH_OFS (offset FN), _AGCH_TTL (ticks, def 100). */
-    static int agch_on = -1, agch_ofs = 0, agch_ttl = 100;
-    if (agch_on < 0) {
-        const char *e = getenv("CALYPSO_SHUNT_AGCH");     agch_on  = (!e || *e != '0') ? 1 : 0;
-        const char *o = getenv("CALYPSO_SHUNT_AGCH_OFS"); agch_ofs = o ? atoi(o) : 0;
-        const char *t = getenv("CALYPSO_SHUNT_AGCH_TTL"); if (t && *t) agch_ttl = atoi(t);
-    }
-    if (agch_on && g_shunt.agch_valid) {
-        if ((uint32_t)(g_shunt.tick_cnt - g_shunt.agch_tick) > (uint32_t)agch_ttl) {
-            g_shunt.agch_valid = false;                   /* périmé -> rendre la main aux SI */
-        } else {
-            /* gate sur le FN L1 FIRMWARE (l1s), pas s->fn : c'est l'horloge des
-             * vrais blocs CCCH du firmware -> alignement run-invariant. */
-            int tc = (int)((((long)shunt_l1s_fn() + agch_ofs) % 51 + 51) % 51);
-            int is_ccch = (tc >= 6 && tc <= 9) || (tc >= 12 && tc <= 19);
-            if (is_ccch) {
-                uint32_t aa = BASE_API_NDB + NDB_A_CD;
-                shunt_write_w(aa + 0, 0x0000);            /* a_cd[0] FIRE = CRC pass */
-                shunt_write_w(aa + 2, 0x0000);
-                shunt_write_w(aa + 4, 0x0000);
-                const uint8_t *m = g_shunt.agch_buf;
-                for (int i = 0; i < 23; i += 2) {
-                    uint8_t lo = m[i], hi = (i + 1 < 23) ? m[i + 1] : 0x2B;
-                    shunt_write_w(aa + 6 + i, lo | (hi << 8));
-                }
-                uint32_t rpA = rp_base(page_idx);
-                shunt_write_w(rpA + RP_D_TASK_D,  ALLC_DSP_TASK);
-                shunt_write_w(rpA + RP_D_BURST_D, g_shunt.d_burst_d);
-                shunt_write_w(rpA + RP_A_SERV_DEMOD + D_TOA   * 2, shunt_toa_val());
-                shunt_write_w(rpA + RP_A_SERV_DEMOD + D_PM    * 2, shunt_is_canned(CAN_PM) ? SHUNT_CANNED_PM : 0);
-                shunt_write_w(rpA + RP_A_SERV_DEMOD + D_ANGLE * 2, 0);
-                shunt_write_w(rpA + RP_A_SERV_DEMOD + D_SNR   * 2, SHUNT_CANNED_SNR);
-                static unsigned n_agch = 0;
-                if (n_agch++ < 40 || (n_agch % 50) == 0)
-                    fprintf(stderr, "[dsp-shunt] DISPATCH AGCH IMM-ASS #%u burst_d=%u "
-                            "tc=%d -> a_cd (chan_nr=0x90 attendu)\n",
-                            n_agch, g_shunt.d_burst_d, tc);
-                return;                                   /* ce dispatch = l'IMM ASSIGN */
-            }
-        }
-    }
-
     /* (A) ROTATION par bloc : au début du bloc (burst 0) on avance au prochain
      * type SI disponible et on le copie dans si_buf (STABLE pour les 4 bursts).
      * Le mobile collecte ainsi TOUT le set (SI1/2/3/4) au fil des blocs au lieu
@@ -801,53 +666,7 @@ static const MemoryRegionOps shunt_ndb_trigger_ops = {
 #define GSMTAP_HDR_LEN          16
 #define GSMTAP_TYPE_UM          0x01
 #define GSMTAP_CHANNEL_BCCH     0x01
-#define GSMTAP_CHANNEL_AGCH     0x04   /* IMM ASSIGN (PORTE 3a / #11) */
 static int g_gsmtap_fd = -1;
-
-/* AGCH (#11) : range l'IMM ASSIGN forwardé par si_bridge (tag GSMTAP AGCH 0x04)
- * dans agch_buf — DISTINCT de si_buf, pour que la rotation des SI ne l'écrase pas.
- * shunt_dispatch_allc le présentera dans a_cd sur un bloc CCCH (le firmware tague
- * alors chan_nr=0x90 -> gsm48_rr_rx_pch_agch -> gsm48_rr_rx_imm_ass). */
-static void calypso_dsp_shunt_feed_agch(const uint8_t *l2, int len)
-{
-    if (!l2 || len < 3) return;
-    int n = len < 23 ? len : 23;
-    memcpy(g_shunt.agch_buf, l2, n);
-    for (int i = n; i < 23; i++) g_shunt.agch_buf[i] = 0x2B;
-
-    /* SONDE B (CALYPSO_REQREF_REWRITE=1, JETABLE — PAS un fix : modifie le message
-     * réseau) : réécrit la request-reference de l'IMM ASSIGN (octets L2 [8],[9]) au
-     * FN L1 que le mobile a mémorisé pour cette RA (g_rach_l1s_fn[RA] + adj), pour
-     * PROUVER que le FN est le dernier mur. RA = L2[7]. Encodage req-ref (04.08) :
-     *   [8] = (T1'<<3) | (T3>>3) ; [9] = ((T3&7)<<5) | T2 ; T1'=(FN/1326)%32. */
-    {
-        static int reqref_rw = -1, rr_adj = -99999;
-        if (reqref_rw < 0)    { const char *e = getenv("CALYPSO_REQREF_REWRITE"); reqref_rw = (e && *e == '1') ? 1 : 0; }
-        if (rr_adj == -99999) { const char *e = getenv("CALYPSO_REQREF_ADJ");     rr_adj = e ? atoi(e) : -1; }
-        if (reqref_rw && n >= 10 && g_shunt.agch_buf[2] == 0x3f) {
-            uint8_t ra = g_shunt.agch_buf[7];
-            if (g_rach_l1s_valid[ra]) {
-                int64_t fn = (int64_t)g_rach_l1s_fn[ra] + rr_adj;
-                if (fn < 0) fn = 0;
-                uint16_t t1p = (uint16_t)(((uint32_t)fn / 1326u) % 32u);
-                uint8_t  t2  = (uint8_t)((uint32_t)fn % 26u);
-                uint8_t  t3  = (uint8_t)((uint32_t)fn % 51u);
-                g_shunt.agch_buf[8] = (uint8_t)((t1p << 3) | ((t3 >> 3) & 7));
-                g_shunt.agch_buf[9] = (uint8_t)(((t3 & 7) << 5) | (t2 & 0x1f));
-                static unsigned rwlog = 0;
-                if (rwlog++ < 30)
-                    fprintf(stderr, "[dsp-shunt] SONDE-B req-ref RA=0x%02x reecrite -> "
-                            "fn=%u (T1'=%u T2=%u T3=%u) adj=%d\n",
-                            ra, (uint32_t)fn, t1p, t2, t3, rr_adj);
-            }
-        }
-    }
-
-    g_shunt.agch_valid = true;
-    g_shunt.agch_tick  = g_shunt.tick_cnt;
-    fprintf(stderr, "[dsp-shunt] feed_agch: IMM-ASS mt=0x%02x -> agch_buf "
-            "(a presenter sur bloc CCCH)\n", l2[2]);
-}
 
 static void shunt_gsmtap_read(void *opaque)
 {
@@ -862,30 +681,23 @@ static void shunt_gsmtap_read(void *opaque)
             continue;
         uint8_t type     = buf[2];   /* GSMTAP hdr : type @2 */
         uint8_t sub_type = buf[12];  /* channel @12 */
-        if (type != GSMTAP_TYPE_UM)
-            continue;
-        /* L2 = buf+16 : [0]=pseudo-len, [1]=PD, [2]=message type. RR PD requis. */
+        if (type != GSMTAP_TYPE_UM || sub_type != GSMTAP_CHANNEL_BCCH)
+            continue;                /* on ne prend que le BCCH (les SI) */
+        /* (A) On accepte le SET BCCH COMPLET (SI1/2/3/4/2bis/2ter), pas juste
+         * SI3 — sinon le mobile n'a jamais le set complet ("No sysinfo yet").
+         * feed_si range chaque type dans son slot, dispatch_allc tourne dessus.
+         * On EXCLUT paging/IMM-ASS (mt=0x21 etc.) qui ne va pas sur le slot BCCH.
+         * L2 = buf+16 : [0]=pseudo-len, [1]=PD, [2]=message type. */
         if (n < GSMTAP_HDR_LEN + 3 || buf[GSMTAP_HDR_LEN + 1] != 0x06)
             continue;                               /* pas RR PD */
-        uint8_t mt = buf[GSMTAP_HDR_LEN + 2];
-        if (sub_type == GSMTAP_CHANNEL_BCCH) {
-            /* (A) SET BCCH COMPLET (SI1/2/3/4/2bis/2ter), pas juste SI3 — sinon le
-             * mobile n'a jamais le set complet ("No sysinfo yet"). feed_si range
-             * chaque type dans son slot, dispatch_allc tourne dessus. */
-            switch (mt) {
-            case 0x19: case 0x1a: case 0x1b:        /* SI1 SI2 SI3 */
-            case 0x1c: case 0x1d: case 0x1e:        /* SI4 SI2bis SI2ter */
-                break;
-            default:
-                continue;                           /* paging/SI13... sur BCCH : drop */
-            }
-            calypso_dsp_shunt_feed_si(buf + GSMTAP_HDR_LEN, (int)n - GSMTAP_HDR_LEN);
-        } else if (sub_type == GSMTAP_CHANNEL_AGCH) {
-            /* (#11) IMM ASSIGN / EXT / REJ -> agch_buf (presente sur bloc CCCH). */
-            if (mt == 0x3f || mt == 0x39 || mt == 0x3a)
-                calypso_dsp_shunt_feed_agch(buf + GSMTAP_HDR_LEN, (int)n - GSMTAP_HDR_LEN);
+        switch (buf[GSMTAP_HDR_LEN + 2]) {
+        case 0x19: case 0x1a: case 0x1b:            /* SI1 SI2 SI3 */
+        case 0x1c: case 0x1d: case 0x1e:            /* SI4 SI2bis SI2ter */
+            break;
+        default:
+            continue;                               /* paging, IMM-ASS, SI13... : drop */
         }
-        /* autres canaux : drop */
+        calypso_dsp_shunt_feed_si(buf + GSMTAP_HDR_LEN, (int)n - GSMTAP_HDR_LEN);
     }
 }
 
@@ -1055,7 +867,7 @@ static void shunt_shm_init(void)
      * /tmp/dsp_iq.cfile ; CALYPSO_SHUNT_IQ_CFILE= (vide) pour desactiver. */
     const char *cf = getenv("CALYPSO_SHUNT_IQ_CFILE");
     if (!cf)
-        cf = "/root/dsp_iq.cfile";
+        cf = "/tmp/dsp_iq.cfile";
     if (*cf) {
         g_iq_cfile = fopen(cf, "wb");
         if (g_iq_cfile)

@@ -161,18 +161,15 @@ EXEMPLES
 FICHIERS / LOGS
 ═══════════════════════════════════════════════════════════════════════════
 
-  (logs dans \$LOGDIR = ${CALYPSO_LOGDIR:-/root} ; PLUS dans /tmp = tmpfs 512M)
-  \$LOGDIR/qemu.log           QEMU + c54x DSP probes
-  \$LOGDIR/osmocon.log        osmocon (romload + bridge) + archives horodatées
-  \$LOGDIR/bridge.py.log      bridge.py si mode bridge-py
-  \$LOGDIR/calypso-ipc-device.log  si mode ipc-device
-  \$LOGDIR/osmo-trx-ipc.log   GMSK modem
-  \$LOGDIR/bts.log            osmo-bts-trx
-  \$LOGDIR/mobile.log         mobile L2 (ou ccch_scan/cell_log)
-  \$LOGDIR/fw-irda.log        IrDA capture (firmware D11)
-  \$LOGDIR/record.cfile       ring record FFT (128MB)
-  \$LOGDIR/qemu-{modem,irda}-tx.raw  dump UART TX (symlink depuis /tmp)
-  /root/mobile-gsmtap.pcap  GSMTAP capture (port 4729)
+  /root/qemu.log           QEMU + c54x DSP probes
+  /tmp/osmocon.log         osmocon (romload + bridge)
+  /tmp/bridge.py.log       bridge.py si mode bridge-py
+  /tmp/calypso-ipc-device.log  si mode ipc-device
+  /tmp/osmo-trx-ipc.log    GMSK modem
+  /tmp/bts.log             osmo-bts-trx
+  /tmp/mobile.log          mobile L2 (ou ccch_scan/cell_log)
+  /tmp/fw-irda.log         IrDA capture (firmware D11)
+  /tmp/mobile-gsmtap.pcap  GSMTAP capture (port 4729)
 
   Attach tmux : tmux a -t calypso
   Kill session : tmux kill-session -t calypso
@@ -1425,23 +1422,13 @@ if [ -n "${CALYPSO_DSP_IDLE_RANGE:-}" ] && [ "${CALYPSO_DSP_IDLE_FF:-1}" = "0" ]
 fi
 
 # ---- log paths ----
-# Tout ce qui GROSSIT (logs + records) va dans $LOGDIR (=/root, gros disque)
-# et PLUS dans /tmp (tmpfs 512M qui se remplissait -> writes échouent -> firmware
-# perd la sync -> freeze). Override : CALYPSO_LOGDIR=/autre ./run.sh.
-# Les FIFOs/sockets/PTY (osmocom_l2, *.sock, iq_*.fifo, irda.pty.link) RESTENT
-# dans /tmp (ce ne sont pas des logs, et certains chemins sont attendus là).
-LOGDIR="${CALYPSO_LOGDIR:-/root}"
-mkdir -p "$LOGDIR" 2>/dev/null || true
-QEMU_LOG="$LOGDIR/qemu.log"
-OSMOCON_LOG="$LOGDIR/osmocon.log"
-MOBILE_LOG="$LOGDIR/mobile.log"
-BTS_LOG="$LOGDIR/bts.log"
-L2_LOG="$LOGDIR/l2_client.log"
-OSMO_TRX_IPC_LOG="$LOGDIR/osmo-trx-ipc.log"
-IPC_DEVICE_LOG="$LOGDIR/calypso-ipc-device.log"
-FW_IRDA_LOG="$LOGDIR/fw-irda.log"
-RECORD_FILE="$LOGDIR/record.cfile"        # ring record FFT (128MB) -> /root, pas /tmp
-export CALYPSO_RECORD_FILE="$RECORD_FILE"  # lu par record_drain.py (defaut /tmp/record.cfile)
+QEMU_LOG="/root/qemu.log"
+OSMOCON_LOG="/tmp/osmocon.log"
+MOBILE_LOG="/tmp/mobile.log"
+BTS_LOG="/tmp/bts.log"
+L2_LOG="/tmp/l2_client.log"
+OSMO_TRX_IPC_LOG="/tmp/osmo-trx-ipc.log"
+IPC_DEVICE_LOG="/tmp/calypso-ipc-device.log"
 MON_SOCK="/tmp/qemu-calypso-mon.sock"
 L1CTL_SOCK="/tmp/osmocom_l2"
 QEMU_DUMMY_SOCK="/tmp/qemu_l1ctl_disabled"
@@ -1508,9 +1495,6 @@ if [ -f "$OSMOCON_LOG" ] && [ -s "$OSMOCON_LOG" ]; then
     mv "$OSMOCON_LOG" "$_OSMOCON_ARCHIVE" 2>/dev/null \
         && echo "[run.sh] osmocon.log précédent archivé → $_OSMOCON_ARCHIVE"
 fi
-# Purge des vieilles archives osmocon (garde les 10 dernières) : sur /tmp elles
-# remplissaient le tmpfs (cause du freeze) ; sur $LOGDIR on borne quand même.
-ls -1t "${OSMOCON_LOG%.log}".[0-9]*.log 2>/dev/null | tail -n +11 | xargs -r rm -f || true   # || true : `ls` echoue si 0 archive (set -e/pipefail)
 rm -f "$QEMU_LOG" "$OSMOCON_LOG" "$MOBILE_LOG" "$BTS_LOG" \
       "$OSMO_TRX_IPC_LOG" "$IPC_DEVICE_LOG" \
       "$MON_SOCK" "$L1CTL_SOCK" "$QEMU_DUMMY_SOCK" \
@@ -1541,18 +1525,11 @@ pkill -9 -f "inject_si3"         2>/dev/null || true
 pkill -9 -f "si_bridge"        2>/dev/null || true
 pkill -9 -f "relay_continu"     2>/dev/null || true
 pkill -9 -f "record_drain"     2>/dev/null || true
-rm -f /tmp/relay_continu.cfile /tmp/record.cfile /tmp/record.cfile.off /tmp/record.cfile.ring \
-      "$RECORD_FILE" "$RECORD_FILE.off" "$RECORD_FILE.ring" 2>/dev/null || true  # vieux record (ring -> $LOGDIR maintenant)
-# qemu-{modem,irda}-tx.raw : QEMU les ecrit HARDCODE dans /tmp (calypso_uart.c L693-695),
-# sans borne et CUMULES entre runs (jamais rm -> remplissaient /tmp). On rm + symlink
-# vers $LOGDIR : QEMU suit le symlink et ecrit sur le gros disque, sans rebuild QEMU.
-rm -f /tmp/qemu-modem-tx.raw /tmp/qemu-irda-tx.raw "$LOGDIR/qemu-modem-tx.raw" "$LOGDIR/qemu-irda-tx.raw" 2>/dev/null || true
-ln -s "$LOGDIR/qemu-modem-tx.raw" /tmp/qemu-modem-tx.raw 2>/dev/null || true
-ln -s "$LOGDIR/qemu-irda-tx.raw"  /tmp/qemu-irda-tx.raw  2>/dev/null || true
+rm -f /tmp/relay_continu.cfile /tmp/record.cfile 2>/dev/null || true  # vieux record (ring externalise maintenant)
 sleep 1   # laisse les sockets UDP/TCP se libérer avant de relancer
 pkill -9 -f irda_capture.py 2>/dev/null || true
 rm -f "$L1CTL_SOCK" "$MON_SOCK" "$QEMU_DUMMY_SOCK" /tmp/osmocom_l2_*
-rm -f "$FW_IRDA_LOG" /tmp/fw-irda.log /tmp/irda_capture.pid /tmp/irda.pty.link
+rm -f /tmp/fw-irda.log /tmp/irda_capture.pid /tmp/irda.pty.link
 # Drop the legacy mmap from previous runs -- no longer used, but lying
 # around in /dev/shm could confuse forensic forensics on old runs.
 rm -f /dev/shm/calypso_si.bin
@@ -1829,13 +1806,13 @@ if [ "$CALYPSO_IRDA_CAPTURE" = "1" ]; then
     if [ -n "$PTY_IRDA" ]; then
         echo " OK ($PTY_IRDA)"
         ln -sf "$PTY_IRDA" /tmp/irda.pty.link
-        : > "$FW_IRDA_LOG"
+        : > /tmp/fw-irda.log
         tmux new-window -t "$SESSION" -n irda
         # Lance irda_capture en background (silencieux -- il pose ses bytes
-        # dans $FW_IRDA_LOG directement, pas sur stdout) puis suit le
+        # dans /tmp/fw-irda.log directement, pas sur stdout) puis suit le
         # log en live dans la fenetre tmux pour debug visuel.
         tmux send-keys -t "$SESSION:irda" \
-            "IRDA_PTY=/tmp/irda.pty.link FW_IRDA_LOG=$FW_IRDA_LOG python3 /opt/GSM/qemu-src/tools/irda_capture.py 2>$LOGDIR/irda_capture.stderr.log & sleep 0.5 && echo '--- live tail $FW_IRDA_LOG ---' && tail -F $FW_IRDA_LOG" C-m
+            "IRDA_PTY=/tmp/irda.pty.link FW_IRDA_LOG=/tmp/fw-irda.log python3 /opt/GSM/qemu-src/tools/irda_capture.py 2>/tmp/irda_capture.stderr.log & sleep 0.5 && echo '--- live tail /tmp/fw-irda.log ---' && tail -F /tmp/fw-irda.log" C-m
         echo -n "Waiting for irda_capture to register pid..."
         for i in $(seq 1 20); do
             [ -f /tmp/irda_capture.pid ] && break
@@ -1918,7 +1895,7 @@ fi
 # Wall-clock-paced FN counter, sercomm soft:I/Q GMSK inline (BRIDGE_BSP_IQ=1).
 if [ "${CALYPSO_SKIP_BRIDGE_PY:-1}" != "1" ]; then
     BRIDGE_PY="${BRIDGE_PY:-/opt/GSM/qemu-src/bridge.py}"
-    BRIDGE_LOG="${BRIDGE_LOG:-$LOGDIR/bridge.py.log}"
+    BRIDGE_LOG="${BRIDGE_LOG:-/tmp/bridge.py.log}"
     if [ -x "$BRIDGE_PY" ]; then
         tmux new-window -t "$SESSION" -n bridge-py
         # /root/.env = venv avec gnuradio/gr-gsm/numpy/scipy.
@@ -1952,7 +1929,7 @@ fi
 if [ "${CALYPSO_DSP_SHUNT:-0}" = "1" ] && [ "${CALYPSO_SKIP_BTS:-0}" != "1" ] \
    && [ "${CALYPSO_SKIP_DEMOD_BRIDGE:-1}" != "1" ]; then
     DEMOD_BRIDGE="${CALYPSO_DEMOD_BRIDGE:-/opt/GSM/qemu_bcch_grgsm.py}"
-    DEMOD_BRIDGE_LOG="${DEMOD_BRIDGE_LOG:-$LOGDIR/demod_bridge.log}"
+    DEMOD_BRIDGE_LOG="${DEMOD_BRIDGE_LOG:-/tmp/demod_bridge.log}"
     DEMOD_PYTHON="${CALYPSO_BRIDGE_PYTHON:-/root/.env/bin/python3}"
     [ -x "$DEMOD_PYTHON" ] || DEMOD_PYTHON=python3
     if [ -f "$DEMOD_BRIDGE" ]; then
@@ -2021,7 +1998,7 @@ if [ "$CALYPSO_MODE" = "full-grgsm" ]; then
     # d underrun (c est le fwrite du ring DANS qemu qui les causait). si_bridge
     # relit record.cfile offline (= ancien comportement, SI preserve).
     pkill -9 -f record_drain.py 2>/dev/null || true
-    ( python3 /opt/GSM/record_drain.py >"$LOGDIR/record_drain.log" 2>&1 & )
+    ( python3 /opt/GSM/record_drain.py >/tmp/record_drain.log 2>&1 & )
     tmux new-window -t "$SESSION" -n grgsm-decode
     # Decodeur gr-gsm AUTO (defaut = relay). grgsm_relay_decode.py lit l'I/Q
     # continu relaye par l'IPC device (UDP 5810) -> gsm.receiver (sync FCCH/SCH,
@@ -2036,10 +2013,10 @@ if [ "$CALYPSO_MODE" = "full-grgsm" ]; then
     # reellement nourri. Le SCH/BSIC reel passe par un autre chemin (cf si_bridge).
     if [ "${CALYPSO_GRGSM_DECODER:-si-bridge}" = "si-bridge" ]; then
         tmux send-keys -t "$SESSION:grgsm-decode" \
-            "sleep 15; bash /opt/GSM/si_bridge_loop.sh 2>&1 | $TSLOG | tee $LOGDIR/grgsm_decode.log" C-m
+            "sleep 15; bash /opt/GSM/si_bridge_loop.sh 2>&1 | $TSLOG | tee /tmp/grgsm_decode.log" C-m
     else
         tmux send-keys -t "$SESSION:grgsm-decode" \
-            "sleep 15; source /root/.env/bin/activate; python3 -u $RELAY_DECODE 2>&1 | $TSLOG | tee $LOGDIR/grgsm_decode.log" C-m
+            "sleep 15; source /root/.env/bin/activate; python3 -u $RELAY_DECODE 2>&1 | $TSLOG | tee /tmp/grgsm_decode.log" C-m
     fi
     echo "[run.sh] full-grgsm : decodeur gr-gsm (${CALYPSO_GRGSM_DECODER:-relay}) lance -> SI (4730) + SCH/BSIC reel (4731)"
     # Bridge SI : grgsm_decode lit le FIFO LIVE /tmp/iq_grgsm.fifo (flux continu pousse
@@ -2105,22 +2082,14 @@ esac
 # redistribuer l'espace, sinon la 3e/4e pane devient trop etroite et tmux
 # rejette le split suivant avec "no space for new pane".
 tmux new-window -t "$SESSION" -n all \
-    "clear; echo '=== osmocon ==='; tail -F $OSMOCON_LOG"
-# qemu (qemu.log) RETIRE du pane all -> le process qemu VIT toujours dans sa
-# fenetre dediee 'qemu'. osmocon devient le pane de base.
+    "clear; echo '=== qemu ==='; tail -F $QEMU_LOG"
 # Build dynamic spec list selon ce qui tourne reellement.
-_ALL_SPECS=()
-# FFT ascii RETIREE du pane all (on utilise la FFT osmo_egprs matplotlib via fft.sh).
-# ipc-device + osmo-trx-ipc RETIRES du pane all -> vivent dans leurs fenetres dediees.
-# qemu (qemu.log) prend la place de osmo-trx-ipc (en haut a droite). Le process
-# qemu tourne dans la fenetre 'qemu' ; ici c'est juste la vue tail -F.
-_ALL_SPECS+=("qemu|$QEMU_LOG")
-# AU MILIEU (rangee horizontale centrale du tiled) : decode SI + decode BURST,
-# sniff PASSIF (gsm_sniff.py, raw socket, aucune fifo, aucune perturbation).
-[ "${CALYPSO_SKIP_DECODE_PANES:-0}" != "1" ] && _ALL_SPECS+=("si|__SI__")
-[ "${CALYPSO_SKIP_DECODE_PANES:-0}" != "1" ] && _ALL_SPECS+=("burst|__BURST__")
-[ "${CALYPSO_SKIP_BRIDGE_PY:-1}" != "1" ] && _ALL_SPECS+=("bridge-py|${BRIDGE_LOG:-$LOGDIR/bridge.py.log}")
-# bts RETIRE du pane all -> process osmo-bts-trx vit dans la fenetre dediee 'bts'.
+_ALL_SPECS=("osmocon|$OSMOCON_LOG")
+[ "${CALYPSO_SKIP_GSMTAP:-0}" != "1" ] && _ALL_SPECS+=("fft|__FFT__")
+[ "${CALYPSO_SKIP_IPC_DEVICE:-0}" != "1" ] && _ALL_SPECS+=("ipc-device|$IPC_DEVICE_LOG")
+[ "${CALYPSO_SKIP_TRX_IPC:-0}" != "1" ] && _ALL_SPECS+=("osmo-trx-ipc|$OSMO_TRX_IPC_LOG")
+[ "${CALYPSO_SKIP_BRIDGE_PY:-1}" != "1" ] && _ALL_SPECS+=("bridge-py|${BRIDGE_LOG:-/tmp/bridge.py.log}")
+[ "${CALYPSO_SKIP_BTS:-0}" != "1" ] && _ALL_SPECS+=("bts|$BTS_LOG")
 [ "${CALYPSO_SKIP_L2:-0}" != "1" ] && _ALL_SPECS+=("$CALYPSO_L2_CLIENT|$L2_TAIL_LOG")
 # gdb pane dans la window 'all'. Default OFF (CALYPSO_SKIP_GDB_PANE=1).
 # Activer avec CALYPSO_SKIP_GDB_PANE=0 (= opt-in pour debug). Le pane gdb
@@ -2128,12 +2097,9 @@ _ALL_SPECS+=("qemu|$QEMU_LOG")
 [ "${CALYPSO_SKIP_GDB_PANE:-1}" != "1" ] && _ALL_SPECS+=("gdb|__GDB__")
 for spec in "${_ALL_SPECS[@]}"; do
     name="${spec%%|*}"; log="${spec##*|}"
-    if [ "$log" = "__SI__" ]; then
-        # decode SI live (type + FN + hexa L2) via sniff passif des GSMTAP 4729/4730.
-        cmd="clear; echo '=== SI decode (4729/4730) ==='; sleep 16; python3 -u /opt/GSM/gsm_sniff.py si"
-    elif [ "$log" = "__BURST__" ]; then
-        # decode BURST live (SCH 4731 + TRXD 5700-5702) via sniff passif.
-        cmd="clear; echo '=== BURST decode (4731 + 5700-5702) ==='; sleep 16; python3 -u /opt/GSM/gsm_sniff.py burst"
+    if [ "$log" = "__FFT__" ]; then
+        # FFT live du cfile BSP (lien grgsm<->BSP) — remplace tcpdump (vire pour l'instant).
+        cmd="clear; source /root/.env/bin/activate 2>/dev/null; CFILE=/tmp/iq_asciifft.fifo FS=1083333 python3 /opt/GSM/grgsm_fft_live.py"
     elif [ "$log" = "__GDB__" ]; then
         # gdb-multiarch attaché au QEMU gdb-stub. Sleep 3 pour laisser QEMU
         # finir son init et binder le port. Pas de script -x : prompt vide
