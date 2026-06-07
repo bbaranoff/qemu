@@ -2083,12 +2083,16 @@ else
 fi
 
 # ---------- 6. gsmtap capture (any iface -- covers eth0 mobile/BTS + eth1) ----------
-# `--print` affiche en live ET continue d'ecrire le pcap ; `-U` flush par paquet
-# pour que le pcap soit utilisable immediatement (sinon buffer 4KB).
+# PAS de `--print -X` : ca deverse chaque paquet (hexdump) dans le pane et inonde
+# la vue multi-pane 'all' (ca "saute"). `-U` = flush par paquet (pcap utilisable
+# de suite). La capture va dans le pcap ; ouvre-le dans wireshark separement.
 if [ "${CALYPSO_SKIP_GSMTAP:-0}" != "1" ]; then
+# tcpdump absent de certaines images de base -> auto-install (le conteneur le
+# perd a chaque recreation depuis une image qui ne l'a pas).
+command -v tcpdump >/dev/null 2>&1 || { apt-get update -qq; apt-get install -y -qq tcpdump; } >/dev/null 2>&1 || true
 tmux new-window -t "$SESSION" -n gsmtap
 tmux send-keys -t "$SESSION:gsmtap" \
-    "sleep 5 && tcpdump -i any -U --print -X -w /root/mobile-gsmtap-$(date +%Y%m%d_%H%M%S).pcap udp port 4729" C-m
+    "sleep 5 && tcpdump -i any -U -w /root/mobile-gsmtap-$(date +%Y%m%d_%H%M%S).pcap udp port 4729" C-m
 fi  # CALYPSO_SKIP_GSMTAP
 
 # ---------- 7. window 'all' -- agrege les 6 premieres en 6 panes ----------
@@ -2117,8 +2121,8 @@ _ALL_SPECS=()
 _ALL_SPECS+=("qemu|$QEMU_LOG")
 # AU MILIEU (rangee horizontale centrale du tiled) : decode SI + decode BURST,
 # sniff PASSIF (gsm_sniff.py, raw socket, aucune fifo, aucune perturbation).
-[ "${CALYPSO_SKIP_DECODE_PANES:-0}" != "1" ] && _ALL_SPECS+=("si|__SI__")
 [ "${CALYPSO_SKIP_DECODE_PANES:-0}" != "1" ] && _ALL_SPECS+=("burst|__BURST__")
+[ "${CALYPSO_SKIP_DECODE_PANES:-0}" != "1" ] && _ALL_SPECS+=("si|__SI__")
 [ "${CALYPSO_SKIP_BRIDGE_PY:-1}" != "1" ] && _ALL_SPECS+=("bridge-py|${BRIDGE_LOG:-$LOGDIR/bridge.py.log}")
 # bts RETIRE du pane all -> process osmo-bts-trx vit dans la fenetre dediee 'bts'.
 [ "${CALYPSO_SKIP_L2:-0}" != "1" ] && _ALL_SPECS+=("$CALYPSO_L2_CLIENT|$L2_TAIL_LOG")
@@ -2130,10 +2134,10 @@ for spec in "${_ALL_SPECS[@]}"; do
     name="${spec%%|*}"; log="${spec##*|}"
     if [ "$log" = "__SI__" ]; then
         # decode SI live (type + FN + hexa L2) via sniff passif des GSMTAP 4729/4730.
-        cmd="clear; echo '=== SI decode (4729/4730) ==='; sleep 16; python3 -u /opt/GSM/gsm_sniff.py si"
+        cmd="clear; echo '=== SI decode (4729/4730) ==='; sleep 16; python3 -u /opt/GSM/qemu-src/gsm_sniff.py si"
     elif [ "$log" = "__BURST__" ]; then
         # decode BURST live (SCH 4731 + TRXD 5700-5702) via sniff passif.
-        cmd="clear; echo '=== BURST decode (4731 + 5700-5702) ==='; sleep 16; python3 -u /opt/GSM/gsm_sniff.py burst"
+        cmd="clear; echo '=== BURST decode (4731 + 5700-5702) ==='; sleep 16; python3 -u /opt/GSM/qemu-src/gsm_sniff.py burst"
     elif [ "$log" = "__GDB__" ]; then
         # gdb-multiarch attaché au QEMU gdb-stub. Sleep 3 pour laisser QEMU
         # finir son init et binder le port. Pas de script -x : prompt vide
