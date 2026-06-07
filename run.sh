@@ -2036,7 +2036,7 @@ if [ "$CALYPSO_MODE" = "full-grgsm" ]; then
     # reellement nourri. Le SCH/BSIC reel passe par un autre chemin (cf si_bridge).
     if [ "${CALYPSO_GRGSM_DECODER:-si-bridge}" = "si-bridge" ]; then
         tmux send-keys -t "$SESSION:grgsm-decode" \
-            "sleep 15; bash /opt/GSM/si_bridge_loop.sh 2>&1 | $TSLOG | tee $LOGDIR/grgsm_decode.log" C-m
+            "sleep 15; bash /opt/GSM/qemu-src/si_bridge_loop.sh 2>&1 | $TSLOG | tee $LOGDIR/grgsm_decode.log" C-m
     else
         tmux send-keys -t "$SESSION:grgsm-decode" \
             "sleep 15; source /root/.env/bin/activate; python3 -u $RELAY_DECODE 2>&1 | $TSLOG | tee $LOGDIR/grgsm_decode.log" C-m
@@ -2088,7 +2088,7 @@ fi
 if [ "${CALYPSO_SKIP_GSMTAP:-0}" != "1" ]; then
 tmux new-window -t "$SESSION" -n gsmtap
 tmux send-keys -t "$SESSION:gsmtap" \
-    "sleep 5 && tcpdump -i any -U --print -X -w /root/mobile-gsmtap.pcap udp port 4729" C-m
+    "sleep 5 && tcpdump -i any -U --print -X -w /root/mobile-gsmtap-$(date +%Y%m%d_%H%M%S).pcap udp port 4729" C-m
 fi  # CALYPSO_SKIP_GSMTAP
 
 # ---------- 7. window 'all' -- agrege les 6 premieres en 6 panes ----------
