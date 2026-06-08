@@ -17,12 +17,15 @@ ARFCN = int(os.environ.get("CALYPSO_CCCH_ARFCN", "514"))
 CF = sys.argv[1] if len(sys.argv) > 1 else "/tmp/iq_grgsm.fifo"
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-SI = {0x1b:"SI3",0x1a:"SI2",0x1c:"SI4",0x21:"SI13",0x19:"SI1",0x1d:"SI2bis",0x1e:"SI2ter",0x06:"RR"}
+SI = {0x1b:"SI3",0x1a:"SI2",0x1c:"SI4",0x19:"SI1",0x1d:"SI2bis",0x1e:"SI2ter",0x06:"RR"}  # NB: 0x21 = PAGING (pas SI13=0x00)
 # CCCH/AGCH downlink (PORTE 3a) : l'IMM ASSIGN doit etre forwarde au mobile, pas
 # seulement les SI. gr-gsm le decode (06 3f) mais si_bridge ne forwardait que les SI.
 CCCH = {0x3f:"IMM-ASSIGN", 0x39:"IMM-ASSIGN-EXT", 0x3a:"IMM-ASSIGN-REJ"}
+# Paging Request (PCH) : type1=0x21 (== GSM48_MT_RR_PAG_REQ_1, PAS SI13), type2=0x22, type3=0x24.
+PAGING = {0x21:"PAG-REQ-1", 0x22:"PAG-REQ-2", 0x24:"PAG-REQ-3"}
 GSMTAP_BCCH = 0x01
 GSMTAP_AGCH = 0x04
+GSMTAP_SDCCH4 = 0x07
 
 def fn51_role(fn):
     m = fn % 51
@@ -39,10 +42,10 @@ def gsmtap(fn, chan, l2):
                       0, 0, fn & 0xffffffff, chan, 0, 0, 0)
     return hdr + l2
 
-p = subprocess.Popen(["grgsm_decode","-m","BCCH","-t","0","-a",str(ARFCN),
+p = subprocess.Popen(["grgsm_decode","-m","BCCH_SDCCH4","-t","0","-a",str(ARFCN),
                       "-c",CF,"-s","1083333","-v"],
                      stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-n = 0; nsch = 0; last_fn = 0
+n = 0; nsch = 0; nsd = 0; last_fn = 0; last_sd_l2 = None
 for line in p.stdout:
     # --- SCH reel : "SCHBSIC <bsic> <fn> <toa>" -> 4731 + horloge FN ---
     msch = re.search(r"SCHBSIC\s+(\d+)\s+(\d+)\s+(-?\d+)", line)
@@ -64,16 +67,39 @@ for line in p.stdout:
     if not m: continue
     try: by = bytes(int(x,16) for x in m.group(1).split())
     except: continue
-    if len(by) >= 3 and by[1] == 0x06 and (by[2] in SI or by[2] in CCCH):  # RR PD + SI ou IMM ASSIGN
+    if len(by) >= 3 and by[1] == 0x06 and (by[2] in SI or by[2] in CCCH or by[2] in PAGING):
         mline_fn = re.match(r"^\s*(\d+)\b", lstr)
         si_fn = int(mline_fn.group(1)) if mline_fn else last_fn
         L2 = (by[:23] + b"\x2b"*23)[:23]
-        is_imm = by[2] in CCCH
-        chan = GSMTAP_AGCH if is_imm else GSMTAP_BCCH          # AGCH pour IMM ASSIGN, BCCH pour SI
+        # IMM ASSIGN (AGCH) ET Paging Request (PCH) -> meme chemin AGCH/PCH cote shunt
+        # (feed_agch -> bloc CCCH -> firmware chan_nr=0x90 -> gsm48_rr_rx_pch_agch qui
+        # dispatch IMM-ASS vs PAGING par msg type). SI -> BCCH.
+        is_ccch = (by[2] in CCCH) or (by[2] in PAGING)
+        chan = GSMTAP_AGCH if is_ccch else GSMTAP_BCCH
         s.sendto(gsmtap(si_fn, chan, L2), ("127.0.0.1", 4730))
         n += 1
-        name = CCCH.get(by[2]) or SI.get(by[2])
-        if is_imm or n <= 20 or n % 50 == 0:                  # toujours logger l'IMM ASSIGN
-            print("[si-bridge] %s (mt=0x%02x) FN=%d (%%51=%d %s) -> feed_si (4730)  #%d"
-                  % (name, by[2], si_fn, si_fn%51, fn51_role(si_fn), n), flush=True)
+        name = CCCH.get(by[2]) or PAGING.get(by[2]) or SI.get(by[2])
+        if is_ccch or n <= 20 or n % 50 == 0:
+            print("[si-bridge] %s (mt=0x%02x) FN=%d (%%51=%d %s) -> %s (4730)  #%d"
+                  % (name, by[2], si_fn, si_fn%51, fn51_role(si_fn),
+                     "feed_agch/PCH" if is_ccch else "feed_si", n), flush=True)
+    # --- SDCCH/4 SS0 DL (#2) : LAPDm (UA/AUTH), pas du RR -> gate fn%51 in {22-25} ---
+    mfn_sd = re.match(r"^\s*(\d+)\b", lstr)
+    sd_fn = int(mfn_sd.group(1)) if mfn_sd else last_fn
+    if len(by) >= 3 and (sd_fn % 51) in (22, 23, 24, 25):
+        L2 = (by[:23] + b"\x2b"*23)[:23]
+        # consume-once : la BTS n emet le UA/AUTH/ACCEPT qu UNE fois par etablissement,
+        # mais gr-gsm re-decode le meme bloc SDCCH a chaque multitrame (235 ms). Sans
+        # dedup le mobile recoit un flot de UA -> traite comme UA non sollicite
+        # (UNSOL_UA) -> l etablissement LAPDm ne se confirme jamais -> pas de RR_EST_CNF.
+        # On saute le bourrage (UI c=0x03) et on ne forwarde qu au CHANGEMENT de contenu.
+        ctrl = by[1] if len(by) > 1 else 0
+        is_fill = (ctrl == 0x03)
+        if (not is_fill) and L2 != last_sd_l2:
+            last_sd_l2 = L2
+            s.sendto(gsmtap(sd_fn, GSMTAP_SDCCH4, L2), ("127.0.0.1", 4730))
+            nsd += 1
+            if nsd <= 20 or nsd % 50 == 0:
+                print("[si-bridge] SDCCH/4 SS0 DL (a0=0x%02x c=0x%02x) FN=%d (%%51=%d) -> feed_sdcch (4730)  #%d [new]"
+                      % (by[0], ctrl, sd_fn, sd_fn%51, nsd), flush=True)
 print("[si-bridge] fini, %d SI / %d SCH transmis" % (n, nsch), flush=True)
