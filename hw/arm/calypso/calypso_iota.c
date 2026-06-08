@@ -8,10 +8,8 @@
 #include <string.h>
 #include "hw/arm/calypso/calypso_iota.h"
 
-#include "hw/arm/calypso/calypso_debug.h"
 #define IOTA_LOG(fmt, ...) \
-    do { if (calypso_debug_enabled("IOTA")) \
-        fprintf(stderr, "[iota] " fmt "\n", ##__VA_ARGS__); } while (0)
+    do { fprintf(stderr, "[iota] " fmt "\n", ##__VA_ARGS__); } while (0)
 
 /* Pending BDLENA windows queued by the TPU sequencer, waiting for a
  * matching downlink burst to arrive on the BSP. Sized for one full TDMA
