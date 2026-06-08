@@ -125,6 +125,29 @@ class SercommParser:
         return frames
 
 
+import sys as _sys, os as _os
+_sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), "tools"))
+
+try:
+    from doppler import apply_doppler as _doppler_apply, dump_burst as _doppler_dump
+except Exception as _doppler_exc:
+    print(f"bridge: doppler module unavailable ({_doppler_exc}) — pass-through",
+          flush=True)
+    def _doppler_apply(iq_bytes, *_a, **_kw): return iq_bytes
+    def _doppler_dump(*_a, **_kw): pass
+
+# Prefer gr-gsm spec-conforme GMSK modulator over our custom impl.
+# Fallback silencieux sur soft_bits_to_gmsk_iq custom si gnuradio absent.
+try:
+    from gmsk_grgsm import bits_to_iq_grgsm as _grgsm_mod
+    print("bridge: GMSK modulator = gr-gsm (gnuradio.digital.gmskmod_bc)",
+          flush=True)
+except Exception as _grgsm_exc:
+    _grgsm_mod = None
+    print(f"bridge: gr-gsm unavailable ({_grgsm_exc}) — fallback custom GMSK",
+          flush=True)
+
+
 def soft_to_int16(soft_bit):
     """Convert osmocom soft bit (0=strong 1, 255=strong 0) to int16."""
     return max(-32768, min(32767, int((127 - soft_bit) * 32767 / 127)))
@@ -391,6 +414,11 @@ class Bridge:
         self.fn_anchor = 0
         self.anchored = False
         self._stop = False
+        # TRXD version negotiated via SETFORMAT TRXC command.
+        # Default v0 until BTS asks otherwise. Max supported = 1.
+        # Set by SETFORMAT handler ; read by _handle_ul to choose layout.
+        self.trxd_version = 0
+        self.trxd_version_max = 1
         self.stats = {"clk": 0, "trxc": 0, "dl": 0, "ul": 0,
                       "tick": 0, "ul_fn_rewrite": 0}
 
@@ -814,16 +842,28 @@ class Bridge:
         elif verb == "POWEROFF":
             self.powered = False; rsp = "RSP POWEROFF 0"
         elif verb == "SETFORMAT":
-            # Bridge envoie TRXDv1 (= byte 0 high nibble = 1, low = TN).
-            # osmo-bts-trx récent attend strictement v1 et drop nos UL si on
-            # répond "v0". Le payload reste identique (148 soft bits ±127),
-            # seul byte 0 change. Voir _handle_ul ci-dessous.
-            # 2026-05-25 : fix passage v0→v1 pour stopper les
-            # "Rx TRXD PDU with unexpected version 0 (expected 1)".
-            requested = args[0] if args else "1"
-            rsp = "RSP SETFORMAT 0 1 1"  # status=0 (ok), accepted=1 (v1), max=1
-            print(f"TRXC SETFORMAT requested=v{requested} → reply v1 "
-                  f"(bridge sends TRXDv1)", flush=True)
+            # TRXC SETFORMAT negotiation : BTS proposes a version, we accept
+            # it if ≤ trxd_version_max, otherwise clamp down. The accepted
+            # version is then used by _handle_ul to encode UL bursts.
+            #
+            # Format de réponse osmo-bts-trx : "RSP SETFORMAT <status> <accepted> <max>"
+            # cf osmo-bts/src/osmo-bts-trx/trx_if.c trx_if_cmd_setformat()
+            #
+            # 2026-05-27 fix : auparavant on hardcodait "accepted=1" → quand BTS
+            # demandait v0 (= certaines versions d'osmo-bts attendent v0
+            # par défaut puis upgrade), on lui répondait v1 et la BTS rejetait
+            # tous les UL avec "unexpected version 1 (expected 0)".
+            try:
+                requested = int(args[0]) if args else 0
+            except ValueError:
+                requested = 0
+            accepted = min(requested, self.trxd_version_max)
+            if accepted < 0: accepted = 0
+            self.trxd_version = accepted
+            rsp = f"RSP SETFORMAT 0 {accepted} {self.trxd_version_max}"
+            print(f"TRXC SETFORMAT requested=v{requested} → accepted=v{accepted} "
+                  f"(max=v{self.trxd_version_max}, bridge will send TRXDv{accepted})",
+                  flush=True)
         elif verb == "NOMTXPOWER":
             rsp = "RSP NOMTXPOWER 0 50"
         elif verb == "MEASURE":
@@ -892,28 +932,36 @@ class Bridge:
             sent_fn = self.wall_fn()
         else:  # "slot" — default
             sent_fn = next_rach_slot_fn(self.wall_fn())
-        # TRXDv1 UL = 11 B header + 148 soft bits = 159 B (vs v0 = 8+148=156).
-        # Layout v1 :
-        #   [0]    version<<4 | TN     (high nibble=1, low nibble=TN)
+        # Encode UL selon la version négociée via SETFORMAT (self.trxd_version).
+        #
+        # v0 (8 B header + 148 soft bits = 156 B) :
+        #   [0]    TN (low 3 bits)             [version field absent]
+        #   [1:5]  FN BE
+        #   [5]    RSSI uint8
+        #   [6:8]  ToA256 BE int16
+        #   [8:]   148 soft bits ±127
+        #
+        # v1 (11 B header + 148 soft bits = 159 B) :
+        #   [0]    version<<4 | TN             (high nibble=1, low nibble=TN)
         #   [1:5]  FN BE
         #   [5]    RSSI uint8
         #   [6:8]  ToA256 BE int16
         #   [8]    MTS = 0x00 (GMSK + TSC 0, per trx_data_mod_val GMSK=0x00)
         #   [9:11] C/I BE int16 = 0 (no info)
         #   [11:]  148 soft bits ±127
-        # cf osmo-bts/src/osmo-bts-trx/trx_if.c : TRX_UL_V1HDR_LEN = 11
-        # 2026-05-25 fix : insertion MTS + C/I, stoppe l'erreur
-        # "Rx TRXD PDU with unknown or not supported modulation (MTS=0x7f)".
-        v0_hdr = bytearray(data[:8])
-        v0_hdr[0] = (1 << 4) | (data[0] & 0x07)
-        v0_hdr[1] = (sent_fn >> 24) & 0xFF
-        v0_hdr[2] = (sent_fn >> 16) & 0xFF
-        v0_hdr[3] = (sent_fn >>  8) & 0xFF
-        v0_hdr[4] =  sent_fn        & 0xFF
-        # MTS=0x00 GMSK normal burst TSC=0 ; C/I=0 (BE int16, 2 bytes)
-        v1_extra = bytes([0x00, 0x00, 0x00])
+        # cf osmo-bts/src/osmo-bts-trx/trx_if.c : TRX_UL_V0HDR_LEN=8, V1HDR_LEN=11
+        hdr = bytearray(data[:8])
+        hdr[0] = ((self.trxd_version & 0x0F) << 4) | (data[0] & 0x07)
+        hdr[1] = (sent_fn >> 24) & 0xFF
+        hdr[2] = (sent_fn >> 16) & 0xFF
+        hdr[3] = (sent_fn >>  8) & 0xFF
+        hdr[4] =  sent_fn        & 0xFF
         soft_bits = bytes(data[8:])
-        out = bytes(v0_hdr) + v1_extra + soft_bits
+        if self.trxd_version == 0:
+            out = bytes(hdr) + soft_bits
+        else:  # v1 : insert MTS + C/I between v0 header and soft bits
+            v1_extra = bytes([0x00, 0x00, 0x00])  # MTS=GMSK TSC=0 ; C/I=0 BE int16
+            out = bytes(hdr) + v1_extra + soft_bits
         if sent_fn != qemu_fn:
             self.stats["ul_fn_rewrite"] += 1
 
@@ -1027,7 +1075,16 @@ class Bridge:
         # soft-bits par défaut ; activer BRIDGE_BSP_IQ après avoir
         # adapté calypso_bsp.c side, sinon les bursts deviennent garbage).
         if BSP_IQ_MODE and payload:
-            iq_bytes = soft_bits_to_gmsk_iq(payload)
+            # gr-gsm spec-conforme si dispo, sinon fallback custom impl.
+            if _grgsm_mod is not None:
+                iq_bytes = _grgsm_mod(payload)
+            else:
+                iq_bytes = soft_bits_to_gmsk_iq(payload)
+            # Doppler/AFC rotation injection — env-gated CALYPSO_DOPPLER_HZ.
+            # No-op si Doppler=0. Permet AFC convergence vs résidu correlator
+            # parasite (cf bug FBSB chain).
+            iq_bytes = _doppler_apply(iq_bytes)
+            _doppler_dump(iq_bytes, tag="DL", fn=sent_fn, tn=tn)
             # Pour N soft bits : 2N int16 = 4N bytes IQ payload (interleaved
             # I,Q,I,Q,...). Total UDP = 8 hdr + 4N. Pour 148 bits = 600 B,
             # pour 146 bits (BTS truncate) = 592 B. BSP attend iq_bytes >= 4*nbits.

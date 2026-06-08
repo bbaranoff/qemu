@@ -8,6 +8,7 @@ in a per-run folder and a final .zip at session end.
 import datetime
 import json
 import os
+import re
 import shutil
 import subprocess
 import zipfile
@@ -171,9 +172,22 @@ def pytest_runtest_makereport(item, call):
     })
 
 
+_MERMAID_RESERVED = {"default", "end", "subgraph", "graph", "flowchart",
+                     "direction", "class", "classDef", "style", "linkStyle",
+                     "click", "href", "interpolate"}
+
 def _sanitize_node_id(s: str) -> str:
-    """Mermaid node IDs must be alphanumeric+underscore."""
-    return "".join(c if c.isalnum() else "_" for c in s)[:48]
+    """Mermaid node IDs must be alphanumeric+underscore.
+
+    Mermaid 10.2 (Quarto built-in) tokenizes some reserved words inside node
+    IDs (`default`, `end`, …) as keywords, breaking `class T_xxx_default fail;`
+    statements. We rewrite the word in place so the ID is still readable but
+    no longer collides with the keyword.
+    """
+    cleaned = "".join(c if c.isalnum() else "_" for c in s)[:48]
+    parts = cleaned.split("_")
+    parts = [p + "X" if p in _MERMAID_RESERVED else p for p in parts]
+    return "_".join(parts)
 
 
 def _label(text: str) -> str:
@@ -1101,6 +1115,32 @@ def _gen_abstract_audit(folder: Path) -> str:
         return f"_exception en exécutant `abstract.py` : {type(e).__name__}: {e}_\n"
 
 
+_ANSI_ESC_RE  = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
+_ANSI_TEXT_RE = re.compile(r'\[[0-9]+(?:;[0-9]+)*m')  # leftover post-stripped ESC
+
+def _strip_for_markdown(txt: str) -> str:
+    """Sanitize log text for Pandoc/Quarto embedding :
+    - strip ANSI color escapes (0x1B [ ... m) — Pandoc avec markdown=1 trippe
+      sur des séquences ESC brutes et génère des warnings Div parasites
+    - strip leftover text-form ANSI patterns "[1;32m" etc. — quand ESC a été
+      stripped en amont (e.g., conversion .md→.qmd), le texte garde "[1;32m"
+      que Pandoc lit comme `[link]` non-fermé
+    - strip d'autres bytes de contrôle (sauf \\n, \\t)
+    - normalise les fins de ligne CR → LF
+    Préserve le contenu lisible. """
+    txt = _ANSI_ESC_RE.sub('', txt)
+    txt = _ANSI_TEXT_RE.sub('', txt)
+    txt = txt.replace('\r', '')
+    # filter non-printable (keep \n, \t)
+    out = []
+    for ch in txt:
+        c = ord(ch)
+        if c < 0x20 and c not in (0x09, 0x0A):
+            continue
+        out.append(ch)
+    return ''.join(out)
+
+
 def _gen_diag_bundle_annex() -> str:
     """Annexe bundle : appelle `make_diag_bundle.sh` puis embarque les
     *digests* texte du tar (parse_summary, source_excerpts, static_decode,
@@ -1153,6 +1193,8 @@ def _gen_diag_bundle_annex() -> str:
                     txt = fp.read().decode("utf-8", errors="replace")
                 except Exception:
                     continue
+                # Sanitize for Pandoc/Quarto embedding : strip ANSI, control chars
+                txt = _strip_for_markdown(txt)
                 lines = txt.splitlines()
                 n = len(lines)
                 # Tronquage proportionnel : gros fichiers = head + tail
@@ -1167,9 +1209,14 @@ def _gen_diag_bundle_annex() -> str:
                             "\n".join(lines[-200:]))
                 else:
                     body = txt
+                # Ligne vide AVANT le <details> + close suivi de ligne vide :
+                # Pandoc/Quarto avec markdown="1" perd parfois la frontière
+                # entre balises HTML inline sans blank line entre elles.
+                out.append("")  # blank line separator
                 out.append(f"<details><summary><code>{m.name}</code> "
                            f"({m.size:,} bytes, {n} lignes)"
-                           f"</summary>\n\n```\n{body}\n```\n\n</details>\n")
+                           f"</summary>\n\n```\n{body}\n```\n\n</details>")
+                out.append("")  # blank line separator
         return "\n".join(out)
     except Exception as e:
         return f"_exception en générant l'annexe bundle : {type(e).__name__}: {e}_\n"
@@ -1609,20 +1656,11 @@ def pytest_sessionfinish(session, exitstatus):
             # 1. Replace ALL <br/> with space (handles multi-line labels with
             #    2+ <br/> like `name<br/>marker<br/>3.15s`).
             line = line.replace("<br/>", " ").replace("<br>", " ")
-            # 2. Strip outer `["..."]` quotes in node labels (Quarto escapes
-            #    them as &quot; which mermaid does not parse).
-            line = _re.sub(r'\["([^"\n]*?)"\]',
-                           lambda m: f'[{m.group(1)}]', line)
+            # 2. KEEP outer `["..."]` quotes. Mermaid 10.2 (Quarto built-in)
+            #    rejects unquoted labels containing ` - `, em-dash, parens.
+            #    Quarto passes ```{mermaid}``` blocks verbatim — quotes survive.
             # 3. Emojis dans edge labels   `-.->|🛑|`  →  `-.->|BREAK|`
             line = _re.sub(r'\|🛑\|', '|BREAK|', line)
-            # 4. Parentheses inside `[...]` labels confuse Mermaid parser
-            #    (interprétées comme stadium shape `id(...)`). Ex:
-            #    `T_007[test_inject_si(1) inject_frames 0.33s]` casse.
-            #    On les neutralise (espace) uniquement à l'intérieur des [].
-            line = _re.sub(
-                r'\[([^\[\]\n]*)\]',
-                lambda m: '[' + m.group(1).replace('(', ' ').replace(')', ' ') + ']',
-                line)
             out.append(line)
         return "\n".join(out)
 
@@ -1820,17 +1858,11 @@ def _gen_detail_per_category_qmd(tree: dict) -> str:
         lines = []
         for line in block.splitlines():
             line = line.replace("<br/>", " ").replace("<br>", " ")
-            # Mermaid 10.2 (Quarto built-in) parse mal certains chars dans
-            # labels sans guillemets : `·` (U+00B7) → rejeté, `|` → consommé
-            # comme délimiteur de edge label, `(` `)` → stadium shape. Le
-            # séparateur safe est `-` simple (rien qui ne soit syntaxe mermaid).
-            line = line.replace(" · ", " - ")
-            line = _re_q.sub(r'\["([^"\n]*?)"\]', lambda m: f'[{m.group(1)}]', line)
+            # KEEP `["..."]` quotes : Mermaid 10.2 (Quarto built-in) rejette
+            # tout label non quoté contenant ` - `, em-dash, `(`, `)`. Quarto
+            # passe les blocs ```{mermaid}``` verbatim — les guillemets
+            # survivent. ` · ` reste OK à l'intérieur des quotes.
             line = _re_q.sub(r'\|🛑\|', '|BREAK|', line)
-            line = _re_q.sub(
-                r'\[([^\[\]\n]*)\]',
-                lambda m: '[' + m.group(1).replace('(', ' ').replace(')', ' ') + ']',
-                line)
             lines.append(line)
         return "\n".join(lines)
     for cat in sorted(graphs):

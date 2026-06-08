@@ -1,8 +1,53 @@
 # QEMU Calypso — Claude Code Context
 
+## 🔄 SYNC MIROIRS — À FAIRE À CHAQUE ÉDITION
+
+Le **latest / autoritaire** = `trying:/opt/GSM/qemu-src` (conteneur, où on build).
+**Après CHAQUE fichier édité**, propager depuis ce latest vers :
+- `/home/nirvana/qemu-src` (miroir full host)
+- `/home/nirvana/qemu-calypso` (subset curated host, même layout `hw/arm/calypso/` + `include/` + `run.sh`)
+
+**On IGNORE `/opt/GSM/qemu-calypso`.** Commande type (depuis latest) :
+```bash
+for dst in /home/nirvana/qemu-src /home/nirvana/qemu-calypso; do
+  mkdir -p "$dst/$(dirname FILE)"; docker cp trying:/opt/GSM/qemu-src/FILE "$dst/FILE"; done
+```
+Inclure ce CLAUDE.md lui-même dans la propagation.
+
 ## Working style with user
 
 Quand l'user me donne un nouvel ordre, je **continue les taches precedentes en parallele**. Je n'abandonne PAS le contexte courant. Si un fix etait en cours et l'user demande autre chose, je termine le fix ET je traite la nouvelle demande. La file de taches s'enchaine, elle ne se reset pas.
+
+## ⚠️ RUNS NON-DÉTERMINISTES — RÈGLE INVARIANTE
+
+**Le runtime QEMU+stack est non-déterministe**. Démontré 2026-05-28 par 3 runs
+manuels du même binaire produisant 3 signatures complètement différentes :
+- `d_fb_det LATCH-CONSUME` varie (87× 0x1ef8 / 96× 0x1255 / 0 / 27× 0x0c4a / ...)
+- `BURST-IN` count varie (10..600+)
+- `SOFT-RESET-TRIG` count varie (6, 60, 26)
+- Hot poll cells varient (0x2e80 vs 0xFFEx vs ailleurs)
+- Mêmes `a_pm` valeurs jamais reproduites entre runs
+
+**Cause** : pipeline real-time, BSP recvfrom socket UDP wall-clock-paced, drain
+timer virtual mais supply async. Tout cascade.
+
+**RÈGLE pour Code dans cette session ET futures** :
+- **JAMAIS conclure d'un seul run** qu'un fix a marché ou échoué.
+- Une signature observée dans 1 run = un *tirage* parmi la distribution possible.
+- Pour valider un fix : observer un **invariant structurel** (= ce qui se passe
+  dans CHAQUE run même si les valeurs précises varient). Exemples d'invariants
+  valides :
+  - Existence d'un type d'event qui n'existait pas (BRINT0 fire avant/après)
+  - Disparition d'un hot poll dominant (0x16b3 polling stopped post-BRINT0 fix)
+  - Type de routine atteint (PC=0xda79 real publisher vs stale-AR 0x821a)
+- Pour confirmer un blocage : 2-3 runs same-binary, vérifier que le pattern
+  RESTE même si les valeurs précises varient.
+- Si une seule run est interprétée → préciser à l'user "cette observation
+  vient d'1 run, peut varier au prochain".
+
+**Anti-pattern à éviter** : dire "telle valeur prouve telle chose" ou
+"ce fix a marché" sur la base d'1 run. Ce qu'il faut dire : "cette valeur
+observée dans 1 run suggère X ; à confirmer cross-run".
 
 ## Dual-agent setup
 
@@ -73,6 +118,15 @@ DEFAULTS (run_si.sh)
 > et SPRU172C avant de patcher**, jamais contourner. Tout contournement
 > temporaire jugé inévitable doit être documenté dans `hw/arm/calypso/doc/TODO.md`
 > avec un critère de retrait.
+>
+> **Disclosure obligatoire.** Si malgré tout un hack/synth/bypass est
+> introduit (même temporaire, même env-gated), écrire EXACTEMENT en
+> tête de la réponse utilisateur :
+>
+> `ATTENTION HACK HACK HACK !!!!!!!!`
+>
+> Puis nommer le hack, son site (file:line), et le critère de retrait.
+> L'absence de ce préambule = manquement à la règle.
 
 ## Architecture
 
@@ -239,9 +293,13 @@ is fixed.
 ```bash
 # Mobile config must have `stick <arfcn>` in `ms 1` block, otherwise
 # mobile abandons FBSB after 2 retries → d_task_md stays at 1.
-CALYPSO_BSP_DARAM_ADDR=0x3fb0 ./run.sh
-# DARAM 0x3fb0 covers the DSP-read range 0x3fb3-0x3fbf (verified via
-# DARAM RD HIST). 0x3fc0 was off by 16 words.
+# 2026-05-28 : default DARAM addr fixe a 0x2a00 (via canary discovery, cf
+# doc/BOOT_TO_FBSB_SEQUENCE.md + commentaire dans calypso_bsp_init). L'ancien
+# 0x3fb0 etait FAUX (zone unmapped). Override via CALYPSO_BSP_DARAM_ADDR si besoin.
+./run.sh
+# Le default 0x2a00 couvre la zone DSP-read 0x2a00-0x2b5e (= BK=0x015e=350 mots,
+# = burst GSM oversample size). Confirme via canary 0xCAFE injecte → DSP lu
+# par PC=0x93a5 AR3=0x2a00+offset.
 ```
 
 ### Old blockers (resolved)
@@ -284,3 +342,77 @@ docker exec CONTAINER bash -c "cd /opt/GSM/qemu-src/build && ninja qemu-system-a
 - `hw/char/calypso_uart.c` — UART with RX FIFO + sercomm
 - `calypso-ipc-device` — BTS UDP bridge (clock-slave)
 - `run.sh` — Orchestrated launch (QEMU → bridge → BTS → mobile)
+
+## DIAG 2026-06-02 (pour Claude web) — Bug #3 décodeur : 0x86/0x87 MVDM→STH
+
+### Ce que le diag `run_diag_debug_all.sh` a prouvé (combo full/mobile/c54x)
+- **Localisation = 100% dans le décodeur c54x du corrélateur** (gagnée par
+  élimination, pas raccourci) : cohérence ARM↔DSP prouvée (sentinelle 0xDEAD),
+  consommation ARM OK, livraison BSP byte-identique, AFC `hz=0.0` stable.
+  `I/Q VARIE` (|max|=23340, 6 val/61 addr = vraie forme d'onde) → corrélateur
+  aval suspecté, PAS l'input. `rxlev<=-110` est un leurre (reporting PM = aval
+  du corrélateur cassé).
+- **Symptôme dominant = runaway SP** : SP-LEDGER passe **0x0097 → 0xcade** entre
+  insn 262.8M et 282.8M puis **gèle** (pushes/pops/irq figés 379/2681/1048).
+  pops>pushes mais net_words explose → **une instruction écrit SP=0xcade**
+  (pas un déséquilibre push/pop) = désync de flux, pas une fuite.
+- **AR3=0000 figé** dans IQ-READ (`PC=0x7e6f`, op voisin `0x8693 @0x7e71`).
+- Contexte : le wedge arrive **juste après** dispatch FB (`task_md=5`,
+  `on_dsp_task_change task=5`) → le pipeline FB est enfin armé, mais wedge avant
+  d'écrire `d_fb_det` (ARM lit `d_fb_det=0x0000` en boucle).
+
+### Root cause (vérifié ISA, règle #1)
+`0x8693 @0x7e71` = **`STH A, ASM, *AR3+`** (1 mot, AR3 post-incr) per
+`doc/opcodes/tic54x_hi8_map.md` L95 (`sth 0x8600/0xFE00`). L'ému le décodait en
+**MVDM/MVMD 2-mots** (`hi8==0x86/0x87`, marqué « TODO swap » par l'auteur) :
+1. **longueur 2 au lieu de 1** → bouffe l'opcode suivant → **désync cascade**
+   (= SP→0xcade) ;
+2. n'incrémente jamais l'AR du Smem → **AR3 figé/0** dans la boucle FB.
+Le « op=0000 » qu'on cherchait avant était une trace **pré-fix** (XPC=3 fetchait
+prog[0x3ee00] vide) — clos par le fix `c54x_prog_xlate` (0xE000+ ignore XPC) +
+PDROM chargé. Pas un bug de sonde : `op=prog_fetch(s,s->pc)` disait vrai.
+
+### Fix (commit en cours)
+`c54x_exec_one` : `0x86/0x87` → `STH src,ASM,Smem` 1-mot, mirror exact du
+handler `0x84` (STL A,ASM,Smem) déjà validé, store HIGH word, `src=hi8&1`.
+**Orthogonal au revert 0x72/0x73** (`REVERT_MVMD_KNOWLEDGE.md`) : l'assembleur
+TI encode MVDM=0x72/MVMD=0x73, JAMAIS à 0x86/0x87 → aucun 0x86xx ROM n'est une
+vraie MVDM.
+
+### Proof-gate (à mesurer cross-run, runtime non-déterministe)
+1. **AR3 BALAYE** le buffer I/Q dans IQ-READ (0x2a00→0x2a.. incrémente, plus figé/0).
+2. SP-LEDGER ne slamme plus à 0xcade (pas de gel post-262M).
+3. corrélateur complète une passe → **`d_fb_det` bit15 armé sur input réel**
+   (PAS forcé), propagé à l'ARM → `Channel synched` BSIC/SNR réels.
+
+### Prochain étage = audit différentiel décodeur (au lieu de peler bug par bug)
+Même classe que SACCD / XPC-paging / AR3-zero : trous **longueur/mode/mnémo**.
+TODO connus dans `tic54x_hi8_map.md` (col. misclassification) : 0x85 (MVPD→STL B),
+0x8B (POPD), 0xDD/0xDE/0xCD/0xC5/0xCE (parallel-store mal décodés), 0xAA-AB.
+Pas de désassembleur `tic54x` dispo (binutils host sans la cible) → audit
+table-driven : logger `(PC, op, consumed)` sur l'overlay 0x8000-0x9fff,
+diff la colonne **longueur** vs map authoritative. Priorité longueur (cascade).
+
+## DIAG 2026-06-02 SOIR (bilan session) — cause (c) localisée, MVDM bloqué
+
+Chaîne **mesurée saine boundary-par-boundary** (BTS→ipc→bridge→BSP→DARAM→DSP→ARM→L2).
+Le mur n'est PAS une intersection — c'est UNE boîte : la décision FB-det dans le DSP.
+
+**Fixes validés gardés :** 0x86/0x87=STH (SP wedge mort, AR3 balaie), 0x8E/0x8F=CMPS
+(nécessaire pas suffisant), sonde `DRAIN-CB delivered=` (vrai compteur `bursts_written`
+vs `bursts_seen` MORT = red herring). Outils : DECODE-AUDIT (CALYPSO_DA_LO/HI/INSN),
+token FBDET.
+
+**Cause (c) prouvée :** DECODE-AUDIT gaté insn>250M → `PC=0xf564 op=0x7215 MVDM`
+dans la boucle dispatch FB décodé 1-mot (0x72/0x73 retirés par revert) → opérande
+exécutée comme opcode → desync → AR5 (ptr handler) jamais chargé → tâche FB jamais
+dispatchée → `0x9ac0` jamais ré-atteint past-boot (DETECTOR-RUN 5× boot) → ANGLE-WR=0
+(SNR/PM jamais écrits) → d_fb_det jamais armé.
+
+**MVDM 2-mots ISA-correct RÉGRESSE (gardé reverté) :** avance dispatch à PC=0xee38
+(task=5 sur 2 pages) mais **AR3 hors-buffer 0x2b97>0x2b28** → A=0 → delivered=0 →
+INT3 mort (irq 3860→4) = deadlock (bug compensateur upstream, REVERT_MVMD_KNOWLEDGE.md).
+
+**NEXT LEAD :** d'où vient AR3=0x2b97 (hors-buffer) à 0xee38 ? Le fixer débloque le
+MVDM ISA → (c) résolu. Garder 0x86/87+CMPS, ré-appliquer 0x72/0x73, tracer le setup AR3.
+**AFC figée = esclave de la FB-det, PAS la cause** (FB établit la réf fréquence).
