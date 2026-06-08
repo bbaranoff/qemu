@@ -1908,7 +1908,7 @@ fi
 if [ "${CALYPSO_SKIP_TRX_IPC:-0}" != "1" ]; then
     tmux new-window -t "$SESSION" -n osmo-trx-ipc
     tmux send-keys -t "$SESSION:osmo-trx-ipc" \
-        ": > $OSMO_TRX_IPC_LOG && $OSMO_TRX_IPC -C $OSMO_TRX_IPC_CFG 2>&1 | $TSLOG | tee $OSMO_TRX_IPC_LOG" C-m
+        ": > $OSMO_TRX_IPC_LOG && $OSMO_TRX_IPC -C $OSMO_TRX_IPC_CFG 2>&1 | cat -v | $TSLOG | tee $OSMO_TRX_IPC_LOG" C-m
 else
     echo "[run.sh] SKIP_TRX_IPC=1 -- osmo-trx-ipc non lance"
 fi
