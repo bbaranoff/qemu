@@ -667,7 +667,22 @@ static void shunt_dispatch_allc(uint8_t page_idx)
             g_shunt.sdcch_valid = false;                  /* perime -> rendre la main aux SI */
         } else {
             int tc = (int)((((long)shunt_l1s_fn() + sdcch_ofs) % 51 + 51) % 51);
-            int is_sdcch4_ss0 = (tc >= 22 && tc <= 25);
+            /* BURST-COVERAGE FIX (#2) : le firmware (prim_rx_nb.c l1s_nb_resp) ne
+             * copie a_cd[3..14] dans L1CTL_DATA_IND qu'au 4eme burst du bloc
+             * (d_burst_d==3) et tague alors chan_nr=0x20. Le bloc SDCCH/4 SS0 dure
+             * 4 bursts (FN consecutifs) : ses bursts s'etalent sur fn%51 {25,26,27,28}
+             * pour l'alignement 5216, donc l'ancien gate {22-25} ne matchait QUE le
+             * burst_d=0 et le consume-once tc>=24 liberait le buffer AVANT le
+             * burst_d==3 -> le SI3 ecrasait a_cd au moment ou le firmware lit. On
+             * gate donc sur g_shunt.d_burst_d (le compteur de burst du firmware,
+             * deja echo dans RP_D_BURST_D) : on presente le UA sur burst_d 0..3 du
+             * bloc SDCCH/4 SS0 (un seul bloc), puis on libere APRES burst_d==3.
+             * Ainsi a_cd tient le UA quand le firmware le copie au burst_d==3, et la
+             * trame est presentee EXACTEMENT une fois (1 DATA_IND/bloc) -> pas de
+             * re-presentation sur la multitrame suivante -> pas de UNSOL_UA. tc reste
+             * une garde large {22-28} (les 4 bursts) en plus du burst_d pour ne pas
+             * empieter sur les autres blocs. */
+            int is_sdcch4_ss0 = (tc >= 22 && tc <= 28);
             if (is_sdcch4_ss0) {
                 uint32_t aa = BASE_API_NDB + NDB_A_CD;
                 shunt_write_w(aa + 0, 0x0000);            /* a_cd[0] FIRE = CRC pass */
@@ -690,12 +705,17 @@ static void shunt_dispatch_allc(uint8_t page_idx)
                     fprintf(stderr, "[dsp-shunt] DISPATCH SDCCH/4 SS0 #%u burst_d=%u "
                             "tc=%d -> a_cd (chan_nr=0x20 attendu)\n",
                             n_sdcch, g_shunt.d_burst_d, tc);
-                /* CONSUME-ONCE : presenter sur UN bloc {22-24} puis liberer. La LAPDm
-                 * est sequencee (PAS du broadcast comme l'AGCH) : re-presenter la meme
-                 * trame sur les blocs suivants = MDL-Error cause 3 (UNSOL_UA_RESP) et
-                 * casse le sequencement des I-frames DL (AUTH/ACCEPT). Si un bloc est
-                 * rate, la retransmission T200 de la BTS re-alimente feed_sdcch. */
-                if (tc >= 24)
+                /* CONSUME-ONCE (corrige) : presenter le UA sur TOUS les bursts du
+                 * bloc (burst_d 0,1,2,3) pour qu'il soit TOUJOURS dans a_cd[3..14]
+                 * quand le firmware le copie au burst_d==3 (prim_rx_nb.c), PUIS
+                 * liberer APRES ce burst_d==3. Le firmware n'emet qu'UN
+                 * L1CTL_DATA_IND par bloc (au burst_d==3), donc -> 1 seul UA cote
+                 * LAPDm, et le buffer n'est PAS re-presente sur le bloc SS0 de la
+                 * multitrame suivante -> pas de UNSOL_UA. (L'ancien code liberait au
+                 * tc>=24, AVANT le burst_d==3 : le SI3 ecrasait alors a_cd.) Si le
+                 * bloc est rate, la retransmission T200 de la BTS re-alimente
+                 * feed_sdcch (et si_bridge re-forwarde le UA re-emis, FN distinct). */
+                if (g_shunt.d_burst_d >= 3)
                     g_shunt.sdcch_valid = false;
                 return;                                   /* ce dispatch = le bloc SDCCH DL */
             }

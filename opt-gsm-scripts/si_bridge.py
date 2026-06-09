@@ -45,7 +45,7 @@ def gsmtap(fn, chan, l2):
 p = subprocess.Popen(["grgsm_decode","-m","BCCH_SDCCH4","-t","0","-a",str(ARFCN),
                       "-c",CF,"-s","1083333","-v"],
                      stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-n = 0; nsch = 0; nsd = 0; last_fn = 0; last_sd_l2 = None
+n = 0; nsch = 0; nsd = 0; last_fn = 0; last_sd_fn = -1
 for line in p.stdout:
     # --- SCH reel : "SCHBSIC <bsic> <fn> <toa>" -> 4731 + horloge FN ---
     msch = re.search(r"SCHBSIC\s+(\d+)\s+(\d+)\s+(-?\d+)", line)
@@ -88,15 +88,20 @@ for line in p.stdout:
     sd_fn = int(mfn_sd.group(1)) if mfn_sd else last_fn
     if len(by) >= 3 and (sd_fn % 51) in (22, 23, 24, 25):
         L2 = (by[:23] + b"\x2b"*23)[:23]
-        # consume-once : la BTS n emet le UA/AUTH/ACCEPT qu UNE fois par etablissement,
-        # mais gr-gsm re-decode le meme bloc SDCCH a chaque multitrame (235 ms). Sans
-        # dedup le mobile recoit un flot de UA -> traite comme UA non sollicite
-        # (UNSOL_UA) -> l etablissement LAPDm ne se confirme jamais -> pas de RR_EST_CNF.
-        # On saute le bourrage (UI c=0x03) et on ne forwarde qu au CHANGEMENT de contenu.
+        # DEDUP PAR FN (corrige) : gr-gsm peut re-decoder le MEME bloc on-air (meme FN)
+        # -> il faut sauter ce doublon (re-decode). MAIS la BTS RE-EMET legitimement le
+        # MEME contenu (UA byte-identique) sur un FN DIFFERENT en reponse a une
+        # retransmission SABM T200 du mobile : ce re-UA DOIT etre forwarde sinon le
+        # mobile ne confirme jamais (UA rate -> boucle SABM -> "SABM not expected in
+        # timer recovery"). L'ancien dedup-par-contenu (L2 != last_sd_l2) DROPPAIT ce
+        # re-UA legitime. On dedup donc par FN decode (sd_fn) : grgsm emet chaque FN
+        # on-air UNE seule fois (FN monotone, verifie) -> dedup-par-FN supprime le
+        # re-decode (meme FN) ET forwarde le re-envoi BTS (FN distinct, meme contenu).
+        # On saute toujours le bourrage LAPDm (UI c=0x03).
         ctrl = by[1] if len(by) > 1 else 0
         is_fill = (ctrl == 0x03)
-        if (not is_fill) and L2 != last_sd_l2:
-            last_sd_l2 = L2
+        if (not is_fill) and sd_fn != last_sd_fn:
+            last_sd_fn = sd_fn
             s.sendto(gsmtap(sd_fn, GSMTAP_SDCCH4, L2), ("127.0.0.1", 4730))
             nsd += 1
             if nsd <= 20 or nsd % 50 == 0:
