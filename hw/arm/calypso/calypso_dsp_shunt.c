@@ -165,6 +165,9 @@ struct dsp_shunt_state {
 /* FN TDMA reelle (calypso_trx.c) pour recoder la FN du shunt (LATCH d_fn=0). */
 extern uint32_t calypso_trx_get_fn(void);
 extern void l1ctl_inject_dl_si(const uint8_t *l2, int l2len, uint32_t fn);
+/* FN-FIX : FN du dernier L1CTL_RACH_CONF (= memo exact du mobile), capture dans
+ * l1ctl_sock.c au moment de l'envoi au mobile (race-free vs last_rach.fn@0x836500). */
+extern volatile uint32_t g_last_rach_conf_fn;
 
 static struct dsp_shunt_state g_shunt;
 
@@ -199,6 +202,26 @@ static uint32_t shunt_l1s_fn(void)
     return le32_to_cpu(v);
 }
 
+/* Lit last_rach.fn : le FN EXACT que le firmware a memorise pour la DERNIERE RACH
+ * (prim_rach.c:94 last_rach.fn = current_time.fn-1, pose au tick l1s_tx_rach_resp)
+ * et qu'il a envoye au mobile via L1CTL_RACH_CONF (prim_rach.c:114). C'EST la valeur
+ * que le mobile compare a la req-ref de l'IMM ASSIGN (gsm48_rr.c:3372). La lire
+ * directement = match EXACT, sans le skew variable de g_rach_l1s_fn[ra] (capture au
+ * tick d_rach/cmd, -4 frames AVANT que le memo soit pose au tick resp -> l'ecart
+ * cmd<->resp varie par-RACH, c'est lui qui faisait derailler tout adj fixe).
+ * struct { uint32_t fn; uint16_t band_arfcn; } last_rach @ 0x836500, fn @ offset 0. */
+static uint32_t shunt_last_rach_fn(void)
+{
+    static uint32_t addr = 0;
+    if (!addr) {
+        const char *e = getenv("CALYPSO_LAST_RACH_FN_ADDR");
+        addr = (e && *e) ? (uint32_t)strtoul(e, NULL, 0) : 0x836500;
+    }
+    uint32_t v = 0;
+    dma_memory_read(g_shunt.as, addr, &v, sizeof(v), MEMTXATTRS_UNSPECIFIED);
+    return le32_to_cpu(v);
+}
+
 /* SONDE B : table RA -> FN L1 firmware (l1s.current_time.fn) au moment de la RACH.
  * Remplie par calypso_trx.c (hook write d_rach). Sert à réécrire la req-ref de
  * l'IMM ASSIGN au FN exact que le mobile a mémorisé (preuve que le FN = dernier mur). */
@@ -224,6 +247,18 @@ static void calypso_sdcch_ul_publish(const uint8_t *l2, uint16_t task_u,
         if (fd >= 0 && ftruncate(fd, 48) < 0) { /* best-effort */ }
     }
     if (fd < 0) return;
+    /* #2 PUBLISH-NO-IDLE : NE PAS republier la trame de remplissage (UI, ctrl=0x03).
+     * Le firmware poste pu_get_idle_frame()=01 03 01 dans a_cu entre les bursts SABM
+     * (burst_id==0, rien en file L23). Chaque publish bumpait seq -> ecrasait la SABM
+     * transitoire (~4 frames) dans la slot unique du sideband AVANT que le consommateur
+     * (qemu_wrap, 1 pread/frame) ne l'echantillonne -> seul l'idle remontait, jamais la
+     * SABM (01 3f) -> osmo-bts jamais de SABM -> jamais d'UA -> T200xN200 -> RR released.
+     * En ne publiant QUE les trames signalisantes (ctrl != 0x03), tout nouveau seq est
+     * porteur et ne peut plus etre clobbere par le fill -> la SABM tient jusqu'a ce que
+     * le consommateur sticky la capture. CALYPSO_UL_PUB_IDLE=1 retablit l'ancien comportement. */
+    static int pub_idle = -1;
+    if (pub_idle < 0) { const char *e = getenv("CALYPSO_UL_PUB_IDLE"); pub_idle = (e && *e == '1') ? 1 : 0; }
+    if (!pub_idle && l2[1] == 0x03) return;   /* trame de fill (UI) : ne pas ecraser la signalisation */
     static uint32_t seq = 0; seq++;
     uint8_t buf[48] = {0};
     memcpy(buf + 4,  &l1s_fn, sizeof(l1s_fn));
@@ -879,19 +914,39 @@ static void calypso_dsp_shunt_feed_agch(const uint8_t *l2, int len)
     memcpy(g_shunt.agch_buf, l2, n);
     for (int i = n; i < 23; i++) g_shunt.agch_buf[i] = 0x2B;
 
-    /* SONDE B (CALYPSO_REQREF_REWRITE=1, JETABLE — PAS un fix : modifie le message
-     * réseau) : réécrit la request-reference de l'IMM ASSIGN (octets L2 [8],[9]) au
-     * FN L1 que le mobile a mémorisé pour cette RA (g_rach_l1s_fn[RA] + adj), pour
-     * PROUVER que le FN est le dernier mur. RA = L2[7]. Encodage req-ref (04.08) :
-     *   [8] = (T1'<<3) | (T3>>3) ; [9] = ((T3&7)<<5) | T2 ; T1'=(FN/1326)%32. */
+    /* FN-FIX (le vrai fix, ON par defaut ; CALYPSO_REQREF_REWRITE=0 pour A/B) :
+     * reecrit la request-reference de l'IMM ASSIGN (octets L2 [8],[9]) au FN EXACT que
+     * le firmware a memorise pour la derniere RACH = last_rach.fn (@0x836500). RAISON :
+     * le FN de la req-ref vit dans l'horloge osmo-trx (sample-position, base ~2465144),
+     * le mobile le compare a SA propre horloge L1 (la valeur recue en L1CTL_RACH_CONF =
+     * last_rach.fn, prim_rach.c:114) ; ces deux compteurs free-running ont une phase de
+     * depart non controlee et variable par-RACH -> mismatch gsm48_rr.c:3382. Aucun
+     * cal_off/ul_fnoff/fn_adj cote device ne peut les aligner.
+     * On lit donc DIRECTEMENT last_rach.fn (la valeur que le mobile a memorisee, par
+     * construction) au lieu de g_rach_l1s_fn[ra]+adj : ce dernier capturait current_time
+     * au tick d_rach/cmd, soit -4 frames AVANT que le firmware pose last_rach.fn =
+     * current_time-1 au tick rach_resp -> skew variable (constate : adj devait passer de
+     * -1 a +1 entre deux runs). last_rach.fn n'a aucun skew ni collision RA (1 seule RACH
+     * en vol cote mobile). Le check du mobile (gsm48_rr.c:3372) est PUREMENT local : il
+     * matche (ra,T1,T2,T3) contre son propre cr_hist ; le FN est informationnel. Donc
+     * req-ref := last_rach.fn => match exact, sans constante FN magique ni adj.
+     * RA = L2[7] (log seulement). Encodage req-ref (04.08) :
+     *   [8] = (T1'<<3) | (T3>>3) ; [9] = ((T3&7)<<5) | T2 ; T1'=(FN/1326)%32.
+     * adj=0 par defaut (last_rach.fn EST le memo) ; surchargeable CALYPSO_REQREF_ADJ. */
     {
         static int reqref_rw = -1, rr_adj = -99999;
-        if (reqref_rw < 0)    { const char *e = getenv("CALYPSO_REQREF_REWRITE"); reqref_rw = (e && *e == '1') ? 1 : 0; }
-        if (rr_adj == -99999) { const char *e = getenv("CALYPSO_REQREF_ADJ");     rr_adj = e ? atoi(e) : -1; }
+        if (reqref_rw < 0)    { const char *e = getenv("CALYPSO_REQREF_REWRITE"); reqref_rw = (e && *e == '0') ? 0 : 1; }
+        if (rr_adj == -99999) { const char *e = getenv("CALYPSO_REQREF_ADJ");     rr_adj = e ? atoi(e) : 0; }
         if (reqref_rw && n >= 10 && g_shunt.agch_buf[2] == 0x3f) {
             uint8_t ra = g_shunt.agch_buf[7];
-            if (g_rach_l1s_valid[ra]) {
-                int64_t fn = (int64_t)g_rach_l1s_fn[ra] + rr_adj;
+            uint32_t memo_fn = g_last_rach_conf_fn;   /* FN-FIX : memo capture du RACH_CONF (race-free) */
+            { static unsigned dbg = 0;
+              if (dbg++ < 40)
+                  fprintf(stderr, "[dsp-shunt] FN-FIX probe RA=0x%02x "
+                          "memo_fn(RACH_CONF)=%u last_rach@500=%u l1s_fn=%u n=%d\n",
+                          ra, memo_fn, shunt_last_rach_fn(), shunt_l1s_fn(), n); }
+            if (memo_fn) {
+                int64_t fn = (int64_t)memo_fn + rr_adj;
                 if (fn < 0) fn = 0;
                 uint16_t t1p = (uint16_t)(((uint32_t)fn / 1326u) % 32u);
                 uint8_t  t2  = (uint8_t)((uint32_t)fn % 26u);
@@ -900,8 +955,8 @@ static void calypso_dsp_shunt_feed_agch(const uint8_t *l2, int len)
                 g_shunt.agch_buf[9] = (uint8_t)(((t3 & 7) << 5) | (t2 & 0x1f));
                 static unsigned rwlog = 0;
                 if (rwlog++ < 30)
-                    fprintf(stderr, "[dsp-shunt] SONDE-B req-ref RA=0x%02x reecrite -> "
-                            "fn=%u (T1'=%u T2=%u T3=%u) adj=%d\n",
+                    fprintf(stderr, "[dsp-shunt] FN-FIX req-ref RA=0x%02x reecrite -> "
+                            "fn=%u (T1'=%u T2=%u T3=%u) adj=%d [last_rach.fn]\n",
                             ra, (uint32_t)fn, t1p, t2, t3, rr_adj);
             }
         }
