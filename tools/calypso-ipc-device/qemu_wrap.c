@@ -1027,6 +1027,7 @@ int32_t uhdwrap_read(void *dev, uint32_t num_chans)
         static uint8_t pend_l2[23]; static int pend_valid = 0;   /* trame UL en attente (1 bloc) */
         static uint32_t last_seq = 0; static int sticky = -1;
         static uint8_t l1s51 = 0xff;
+        static int sd_autoofs = -99999;          /* offset auto-calibre l1s%51 -> osmo s51 */
         if (sticky < 0) { const char *e = getenv("CALYPSO_UL_SABM_STICKY"); sticky = (!e || *e != '0') ? 1 : 0; }
         { uint8_t l2[23]; uint32_t lfn = 0, seq = 0;
           if (calypso_sdcch_ul_read(l2, &l1s51, &lfn, &seq)) {
@@ -1036,23 +1037,56 @@ int32_t uhdwrap_read(void *dev, uint32_t num_chans)
                * Remplace le buffer sticky a TTL partage qui faisait SAPI3 ecraser SAPI0
                * pendant le SMS -> lien principal down. Le firmware multiplexe deja SAPI0/
                * SAPI3 par bloc ; un miss -> retransmission T200 (nouveau seq) -> recapture.
-               * Filtre : idle (UI 0x03) et SACCH SAPI1 (sapi=(a0>>2)&7) ecartes. */
+               * Filtre : idle (UI 0x03) et SACCH SAPI1 (sapi=(a0>>2)&7) ecartes.
+               * NB : depuis le fix PUBLISH-NO-IDLE cote QEMU, l'idle n'est PLUS publie ->
+               * tout seq nouveau est porteur ; le filtre is_fill reste (defensif). */
               int sapi = (l2[0] >> 2) & 0x07;
               int is_fill = (l2[1] == 0x03);
               if (sticky && seq != last_seq && (sapi == 0 || sapi == 3) && !is_fill) {
                   last_seq = seq;
                   memcpy(pend_l2, l2, sizeof(pend_l2)); pend_valid = 1;
+                  /* #2 v3 ALIGNEMENT DETERMINISTE (2026-06-09) : l'ancien auto-calib
+                   * (sd_autoofs = 37 - osmo_fn%51) derivait l'offset de l'INSTANT ou le
+                   * firmware publie la SABM, dicte par l1s.current_time.fn -> seede par
+                   * le SCH FN que gr-gsm decode au sync -> RUN-VARIANT. SUPPRIME.
+                   * Avec osmo-trx START_FN=0 ET IPCDevice ts_initial snappe a 102*5000,
+                   * osmo_trx_fn == internal_fn (mod 102) ; ul_fnoff=36 -> eff_ofs FIXE=15
+                   * place bid0..3 sur osmo_trx_fn%51 {37,38,39,40} = SDCCH/4 SS0 UL.
+                   * CALYPSO_UL_SDCCH_OFS surcharge pour sweeper si besoin. */
               }
           } }
-        uint32_t s51 = (uint32_t)((((long)osmo_fn + sd_ofs) % 51 + 51) % 51);
+        int eff_ofs = (sd_ofs != 0) ? sd_ofs : 15;
+        uint32_t s51 = (uint32_t)((((long)osmo_fn + eff_ofs) % 51 + 51) % 51);
         if (ul_src != ul_chunk && s51 >= 37 && s51 <= 40) {   /* SDCCH/4 SS0 UL block */
             int bid = (int)s51 - 37;
-            /* COHÉRENCE DE BLOC : latch a bid 0, reutilise blk_l2 pour bid 1..3. */
+            /* COHÉRENCE DE BLOC (#2 v2) : osmo-bts desentrelace les 4 bursts osmo%51
+             * {37,38,39,40} EN UN bloc L2 -> les 4 DOIVENT porter le MEME L2. On TIENT
+             * donc la derniere trame signalisante captee (held_l2) de facon persistante
+             * et on la snapshot -> blk_l2 UNIQUEMENT a bid 0, reutilisee pour bid 1..3.
+             * Plus de latch mid-bloc (qui rendait le bloc incoherent : bid0=idle +
+             * bid1-3=SABM -> CRC fail). held tient jusqu'a remplacement par une nouvelle
+             * capture OU expiration (CALYPSO_UL_SABM_HOLD_TTL blocs, def 30 ~7s ; rafraichi
+             * a chaque capture). La SABM etant retransmise ~1/s (T200) et injectee sur
+             * ~4 blocs/s, osmo-bts voit plusieurs blocs SABM COHERENTS -> decode -> UA.
+             * CALYPSO_UL_SABM_HOLD=0 = legacy (pas de hold persistant). */
+            static uint8_t held_l2[23]; static int held_valid = 0; static int held_ttl = 0;
             static uint8_t blk_l2[23]; static int blk_valid = 0;
-            if (bid == 0) {
-                if (sticky && pend_valid) { memcpy(blk_l2, pend_l2, sizeof(blk_l2)); blk_valid = 1; pend_valid = 0; }
-                else { blk_l2[0] = 0x01; blk_l2[1] = 0x03; blk_l2[2] = 0x01;   /* idle UI SDCCH FIXE SAPI0 */
-                       memset(blk_l2 + 3, 0x2b, sizeof(blk_l2) - 3); blk_valid = 1; }
+            static int hold_on = -1, hold_ttl_max = -1;
+            if (hold_on < 0) { const char *e = getenv("CALYPSO_UL_SABM_HOLD"); hold_on = (!e || *e != '0') ? 1 : 0; }
+            if (hold_ttl_max < 0) { const char *e = getenv("CALYPSO_UL_SABM_HOLD_TTL"); hold_ttl_max = (e && *e) ? atoi(e) : 30; }
+            /* capture persistante : toute nouvelle trame signalisante remplace held_l2 */
+            if (sticky && pend_valid) {
+                memcpy(held_l2, pend_l2, sizeof(held_l2)); held_valid = 1;
+                held_ttl = hold_on ? hold_ttl_max : 1; pend_valid = 0;
+            }
+            if (bid == 0) {                         /* snapshot 1×/bloc -> 4 bursts coherents */
+                if (held_valid && held_ttl > 0) {
+                    memcpy(blk_l2, held_l2, sizeof(blk_l2)); blk_valid = 1;
+                    if (--held_ttl == 0) held_valid = 0;
+                } else {
+                    blk_l2[0] = 0x01; blk_l2[1] = 0x03; blk_l2[2] = 0x01;   /* idle UI SDCCH FIXE SAPI0 */
+                    memset(blk_l2 + 3, 0x2b, sizeof(blk_l2) - 3); blk_valid = 1;
+                }
             }
             if (blk_valid) {
                 int8_t ab[CALYPSO_BSP_BURSTLEN];
@@ -1072,10 +1106,12 @@ int32_t uhdwrap_read(void *dev, uint32_t num_chans)
                 memcpy(ul_chunk + 2 * off, g_ul_iq, sizeof(g_ul_iq));
                 ul_src = ul_chunk;
                 static unsigned sd_inj = 0;
-                if (sd_inj++ < 40 || (sd_inj % 200) == 0)
+                int is_idle_inj = (blk_l2[0] == 0x01 && blk_l2[1] == 0x03 && blk_l2[2] == 0x01);
+                if (sd_inj++ < 40 || !is_idle_inj || (sd_inj % 200) == 0)
                     LOGP(DDEV, LOGL_NOTICE,
-                         "UL SDCCH inject #%u bid=%d osmo%%51=%u l1s%%51=%u L2=%02x %02x %02x\n",
-                         sd_inj, bid, s51, l1s51, blk_l2[0], blk_l2[1], blk_l2[2]);
+                         "UL SDCCH inject #%u%s bid=%d osmo%%51=%u l1s%%51=%u eff_ofs=%d L2=%02x %02x %02x\n",
+                         sd_inj, is_idle_inj ? "" : " *SABM/SIG*", bid, s51, l1s51,
+                         eff_ofs, blk_l2[0], blk_l2[1], blk_l2[2]);
             }
         }
     }

@@ -93,6 +93,13 @@ typedef struct L1CTLSock {
 
 static L1CTLSock g_l1ctl;
 
+/* FN-FIX : le FN que le firmware envoie au mobile dans L1CTL_RACH_CONF (msg type
+ * 0x0c), capture ICI au moment EXACT ou le mobile le recoit (= ce qu'il memorise
+ * pour matcher la req-ref de l'IMM ASSIGN, gsm48_rr.c:3372). Lu par le shunt
+ * (calypso_dsp_shunt.c) pour reecrire la req-ref. Source race-free : pas de lecture
+ * paresseuse de last_rach.fn @0x836500 (qui est asynchrone vs l'IMM ASS du BTS). */
+volatile uint32_t g_last_rach_conf_fn = 0;
+
 /* ---- Sercomm helpers ---- */
 
 static int sercomm_wrap(uint8_t dlci, const uint8_t *payload, int plen,
@@ -227,6 +234,13 @@ static void sercomm_frame_complete(L1CTLSock *s)
                 memcpy(l3, imm, sizeof(imm));
                 L1CTL_LOG("GATE-AGCH #2 pch: IMM ASSIGNMENT injecté");
             }
+        }
+        /* FN-FIX : capture le FN du RACH_CONF (0x0c) = le FN que le mobile memorise.
+         * Layout : l1ctl_hdr(4) + l1ctl_info_dl ; frame_nr (BE) @ payload[8..11]. */
+        if (payload[0] == 0x0c && plen >= 12) {
+            g_last_rach_conf_fn = ((uint32_t)payload[8] << 24) | ((uint32_t)payload[9] << 16) |
+                                  ((uint32_t)payload[10] << 8) | (uint32_t)payload[11];
+            L1CTL_LOG("FN-FIX: RACH_CONF fn=%u capture (memo mobile)", g_last_rach_conf_fn);
         }
         L1CTL_LOG("TX→mobile: dlci=%d len=%d type=0x%02x %s", dlci, plen, payload[0],
                   l1ctl_tname(payload[0]));
