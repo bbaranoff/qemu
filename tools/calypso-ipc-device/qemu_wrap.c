@@ -1045,18 +1045,17 @@ int32_t uhdwrap_read(void *dev, uint32_t num_chans)
               if (sticky && seq != last_seq && (sapi == 0 || sapi == 3) && !is_fill) {
                   last_seq = seq;
                   memcpy(pend_l2, l2, sizeof(pend_l2)); pend_valid = 1;
-                  /* #2 AUTO-CALIB DE PHASE : la SABM/I-frame est publiee sur le bloc
-                   * SDCCH/4 SS0 UL aux 4 frames l1s%51 in {36,37,38,39}. Le bloc UL
-                   * cote osmo-trx est s51 in {37,38,39,40}. Au 1er latch on aligne
-                   * sd_ofs pour que le DEBUT de bloc osmo (s51==37) coincide avec la
-                   * frame courante (ou pend_valid vient d'etre pose) : sd_autoofs =
-                   * 37 - osmo_fn%51, applique aux 4 bursts. Magic-free : derive du
-                   * runtime, pas d'OFS code en dur. CALYPSO_UL_SDCCH_OFS!=0 le force. */
-                  if (sd_ofs == 0 && sd_autoofs == -99999)
-                      sd_autoofs = (int)((37 - (int)(osmo_fn % 51)) % 51 + 51) % 51;
+                  /* #2 v3 ALIGNEMENT DETERMINISTE (2026-06-09) : l'ancien auto-calib
+                   * (sd_autoofs = 37 - osmo_fn%51) derivait l'offset de l'INSTANT ou le
+                   * firmware publie la SABM, dicte par l1s.current_time.fn -> seede par
+                   * le SCH FN que gr-gsm decode au sync -> RUN-VARIANT. SUPPRIME.
+                   * Avec osmo-trx START_FN=0 ET IPCDevice ts_initial snappe a 102*5000,
+                   * osmo_trx_fn == internal_fn (mod 102) ; ul_fnoff=36 -> eff_ofs FIXE=15
+                   * place bid0..3 sur osmo_trx_fn%51 {37,38,39,40} = SDCCH/4 SS0 UL.
+                   * CALYPSO_UL_SDCCH_OFS surcharge pour sweeper si besoin. */
               }
           } }
-        int eff_ofs = (sd_ofs != 0) ? sd_ofs : (sd_autoofs != -99999 ? sd_autoofs : 0);
+        int eff_ofs = (sd_ofs != 0) ? sd_ofs : 15;
         uint32_t s51 = (uint32_t)((((long)osmo_fn + eff_ofs) % 51 + 51) % 51);
         if (ul_src != ul_chunk && s51 >= 37 && s51 <= 40) {   /* SDCCH/4 SS0 UL block */
             int bid = (int)s51 - 37;
