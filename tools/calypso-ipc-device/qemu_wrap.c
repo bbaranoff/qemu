@@ -531,6 +531,18 @@ static int  g_ul_on   = -1;            /* CALYPSO_IPC_UL */
 static int16_t g_ul_iq[CALYPSO_BSP_BURSTLEN * CALYPSO_TRX_OSR * 2];   /* dernier burst modulé @ OSR */
 static volatile int g_ul_pending = 0;  /* 1 = un burst à injecter */
 static volatile uint32_t g_ul_real_fn = 0;  /* FN firmware (sideband) du dernier RACH -> FN-lock */
+/* === RACH waveform DEDIE (FIX MT-SMS 2026-06-09) ============================
+ * g_ul_iq est ECRASE a CHAQUE frame par le chemin SDCCH-idle (ul_mod_laurent ->
+ * g_ul_iq, ~119x/run). Pour le LU c'etait masque : le firmware re-livrait la RACH
+ * 30x sur g_bsp_fd, donc g_ul_iq etait re-rempli juste avant un slot eligible.
+ * La paging-response (RA=0x98) n'est encodee QU'UNE fois -> entre l'encode et le
+ * 1er vrai slot RACH (max 51 frames), le SDCCH-idle clobbe g_ul_iq -> meme avec la
+ * gate corrigee, le burst inject serait du SDCCH, pas la RACH. On latch donc la
+ * waveform RACH dans un buffer SEPARE (g_rach_iq) et on l'arme STICKY pour quelques
+ * slots RACH-eligibles, re-injectee sur le 1er fn_ok. */
+static int16_t g_rach_iq[CALYPSO_BSP_BURSTLEN * CALYPSO_TRX_OSR * 2]; /* waveform RACH latchee */
+static volatile int g_rach_pending = 0;       /* nb de slots RACH-eligibles restants a tenter */
+static volatile uint32_t g_rach_arm_seq = 0;  /* incremente a chaque nouvel arm (debug) */
 
 /* MSK phase-continue a OSR samples/symbole : 148 soft-bits (±127) -> 148*OSR
  * cs16 I/Q. Increment de phase ±(π/2)/OSR par SAMPLE (convention osmo-trx :
@@ -834,6 +846,15 @@ static void ul_drain(void)
                 int8_t ab_rach[CALYPSO_BSP_BURSTLEN];
                 ul_build_rach_ra(ab_rach, (int)real_ra, (int)real_bsic);
                 ul_mod_laurent(ab_rach, 88, g_ul_iq);   /* 88 bits actifs = access-burst */
+                /* FIX MT-SMS : latch la waveform RACH dans son buffer dedie et arme
+                 * STICKY sur N slots RACH-eligibles. Le chemin SDCCH-idle ecrase g_ul_iq
+                 * a chaque frame ; g_rach_iq lui reste intact -> la paging-response (un
+                 * seul encode) survit jusqu'a un vrai slot RACH. CALYPSO_UL_RACH_STICKY =
+                 * nb de slots eligibles a tenter (def 8 ~ couvre >1 multiframe-51). */
+                memcpy(g_rach_iq, g_ul_iq, sizeof(g_rach_iq));
+                { static int rsticky = -1;
+                  if (rsticky < 0) { const char *e = getenv("CALYPSO_UL_RACH_STICKY"); rsticky = (e && *e) ? atoi(e) : 8; }
+                  g_rach_pending = rsticky; g_rach_arm_seq++; }
                 used_tab = 1;
                 static int last_ra = -1;
                 if ((int)real_ra != last_ra) {
@@ -958,8 +979,21 @@ int32_t uhdwrap_read(void *dev, uint32_t num_chans)
     if (ul_fngate < 0)      { const char *e = getenv("CALYPSO_UL_FN_GATE");   ul_fngate = (!e || *e != '0'); }
     if (ul_slotoff < 0)     { const char *e = getenv("CALYPSO_UL_SLOT_OFFSET"); ul_slotoff = e ? atoi(e) : 0; }
     uint32_t internal_fn = (uint32_t)(d->rx_ts / (uint64_t)CALYPSO_FRAME_SAMPLES);
-    uint32_t osmo_fn = internal_fn + (uint32_t)ul_fnoff;     /* FN tel que vu par osmo-trx */
-    uint32_t m51 = osmo_fn % 51;
+    uint32_t osmo_fn = internal_fn + (uint32_t)ul_fnoff;     /* FN tel que vu par osmo-trx (SDCCH only) */
+    /* FN-GATE RACH (FIX MT-SMS 2026-06-09) : osmo-trx TAMPONNE+CORRELE le burst injecte
+     * sur SON fn == internal_fn (PROUVE : la seule RACH-DET du run est a osmo-trx fn=4058,
+     * exactement = inject#1 internal_fn=4058, que le gate avait etiquete osmo_fn=4094).
+     * L'ancien gate testait osmo_fn%51 = (internal_fn+36)%51 -> il autorisait des slots
+     * (internal%51 in {0,9,10,37..44,47..50}) ou osmo-trx fait tourner le correlateur
+     * NORMAL-BURST, JAMAIS le correlateur RACH -> burst jamais detecte comme access-burst.
+     * Le LU n'a marche QUE par coincidence (inject#1 tombait sur internal%51=29, un vrai
+     * slot RACH). La paging-response (RA=0x98) n'a JAMAIS touche un vrai slot RACH -> aucune
+     * 2e RACH-DET -> pas de CHAN RQD -> pas d'IMM ASS -> SMS jamais livre.
+     * FIX : evaluer l'eligibilite RACH sur internal_fn (== osmo-trx fn), set combination-V
+     * {4,5,14..36,45,46} = exactement osmo-trx Transceiver::expectedCorrType() case V.
+     * NB : le bloc SDCCH (ligne ~1059) garde son propre osmo_fn+eff_ofs (calibre
+     * independamment, SABM/UA OK) -> on NE touche QUE la gate RACH. */
+    uint32_t m51 = internal_fn % 51;
     int fn_ok = !ul_fngate || (m51 == 4 || m51 == 5 || (m51 >= 14 && m51 <= 36) || m51 == 45 || m51 == 46);
 
     /* === FN-LOCK (NO-HARDCODE, env CALYPSO_UL_FN_LOCK=1 ; OFF par defaut) =======
@@ -992,18 +1026,25 @@ int32_t uhdwrap_read(void *dev, uint32_t num_chans)
             fnlock_ok = 0;                /* pas encore calibre -> attendre un RACH */
         }
     }
-    if (g_ul_on && g_ul_pending && fn_ok && fnlock_ok && (d->rx_ts % ((uint64_t)CALYPSO_FRAME_SAMPLES)) == 0) {
+    /* RACH a injecter : soit fraichement livre (g_ul_pending, comportement LU 30x),
+     * soit latche STICKY pour la paging-response (g_rach_pending, un seul encode).
+     * On prefere g_rach_iq (intact) a g_ul_iq (clobbe par le SDCCH-idle). */
+    int rach_inject = (g_ul_pending || g_rach_pending > 0);
+    if (g_ul_on && rach_inject && fn_ok && fnlock_ok && (d->rx_ts % ((uint64_t)CALYPSO_FRAME_SAMPLES)) == 0) {
         memset(ul_chunk, 0, sizeof(ul_chunk));
         int off = ul_slotoff < 0 ? 0 : ul_slotoff;
         if (2 * off + (int)sizeof(g_ul_iq) > (int)sizeof(ul_chunk)) off = 0;  /* borne */
-        memcpy(ul_chunk + 2 * off, g_ul_iq, sizeof(g_ul_iq));
+        /* g_rach_iq survit au clobber SDCCH-idle -> source preferentielle */
+        memcpy(ul_chunk + 2 * off, g_rach_iq, sizeof(g_rach_iq));
         ul_src = ul_chunk;
         g_ul_pending = 0;
+        if (g_rach_pending > 0) g_rach_pending--;   /* consomme un slot eligible */
         static unsigned ul_inj = 0;
         if (ul_inj++ < 30 || (ul_inj % 100) == 0)
             LOGP(DDEV, LOGL_NOTICE,
-                 "UL inject #%u → internal_fn=%u osmo_fn=%u (%%51=%u) slotoff=%d ts=%llu\n",
-                 ul_inj, internal_fn, osmo_fn, m51, off, (unsigned long long)d->rx_ts);
+                 "UL inject #%u → internal_fn=%u osmo_fn=%u (%%51=%u) slotoff=%d ts=%llu rach_pend=%d seq=%u\n",
+                 ul_inj, internal_fn, osmo_fn, m51, off, (unsigned long long)d->rx_ts,
+                 g_rach_pending, g_rach_arm_seq);
     }
 
     /* === SDCCH/SACCH UL (#12 PIÈCE 2) : burst NORMAL encodé sur le slot dédié =======
