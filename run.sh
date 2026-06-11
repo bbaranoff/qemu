@@ -1782,16 +1782,28 @@ tmux send-keys -t "$SESSION:qemu" "tail -f $QEMU_LOG" C-m
 
 echo -n "Waiting for QEMU PTY allocation..."
 PTY_MODEM=""
-for i in $(seq 1 30); do
+# 60s : sous VM chargée (split bins DSP + osmo core) le boot QEMU peut dépasser
+# les 30s d'avant -> TIMEOUT intermittent. On surveille AUSSI le PID : si QEMU
+# meurt (crash boot, machine type / blob DSP / firmware), on sort tout de suite
+# et on affiche la VRAIE cause depuis $QEMU_LOG au lieu d'un opaque "no PTY".
+for i in $(seq 1 60); do
     if grep -q 'redirected to /dev/pts/.* (label serial0)' "$QEMU_LOG" 2>/dev/null; then
         PTY_MODEM=$(grep 'redirected to /dev/pts/.* (label serial0)' "$QEMU_LOG" \
                     | sed -E 's/.*redirected to (\/dev\/pts\/[0-9]+).*/\1/' | head -1)
         break
     fi
+    if ! kill -0 "$QEMU_PID" 2>/dev/null; then
+        echo " QEMU DEAD (pid $QEMU_PID exited before PTY)"
+        echo "--- dernières lignes de $QEMU_LOG : ---" >&2
+        tail -n 20 "$QEMU_LOG" >&2 2>/dev/null || echo "(log vide/illisible)" >&2
+        exit 1
+    fi
     sleep 1; echo -n "."
 done
 if [ -z "$PTY_MODEM" ]; then
-    echo " TIMEOUT -- no PTY in $QEMU_LOG"
+    echo " TIMEOUT -- no PTY in $QEMU_LOG (QEMU_PID=$QEMU_PID still alive=$(kill -0 "$QEMU_PID" 2>/dev/null && echo yes || echo no))"
+    echo "--- dernières lignes de $QEMU_LOG : ---" >&2
+    tail -n 20 "$QEMU_LOG" >&2 2>/dev/null || echo "(log vide/illisible)" >&2
     exit 1
 fi
 echo " OK ($PTY_MODEM, QEMU_PID=$QEMU_PID)"
