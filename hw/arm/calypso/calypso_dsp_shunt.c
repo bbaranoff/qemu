@@ -315,12 +315,28 @@ static void shunt_latch_task(uint16_t new_d_dsp_page)
      * injecte). a_cu[0..2]=header. La L2 porte le SABM / SACCH meas / I-frames. */
     if (g_shunt.d_task_u != 0) {
         uint8_t l2[23];
-        uint32_t acu3 = BASE_API_NDB + 0x264u + 6u;   /* a_cu[3] = 1er octet L2 */
-        for (int i = 0; i < 23; i += 2) {
-            uint16_t w = shunt_read_w(acu3 + i);
-            l2[i] = (uint8_t)(w & 0xff);
-            if (i + 1 < 23) l2[i + 1] = (uint8_t)((w >> 8) & 0xff);
+        /* a_cu UL : l'offset exact de la trame LAPDm varie (header L1 SACCH 2o /
+         * type SABM-I-fill / packing) -> un offset fixe rate. On lit une FENETRE et
+         * on SCANNE le debut de trame : 1er octet = addr SDCCH valide (EA=1, SAPI 0/3)
+         * suivi d'un control non-fill. Base fenetre = gate CALYPSO_UL_ACU_OFS (def 6). */
+        static int acu_ofs = -1;
+        if (acu_ofs < 0) { const char *e = getenv("CALYPSO_UL_ACU_OFS"); acu_ofs = (e && *e) ? atoi(e) : 6; }
+        uint8_t win[30];
+        uint32_t wbase = BASE_API_NDB + 0x264u + (uint32_t)acu_ofs;
+        for (int i = 0; i < 30; i += 2) {
+            uint16_t w = shunt_read_w(wbase + i);
+            win[i] = (uint8_t)(w & 0xff);
+            if (i + 1 < 30) win[i + 1] = (uint8_t)((w >> 8) & 0xff);
         }
+        int kk = -1;
+        for (int j = 0; j <= 6; j++) {
+            uint8_t a = win[j], c = win[j + 1];
+            int sapi = (a >> 2) & 7;
+            if ((a & 0x01) && (sapi == 0 || sapi == 3) &&
+                c != 0x2b && c != 0x00 && c != 0xff) { kk = j; break; }
+        }
+        if (kk < 0) kk = 0;
+        for (int i = 0; i < 23; i++) l2[i] = win[kk + i];
         calypso_sdcch_ul_publish(l2, g_shunt.d_task_u,
                                  calypso_trx_get_fn(), shunt_l1s_fn());
         /* Log : quelques idle pour sanity (capé), mais TOUJOURS les frames NON-IDLE
@@ -1261,6 +1277,7 @@ struct dsp_shunt_shm {
 static struct dsp_shunt_shm *g_shm;
 static uint32_t              g_shm_last_si_seq;
 static FILE                 *g_iq_cfile;   /* enreg .cfile fc32 de l'I/Q d'entree */
+static FILE                 *g_iq_cfile2;  /* cfile #2 FN-espace (zero-fill) -> test grgsm SACCH */
 
 static void shunt_shm_init(void)
 {
@@ -1301,6 +1318,15 @@ static void shunt_shm_init(void)
         else
             error_report("[dsp-shunt] fopen(%s) cfile: %s", cf, strerror(errno));
     }
+    /* cfile #2 : reconstruction FN-espacee (zero-fill des trames manquantes) pour
+     * que grgsm retrouve la 51-mf et decode la SACCH (SI5/SI6). Test offline, ne
+     * touche PAS au cfile live. Active via CALYPSO_SHUNT_IQ_CFILE2=<chemin>. */
+    const char *cf2 = getenv("CALYPSO_SHUNT_IQ_CFILE2");
+    if (cf2 && *cf2) {
+        g_iq_cfile2 = fopen(cf2, "wb");
+        if (g_iq_cfile2)
+            error_report("[dsp-shunt] cfile #2 FN-espace -> %s (gap zero-fill)", cf2);
+    }
 }
 
 /* ENTREE du DSP shunte : la BSP appelle ceci avec l'I/Q DL (cs16, n int16
@@ -1333,6 +1359,26 @@ void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
         for (int i = 0; i < n; i++)
             fbuf[i] = (float)iq[i] / 32768.0f;
         fwrite(fbuf, sizeof(float), (size_t)n, g_iq_cfile);
+    }
+    /* cfile #2 FN-espace : chaque burst TS0 a sa position de trame
+     * ((fn-base)*spf int16), trames manquantes zero-fillees -> grgsm retrouve la
+     * 51-mf -> SACCH (SI5/SI6) decodable. spf = int16/trame TDMA (def 2500=1x,
+     * sweepable via CALYPSO_IQ_CFILE_SPF pour le test offline). */
+    if (g_iq_cfile2) {
+        static int spf = -1; static uint32_t base_fn = 0; static int64_t pos = 0; static int have_base = 0;
+        if (spf < 0) { const char *e = getenv("CALYPSO_IQ_CFILE_SPF"); spf = (e && *e) ? atoi(e) : 2500; }
+        if (!have_base) { base_fn = fn; pos = 0; have_base = 1; }
+        int64_t target = (int64_t)fn - (int64_t)base_fn;
+        if (target < 0) target += 2715648;            /* hyperframe wrap */
+        target *= spf;
+        int64_t gap = target - pos;
+        if (gap < 0 || gap > (int64_t)spf * 300) { base_fn = fn; pos = 0; gap = 0; }  /* rebase si saut anormal */
+        static const float zeros[512] = {0};
+        while (gap > 0) { int c = gap > 512 ? 512 : (int)gap; fwrite(zeros, sizeof(float), (size_t)c, g_iq_cfile2); pos += c; gap -= c; }
+        float fbuf2[SHM_IQ_LEN];
+        for (int i = 0; i < n; i++) fbuf2[i] = (float)iq[i] / 32768.0f;
+        fwrite(fbuf2, sizeof(float), (size_t)n, g_iq_cfile2);
+        pos += n;
     }
 }
 
@@ -1455,13 +1501,21 @@ void calypso_dsp_shunt_feed_si(const uint8_t *l2, int len)
     if (slot == 2 && n >= 10) {
         uint8_t *s6 = g_shunt.sacch_buf;
         memset(s6, 0x2b, sizeof(g_shunt.sacch_buf));
-        s6[0] = (uint8_t)((11 << 2) | 0x01);   /* L2 pseudo-length L=11 */
-        s6[1] = 0x06;                          /* RR PD, skip=0 */
-        s6[2] = 0x1e;                          /* SYSTEM INFORMATION TYPE 6 */
-        s6[3] = l2[3]; s6[4] = l2[4];          /* cell identity (SI3 @3..4) */
-        s6[5] = l2[5]; s6[6] = l2[6]; s6[7] = l2[7]; s6[8] = l2[8]; s6[9] = l2[9]; /* LAI (SI3 @5..9) */
-        s6[10] = 0x0f;                         /* cell options : radio-link-timeout long */
-        s6[11] = 0xff;                         /* NCC permitted : tous */
+        /* Layout B4 reel (lapdm.c) : header L1 SACCH (2o, non strippe par la L1
+         * osmocom-bb) + LAPDm addr + LAPDm control UI (-> fmt B4, l3len=19) + L3. */
+        s6[0] = 0x00;                          /* L1 SACCH : tx_power */
+        s6[1] = 0x00;                          /* L1 SACCH : TA */
+        s6[2] = 0x03;                          /* LAPDm address : SAPI0, C/R, EA=1 */
+        s6[3] = 0x03;                          /* LAPDm control : UI -> format B4 */
+        s6[4] = (uint8_t)((11 << 2) | 0x01);   /* L3 pseudo-length L=11 */
+        s6[5] = 0x06;                          /* RR PD, skip=0 */
+        s6[6] = 0x1e;                          /* SYSTEM INFORMATION TYPE 6 */
+        s6[7] = l2[3]; s6[8] = l2[4];          /* cell identity (SI3 @3..4) */
+        s6[9]  = l2[5]; s6[10] = l2[6]; s6[11] = l2[7];
+        s6[12] = l2[8]; s6[13] = l2[9];        /* LAI (SI3 @5..9) */
+        s6[14] = 0x0f;                         /* cell options : radio-link-timeout long */
+        s6[15] = 0xff;                         /* NCC permitted : tous */
+        /* [16..22] = 0x2b rest octets (l3 total = [4..22] = 19o) */
         g_shunt.sacch_have = true;
     }
     /* compat / fallback : si_buf = dernier reçu */
