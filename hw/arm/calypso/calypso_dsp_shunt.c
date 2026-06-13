@@ -139,8 +139,11 @@ struct dsp_shunt_state {
      * bursts (a_cd mono-frame ; sinon frame incohérente → CRC fail). */
     uint8_t    si_set[6][23];
     bool       si_set_have[6];
-    uint8_t    sacch_buf[23];   /* SI6 (B4) derive du SI3, pour la SACCH dediee SS0 */
+    uint8_t    sacch_buf[23];   /* SI5/SI6 (B4) SACCH dediee SS0 : REEL via feed_sacch
+                                 * (fallback = fabrique depuis SI3 tant que !sacch_real) */
     bool       sacch_have;
+    bool       sacch_real;      /* true des qu'un SI5/SI6 REEL grgsm est arrive ->
+                                 * la fabrication SI3->SI6 cesse de clobber sacch_buf */
     int        si_rr;                 /* index round-robin du dernier type servi */
     /* Resultat de sync REEL poste par gr-gsm (= le DSP) via UDP SCH (4731,
      * shunt_sch_read). Remplace SHUNT_CANNED_BSIC dans shunt_dispatch_sb. */
@@ -978,6 +981,8 @@ static const MemoryRegionOps shunt_ndb_trigger_ops = {
 #define GSMTAP_CHANNEL_BCCH     0x01
 #define GSMTAP_CHANNEL_AGCH     0x04   /* IMM ASSIGN (PORTE 3a / #11) */
 #define GSMTAP_CHANNEL_SDCCH4   0x07   /* SDCCH/4 SS0 DL (UA/AUTH / #2) */
+#define GSMTAP_CHANNEL_ACCH     0x80   /* bit ACCH (SACCH) GSMTAP */
+#define GSMTAP_CHANNEL_SACCH    (GSMTAP_CHANNEL_SDCCH4 | GSMTAP_CHANNEL_ACCH) /* 0x87 : SI5/SI6 reels */
 static int g_gsmtap_fd = -1;
 
 /* AGCH (#11) : range l'IMM ASSIGN forwardé par si_bridge (tag GSMTAP AGCH 0x04)
@@ -1090,6 +1095,34 @@ static void calypso_dsp_shunt_feed_sdcch(const uint8_t *l2, int len)
             "-> sdcch_buf (a presenter sur bloc fn%%51 22-25)\n", l2[0], l2[1]);
 }
 
+/* SACCH SS0 DL REELLE : SI5(0x1d)/SI6(0x1e) decodes par grgsm, forwardes par
+ * si_bridge (sub_type 0x87). Le bloc grgsm = 23o : [L1 hdr 2][LAPDm: 03 03 len
+ * 06 mt L3...] -> exactement le layout B4 attendu par le dispatch SACCH. On
+ * garde la L3 REELLE mais on ZERO le header L1 (tx_power/TA) : les valeurs
+ * osmo-bts ne sont pas pour notre air emule (idem fabrication). sacch_real=true
+ * fait CESSER la fabrication SI3->SI6 (sinon SI3 du BCCH clobbe le SI5/SI6 reel). */
+static void calypso_dsp_shunt_feed_sacch(const uint8_t *l2, int len)
+{
+    if (!l2 || len < 7) return;
+    int n = len < 23 ? len : 23;
+    /* trouve le RR header (06 1d / 06 1e) pour valider que c'est bien SI5/SI6 */
+    int rr = -1;
+    for (int i = 2; i + 1 < n && i < 8; i++)
+        if (l2[i] == 0x06 && (l2[i + 1] == 0x1d || l2[i + 1] == 0x1e)) { rr = i; break; }
+    if (rr < 0) return;                       /* pas un SI5/SI6 -> ignore */
+    uint8_t *s = g_shunt.sacch_buf;
+    memcpy(s, l2, n);
+    for (int i = n; i < 23; i++) s[i] = 0x2b;
+    s[0] = 0x00;                              /* L1 SACCH header : tx_power -> neutre */
+    s[1] = 0x00;                              /* L1 SACCH header : TA       -> neutre */
+    g_shunt.sacch_have = true;
+    g_shunt.sacch_real = true;                /* coupe la fabrication SI3->SI6 */
+    static unsigned nf = 0;
+    if (nf++ < 20 || (nf % 50) == 0)
+        fprintf(stderr, "[dsp-shunt] feed_sacch REEL: SI%d %do (mt=0x%02x) -> sacch_buf\n",
+                (l2[rr + 1] == 0x1d) ? 5 : 6, n, l2[rr + 1]);
+}
+
 static void shunt_gsmtap_read(void *opaque)
 {
     uint8_t buf[512];
@@ -1111,7 +1144,8 @@ static void shunt_gsmtap_read(void *opaque)
          * PAS 0x06 pour sub_type 0x07. */
         if (n < GSMTAP_HDR_LEN + 3)
             continue;
-        if (sub_type != GSMTAP_CHANNEL_SDCCH4 && buf[GSMTAP_HDR_LEN + 1] != 0x06)
+        if (sub_type != GSMTAP_CHANNEL_SDCCH4 && sub_type != GSMTAP_CHANNEL_SACCH &&
+            buf[GSMTAP_HDR_LEN + 1] != 0x06)
             continue;                               /* pas RR PD (BCCH/AGCH) */
         uint8_t mt = buf[GSMTAP_HDR_LEN + 2];
         if (sub_type == GSMTAP_CHANNEL_BCCH) {
@@ -1138,6 +1172,10 @@ static void shunt_gsmtap_read(void *opaque)
              * SDCCH/4 SS0, fn%51 in {22-25}). LAPDm : aucun filtre message-type
              * (le gate canal = le FN cote si_bridge + le dispatch). */
             calypso_dsp_shunt_feed_sdcch(buf + GSMTAP_HDR_LEN, (int)n - GSMTAP_HDR_LEN);
+        } else if (sub_type == GSMTAP_CHANNEL_SACCH) {
+            /* SACCH SS0 DL : SI5/SI6 REELS (si_bridge fn%51 {42-45}) -> sacch_buf
+             * REEL (presente fn%51 {42-45}). Remplace la fabrication SI3->SI6. */
+            calypso_dsp_shunt_feed_sacch(buf + GSMTAP_HDR_LEN, (int)n - GSMTAP_HDR_LEN);
         }
         /* autres canaux : drop */
     }
@@ -1494,11 +1532,13 @@ void calypso_dsp_shunt_feed_si(const uint8_t *l2, int len)
         for (int i = n; i < 23; i++) g_shunt.si_set[slot][i] = 0x2B;
         g_shunt.si_set_have[slot] = true;
     }
-    /* SI3 (slot 2) -> derive un SI6 (B4, 19o l3) pour la SACCH dediee : evite que
-     * le mobile lise du garbage sur la SACCH -> 'Short header 0x07 unsupported'.
-     * Layout B4 : [0]pseudo-len(L=11) [1]=0x06 RR [2]=0x1e SI6 [3..4]cell_id
-     * [5..9]LAI (copies du SI3) [10]cell_options [11]ncc_permitted [12..18]rest. */
-    if (slot == 2 && n >= 10) {
+    /* SI3 (slot 2) -> SEED SI6 fabrique (B4) pour la SACCH dediee, UNIQUEMENT en
+     * fallback tant qu'aucun SI5/SI6 REEL n'est arrive (g_shunt.sacch_real). Des
+     * que feed_sacch recoit le vrai SI5/SI6 (grgsm), sacch_real=true et ce bloc
+     * ne tourne plus -> le SI3 du BCCH ne clobbe plus le SACCH reel. Le seed evite
+     * le 'Short header 0x07 unsupported' au tout debut d'un canal dedie (avant que
+     * grgsm ait decode la 1ere SACCH ~480ms). */
+    if (slot == 2 && n >= 10 && !g_shunt.sacch_real) {
         uint8_t *s6 = g_shunt.sacch_buf;
         memset(s6, 0x2b, sizeof(g_shunt.sacch_buf));
         /* Layout B4 reel (lapdm.c) : header L1 SACCH (2o, non strippe par la L1

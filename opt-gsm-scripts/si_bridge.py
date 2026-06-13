@@ -26,6 +26,7 @@ PAGING = {0x21:"PAG-REQ-1", 0x22:"PAG-REQ-2", 0x24:"PAG-REQ-3"}
 GSMTAP_BCCH = 0x01
 GSMTAP_AGCH = 0x04
 GSMTAP_SDCCH4 = 0x07
+GSMTAP_SACCH  = 0x07 | 0x80   # SDCCH/4 + ACCH = SACCH dediee SS0 (SI5/SI6 reels)
 
 def fn51_role(fn):
     m = fn % 51
@@ -45,7 +46,7 @@ def gsmtap(fn, chan, l2):
 p = subprocess.Popen(["grgsm_decode","-m","BCCH_SDCCH4","-t","0","-a",str(ARFCN),
                       "-c",CF,"-s","1083333","-v"],
                      stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-n = 0; nsch = 0; nsd = 0; last_fn = 0; last_sd_fn = -1
+n = 0; nsch = 0; nsd = 0; nsa = 0; last_fn = 0; last_sd_fn = -1; last_sa_fn = -1
 for line in p.stdout:
     # --- SCH reel : "SCHBSIC <bsic> <fn> <toa>" -> 4731 + horloge FN ---
     msch = re.search(r"SCHBSIC\s+(\d+)\s+(\d+)\s+(-?\d+)", line)
@@ -107,4 +108,22 @@ for line in p.stdout:
             if nsd <= 20 or nsd % 50 == 0:
                 print("[si-bridge] SDCCH/4 SS0 DL (a0=0x%02x c=0x%02x) FN=%d (%%51=%d) -> feed_sdcch (4730)  #%d [new]"
                       % (by[0], ctrl, sd_fn, sd_fn%51, nsd), flush=True)
-print("[si-bridge] fini, %d SI / %d SCH transmis" % (n, nsch), flush=True)
+    # --- SACCH (SDCCH/4 SS0) DL : SI5(0x1d)/SI6(0x1e) REELS -> feed_sacch ---
+    # Slots SACCH SS0 (combine CCCH+SDCCH/4) : fn%51 in {42-45}. grgsm donne le
+    # bloc 23o = [L1 hdr 2][LAPDm: 03 03 len 06 mt L3...]. On detecte le RR header
+    # "06 1d"/"06 1e" et on forwarde le bloc TEL QUEL au shunt (sub_type 0x87 =
+    # SDCCH4|ACCH) -> feed_sacch REEL, remplace la fabrication SI3->SI6.
+    if len(by) >= 8 and (sd_fn % 51) in (42, 43, 44, 45):
+        mt_sa = None
+        for off in range(2, min(9, len(by) - 1)):
+            if by[off] == 0x06 and by[off + 1] in (0x1d, 0x1e):
+                mt_sa = by[off + 1]; break
+        if mt_sa is not None and sd_fn != last_sa_fn:
+            last_sa_fn = sd_fn
+            L2 = (by[:23] + b"\x2b" * 23)[:23]
+            s.sendto(gsmtap(sd_fn, GSMTAP_SACCH, L2), ("127.0.0.1", 4730))
+            nsa += 1
+            if nsa <= 20 or nsa % 50 == 0:
+                print("[si-bridge] SACCH SI%d (mt=0x%02x) FN=%d (%%51=%d) -> feed_sacch REEL (4730)  #%d"
+                      % (5 if mt_sa == 0x1d else 6, mt_sa, sd_fn, sd_fn % 51, nsa), flush=True)
+print("[si-bridge] fini, %d SI / %d SCH / %d SACCH transmis" % (n, nsch, nsa), flush=True)
