@@ -853,7 +853,7 @@ static void ul_drain(void)
                  * nb de slots eligibles a tenter (def 8 ~ couvre >1 multiframe-51). */
                 memcpy(g_rach_iq, g_ul_iq, sizeof(g_rach_iq));
                 { static int rsticky = -1;
-                  if (rsticky < 0) { const char *e = getenv("CALYPSO_UL_RACH_STICKY"); rsticky = (e && *e) ? atoi(e) : 8; }
+                  if (rsticky < 0) { const char *e = getenv("CALYPSO_UL_RACH_STICKY"); rsticky = (e && *e) ? atoi(e) : 0;        /* defaut OFF (gate vide) : sticky retire */ }
                   g_rach_pending = rsticky; g_rach_arm_seq++; }
                 used_tab = 1;
                 static int last_ra = -1;
@@ -975,9 +975,9 @@ int32_t uhdwrap_read(void *dev, uint32_t num_chans)
      *                        CCCH+SDCCH4 : osmo_fn%51 in {4,5,14..36,45,46}).
      * CALYPSO_UL_SLOT_OFFSET : offset intra-slot (samples) du burst (TOA). */
     static int ul_fnoff = -99999, ul_fngate = -1, ul_slotoff = -1;
-    if (ul_fnoff == -99999) { const char *e = getenv("CALYPSO_UL_FN_OFFSET"); ul_fnoff = e ? atoi(e) : 31; }
+    if (ul_fnoff == -99999) { const char *e = getenv("CALYPSO_UL_FN_OFFSET"); ul_fnoff = (e && *e) ? atoi(e) : 36;       /* hardcode : offset FN device->osmo-trx (gate vide=36) */ }
     if (ul_fngate < 0)      { const char *e = getenv("CALYPSO_UL_FN_GATE");   ul_fngate = (!e || *e != '0'); }
-    if (ul_slotoff < 0)     { const char *e = getenv("CALYPSO_UL_SLOT_OFFSET"); ul_slotoff = e ? atoi(e) : 0; }
+    if (ul_slotoff < 0)     { const char *e = getenv("CALYPSO_UL_SLOT_OFFSET"); ul_slotoff = (e && *e) ? atoi(e) : 1875;   /* hardcode : TOA intra-slot RACH (gate vide=1875) */ }
     uint32_t internal_fn = (uint32_t)(d->rx_ts / (uint64_t)CALYPSO_FRAME_SAMPLES);
     uint32_t osmo_fn = internal_fn + (uint32_t)ul_fnoff;     /* FN tel que vu par osmo-trx (SDCCH only) */
     /* FN-GATE RACH (FIX MT-SMS 2026-06-09) : osmo-trx TAMPONNE+CORRELE le burst injecte

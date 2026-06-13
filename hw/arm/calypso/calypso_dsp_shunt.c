@@ -139,6 +139,8 @@ struct dsp_shunt_state {
      * bursts (a_cd mono-frame ; sinon frame incohérente → CRC fail). */
     uint8_t    si_set[6][23];
     bool       si_set_have[6];
+    uint8_t    sacch_buf[23];   /* SI6 (B4) derive du SI3, pour la SACCH dediee SS0 */
+    bool       sacch_have;
     int        si_rr;                 /* index round-robin du dernier type servi */
     /* Resultat de sync REEL poste par gr-gsm (= le DSP) via UDP SCH (4731,
      * shunt_sch_read). Remplace SHUNT_CANNED_BSIC dans shunt_dispatch_sb. */
@@ -168,6 +170,7 @@ extern void l1ctl_inject_dl_si(const uint8_t *l2, int l2len, uint32_t fn);
 /* FN-FIX : FN du dernier L1CTL_RACH_CONF (= memo exact du mobile), capture dans
  * l1ctl_sock.c au moment de l'envoi au mobile (race-free vs last_rach.fn@0x836500). */
 extern volatile uint32_t g_last_rach_conf_fn;
+extern volatile uint32_t g_rach_conf_fn[256];   /* per-ra : FN exact du RACH_CONF keye par ra (defini l1ctl_sock.c) */
 
 static struct dsp_shunt_state g_shunt;
 
@@ -226,12 +229,14 @@ static uint32_t shunt_last_rach_fn(void)
  * Remplie par calypso_trx.c (hook write d_rach). Sert à réécrire la req-ref de
  * l'IMM ASSIGN au FN exact que le mobile a mémorisé (preuve que le FN = dernier mur). */
 static uint32_t g_rach_l1s_fn[256];
+volatile uint8_t g_last_recorded_ra = 0;   /* per-ra FN-FIX : ra de la derniere RACH (lu par l1ctl_sock.c) */
 static uint8_t  g_rach_l1s_valid[256];
 void calypso_dsp_shunt_record_rach(uint8_t ra)
 {
     if (!g_shunt.active) return;
     g_rach_l1s_fn[ra]    = shunt_l1s_fn();
     g_rach_l1s_valid[ra] = 1;
+    g_last_recorded_ra   = ra;   /* per-ra FN-FIX : permet a l1ctl_sock de keyer le RACH_CONF par ra */
 }
 
 /* SDCCH/SACCH UL sideband (#12) : QEMU publie la L2 montante (a_cu[3..], 23o) vers
@@ -722,6 +727,42 @@ static void shunt_dispatch_allc(uint8_t page_idx)
         }
     }
 
+    /* === SACCH SDCCH/4 SS0 DL : presente le SI6 (B4) sur les slots SACCH du SS0 ===
+     * Sinon le mobile lit du garbage sur la SACCH dediee -> 'Short header 0x07'.
+     * Slots SACCH SS0 (combine CCCH+SDCCH/4, GSM 05.02) : fn%51 in {42-45} ET
+     * (fn/51)%2==0. Gate CALYPSO_SHUNT_SACCH (def ON). */
+    {
+        static int sacch_on = -1;
+        if (sacch_on < 0) { const char *e = getenv("CALYPSO_SHUNT_SACCH"); sacch_on = (!e || *e != '0') ? 1 : 0; }
+        if (sacch_on && g_shunt.sacch_have) {
+            long fn = shunt_l1s_fn();
+            int tc    = (int)(((fn % 51) + 51) % 51);
+            int mf102 = (int)(((fn / 51) % 2 + 2) % 2);
+            if (tc >= 42 && tc <= 46 && mf102 == 0) {
+                uint32_t aa = BASE_API_NDB + NDB_A_CD;
+                shunt_write_w(aa + 0, 0x0000);
+                shunt_write_w(aa + 2, 0x0000);
+                shunt_write_w(aa + 4, 0x0000);
+                const uint8_t *m = g_shunt.sacch_buf;
+                for (int i = 0; i < 23; i += 2) {
+                    uint8_t lo = m[i], hi = (i + 1 < 23) ? m[i + 1] : 0x2B;
+                    shunt_write_w(aa + 6 + i, lo | (hi << 8));
+                }
+                uint32_t rpA = rp_base(page_idx);
+                shunt_write_w(rpA + RP_D_TASK_D,  ALLC_DSP_TASK);
+                shunt_write_w(rpA + RP_D_BURST_D, g_shunt.d_burst_d);
+                shunt_write_w(rpA + RP_A_SERV_DEMOD + D_TOA   * 2, shunt_toa_val());
+                shunt_write_w(rpA + RP_A_SERV_DEMOD + D_PM    * 2, shunt_is_canned(CAN_PM) ? SHUNT_CANNED_PM : g_shunt.last_pm);
+                shunt_write_w(rpA + RP_A_SERV_DEMOD + D_ANGLE * 2, 0);
+                shunt_write_w(rpA + RP_A_SERV_DEMOD + D_SNR   * 2, SHUNT_CANNED_SNR);
+                static unsigned n_sacch = 0;
+                if (n_sacch++ < 20 || (n_sacch % 50) == 0)
+                    fprintf(stderr, "[dsp-shunt] DISPATCH SACCH SI6 #%u tc=%d -> a_cd\n", n_sacch, tc);
+                return;
+            }
+        }
+    }
+
     /* (A) ROTATION par bloc : au début du bloc (burst 0) on avance au prochain
      * type SI disponible et on le copie dans si_buf (STABLE pour les 4 bursts).
      * Le mobile collecte ainsi TOUT le set (SI1/2/3/4) au fil des blocs au lieu
@@ -930,6 +971,31 @@ static int g_gsmtap_fd = -1;
 static void calypso_dsp_shunt_feed_agch(const uint8_t *l2, int len)
 {
     if (!l2 || len < 3) return;
+
+    /* Priorite IMM ASSIGN : ne pas laisser un PAGING REQUEST (mt 0x21/0x22/0x24)
+     * ecraser un IMM ASSIGN (0x3f/0x3a/0x3b) encore valide en attente de
+     * presentation sur l'AGCH. L'IMM ASSIGN est la reponse time-critical au RACH
+     * (un seul agch_buf partage) ; le paging est best-effort. Sur un reseau a
+     * paging dense le flood clobberait sinon le grant -> RACH en boucle, pas de LU. */
+    {
+        uint8_t in_mt = l2[2];
+        int in_is_imm = (in_mt == 0x3f || in_mt == 0x3a || in_mt == 0x3b);
+        uint8_t cur_mt = g_shunt.agch_buf[2];
+        int cur_is_imm = (cur_mt == 0x3f || cur_mt == 0x3a || cur_mt == 0x3b);
+        if (!in_is_imm && g_shunt.agch_valid && cur_is_imm) {
+            static int ttl = -1;
+            if (ttl < 0) { const char *t = getenv("CALYPSO_SHUNT_AGCH_TTL");
+                           ttl = (t && *t) ? atoi(t) : 100; }
+            if ((uint32_t)(g_shunt.tick_cnt - g_shunt.agch_tick) <= (uint32_t)ttl) {
+                static unsigned drop = 0;
+                if (drop++ < 20 || (drop % 200) == 0)
+                    fprintf(stderr, "[dsp-shunt] feed_agch: PAGING mt=0x%02x DROP "
+                            "(IMM ASSIGN 0x%02x encore valide en attente)\n", in_mt, cur_mt);
+                return;
+            }
+        }
+    }
+
     int n = len < 23 ? len : 23;
     memcpy(g_shunt.agch_buf, l2, n);
     for (int i = n; i < 23; i++) g_shunt.agch_buf[i] = 0x2B;
@@ -954,12 +1020,14 @@ static void calypso_dsp_shunt_feed_agch(const uint8_t *l2, int len)
      *   [8] = (T1'<<3) | (T3>>3) ; [9] = ((T3&7)<<5) | T2 ; T1'=(FN/1326)%32.
      * adj=0 par defaut (last_rach.fn EST le memo) ; surchargeable CALYPSO_REQREF_ADJ. */
     {
-        static int reqref_rw = -1, rr_adj = -99999;
-        if (reqref_rw < 0)    { const char *e = getenv("CALYPSO_REQREF_REWRITE"); reqref_rw = (e && *e == '0') ? 0 : 1; }
+        static int reqref_rw = -1, reqref_perra = -1, rr_adj = -99999;
+        if (reqref_rw < 0)    { const char *e = getenv("CALYPSO_REQREF_REWRITE"); reqref_rw = (e && *e == '1') ? 1 : 0; }  /* defaut OFF : ancien rewrite GLOBAL (50% multi-RACH) */
+        if (reqref_perra < 0) { const char *e = getenv("CALYPSO_REQREF_PERRA");   reqref_perra = (e && *e == '0') ? 0 : 1; } /* defaut ON : req-ref PER-RA (FN exact du RACH_CONF keye par ra) */
         if (rr_adj == -99999) { const char *e = getenv("CALYPSO_REQREF_ADJ");     rr_adj = e ? atoi(e) : 0; }
-        if (reqref_rw && n >= 10 && g_shunt.agch_buf[2] == 0x3f) {
+        if ((reqref_perra || reqref_rw) && n >= 10 && g_shunt.agch_buf[2] == 0x3f) {
             uint8_t ra = g_shunt.agch_buf[7];
-            uint32_t memo_fn = g_last_rach_conf_fn;   /* FN-FIX : memo capture du RACH_CONF (race-free) */
+            uint32_t memo_fn = (reqref_perra && g_rach_conf_fn[ra]) ? g_rach_conf_fn[ra]
+                             : (reqref_rw ? g_last_rach_conf_fn : 0);   /* per-ra exact, sinon fallback global */
             { static unsigned dbg = 0;
               if (dbg++ < 40)
                   fprintf(stderr, "[dsp-shunt] FN-FIX probe RA=0x%02x "
@@ -1379,6 +1447,22 @@ void calypso_dsp_shunt_feed_si(const uint8_t *l2, int len)
         memcpy(g_shunt.si_set[slot], l2, n);
         for (int i = n; i < 23; i++) g_shunt.si_set[slot][i] = 0x2B;
         g_shunt.si_set_have[slot] = true;
+    }
+    /* SI3 (slot 2) -> derive un SI6 (B4, 19o l3) pour la SACCH dediee : evite que
+     * le mobile lise du garbage sur la SACCH -> 'Short header 0x07 unsupported'.
+     * Layout B4 : [0]pseudo-len(L=11) [1]=0x06 RR [2]=0x1e SI6 [3..4]cell_id
+     * [5..9]LAI (copies du SI3) [10]cell_options [11]ncc_permitted [12..18]rest. */
+    if (slot == 2 && n >= 10) {
+        uint8_t *s6 = g_shunt.sacch_buf;
+        memset(s6, 0x2b, sizeof(g_shunt.sacch_buf));
+        s6[0] = (uint8_t)((11 << 2) | 0x01);   /* L2 pseudo-length L=11 */
+        s6[1] = 0x06;                          /* RR PD, skip=0 */
+        s6[2] = 0x1e;                          /* SYSTEM INFORMATION TYPE 6 */
+        s6[3] = l2[3]; s6[4] = l2[4];          /* cell identity (SI3 @3..4) */
+        s6[5] = l2[5]; s6[6] = l2[6]; s6[7] = l2[7]; s6[8] = l2[8]; s6[9] = l2[9]; /* LAI (SI3 @5..9) */
+        s6[10] = 0x0f;                         /* cell options : radio-link-timeout long */
+        s6[11] = 0xff;                         /* NCC permitted : tous */
+        g_shunt.sacch_have = true;
     }
     /* compat / fallback : si_buf = dernier reçu */
     memcpy(g_shunt.si_buf, l2, n);

@@ -99,6 +99,8 @@ static L1CTLSock g_l1ctl;
  * (calypso_dsp_shunt.c) pour reecrire la req-ref. Source race-free : pas de lecture
  * paresseuse de last_rach.fn @0x836500 (qui est asynchrone vs l'IMM ASS du BTS). */
 volatile uint32_t g_last_rach_conf_fn = 0;
+volatile uint32_t g_rach_conf_fn[256] = {0};  /* per-ra FN-FIX : RACH_CONF fn keye par g_last_recorded_ra */
+extern volatile uint8_t g_last_recorded_ra;   /* defini dans calypso_dsp_shunt.c (record_rach) */
 
 /* ---- Sercomm helpers ---- */
 
@@ -240,7 +242,8 @@ static void sercomm_frame_complete(L1CTLSock *s)
         if (payload[0] == 0x0c && plen >= 12) {
             g_last_rach_conf_fn = ((uint32_t)payload[8] << 24) | ((uint32_t)payload[9] << 16) |
                                   ((uint32_t)payload[10] << 8) | (uint32_t)payload[11];
-            L1CTL_LOG("FN-FIX: RACH_CONF fn=%u capture (memo mobile)", g_last_rach_conf_fn);
+            g_rach_conf_fn[g_last_recorded_ra] = g_last_rach_conf_fn;   /* per-ra : keye par le ra de la derniere RACH */
+            L1CTL_LOG("FN-FIX: RACH_CONF fn=%u capture (memo mobile, ra=0x%02x)", g_last_rach_conf_fn, g_last_recorded_ra);
         }
         L1CTL_LOG("TX→mobile: dlci=%d len=%d type=0x%02x %s", dlci, plen, payload[0],
                   l1ctl_tname(payload[0]));
