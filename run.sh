@@ -1561,6 +1561,27 @@ sleep 1
 /etc/osmocom/status.sh stop 2>/dev/null || true
 /etc/osmocom/osmo-start.sh 2>/dev/null || true
 
+# ---------- 1pre. Feed HLR (INDISPENSABLE A5/1) ----------
+# Sans l'IMSI/Ki du SIM test dans le HLR, la MSC ne peut pas authentifier -> pas
+# de Kc -> CIPHER MODE rejete -> LU chiffree KO (LU en clair OK car a5/0 sans auth).
+# osmo-start.sh (ci-dessus) a lance osmo-hlr ; le HLR DOIT etre up pour etre feed,
+# donc on ATTEND son VTY (4258) puis on injecte l'abonne. Idempotent, tache de fond.
+(
+  _hlr_ip="${CALYPSO_HLR_VTY_IP:-127.0.0.1}"
+  _sim="$MOBILE_CFG"; [ -f "$_sim" ] || _sim=/opt/GSM/qemu-src/cfgs/mobile_group1.cfg
+  _imsi=$(grep -oP '^\s*imsi \K[0-9]{15}' "$_sim" 2>/dev/null | head -1)
+  _ki=$(grep -oP '^\s*ki comp128 \K[0-9a-fA-F ]+' "$_sim" 2>/dev/null | head -1 | tr -d ' ')
+  if [ -n "$_imsi" ] && [ -n "$_ki" ]; then
+    for _ in $(seq 1 90); do (echo >"/dev/tcp/$_hlr_ip/4258") 2>/dev/null && break; sleep 2; done
+    if exec 9<>"/dev/tcp/$_hlr_ip/4258" 2>/dev/null; then
+      printf 'enable\nsubscriber imsi %s create\nsubscriber imsi %s update msisdn %s\nsubscriber imsi %s update aud2g comp128v1 ki %s\n' \
+        "$_imsi" "$_imsi" "${_imsi: -5}" "$_imsi" "$_ki" >&9
+      timeout 2 cat <&9 >/dev/null 2>&1; exec 9>&- 9<&-
+      echo "[run.sh] HLR feed OK : IMSI=$_imsi msisdn=${_imsi: -5} (comp128v1) -> $_hlr_ip:4258"
+    fi
+  fi
+) &
+
 tmux new-session -d -s "$SESSION" -n qemu
 
 # ---------- 1. QEMU ----------
@@ -1774,7 +1795,7 @@ export CALYPSO_SHUNT_DL_INJECT
 # jamais presente au mobile -> RACH en boucle, pas de Location Update. On les
 # derive via nm et on exporte les surcharges (CALYPSO_*_FN_ADDR) -> robuste a
 # tout rebuild, plus jamais besoin de toucher au dsp-shunt.
-_NM="$(command -v arm-elf-nm 2>/dev/null || echo /root/gnuarm/install/bin/arm-elf-nm)"
+_NM="$(command -v arm-elf-nm 2>/dev/null || command -v arm-none-eabi-nm 2>/dev/null || echo /root/gnuarm/install/bin/arm-elf-nm)"
 if [ -x "$_NM" ] && [ -r "$FW_ELF" ]; then
     _L1S=$("$_NM" "$FW_ELF" 2>/dev/null | awk '$3=="l1s"{print "0x"$1}' | head -1)
     _LR=$( "$_NM" "$FW_ELF" 2>/dev/null | awk '$3=="last_rach"{print "0x"$1}' | head -1)
