@@ -11,7 +11,7 @@
 #       0,10,20,30,40 = FCCH | 1,11,21,31,41 = SCH | 2-5 = BCCH
 #       6-9,12-19,22-29,32-39,42-49 = CCCH (PCH/AGCH) | 50 = idle
 #     -> 31 = position SCH, 32 = debut d'un bloc CCCH, 51 = longueur multiframe.
-import subprocess, socket, struct, re, sys, os
+import subprocess, socket, struct, re, sys, os, threading, time
 
 ARFCN = int(os.environ.get("CALYPSO_CCCH_ARFCN", "514"))
 CF = sys.argv[1] if len(sys.argv) > 1 else "/tmp/iq_grgsm.fifo"
@@ -26,6 +26,7 @@ PAGING = {0x21:"PAG-REQ-1", 0x22:"PAG-REQ-2", 0x24:"PAG-REQ-3"}
 GSMTAP_BCCH = 0x01
 GSMTAP_AGCH = 0x04
 GSMTAP_SDCCH4 = 0x07
+GSMTAP_SACCH  = 0x07 | 0x80   # SDCCH/4 + ACCH = SACCH dediee SS0 (SI5/SI6 reels)
 
 def fn51_role(fn):
     m = fn % 51
@@ -42,11 +43,10 @@ def gsmtap(fn, chan, l2):
                       0, 0, fn & 0xffffffff, chan, 0, 0, 0)
     return hdr + l2
 
-p = subprocess.Popen(["grgsm_decode","-m","BCCH_SDCCH4","-t","0","-a",str(ARFCN),
-                      "-c",CF,"-s","1083333","-v"],
-                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-n = 0; nsch = 0; nsd = 0; last_fn = 0; last_sd_fn = -1
-for line in p.stdout:
+n = 0; nsch = 0; nsd = 0; nsa = 0; last_fn = 0; last_sd_fn = -1; last_sa_fn = -1
+
+def handle_line(line):
+    global n, nsch, nsd, nsa, last_fn, last_sd_fn, last_sa_fn
     # --- SCH reel : "SCHBSIC <bsic> <fn> <toa>" -> 4731 + horloge FN ---
     msch = re.search(r"SCHBSIC\s+(\d+)\s+(\d+)\s+(-?\d+)", line)
     if msch:
@@ -57,16 +57,16 @@ for line in p.stdout:
         if nsch <= 10 or nsch % 100 == 0:
             print("[si-bridge] SCH -> 4731 : BSIC=%d (ncc=%d bcc=%d) FN=%d (%%51=%d %s) TOA=%d  #%d"
                   % (bsic,(bsic>>3)&7,bsic&7,fn,fn%51,fn51_role(fn),toa,nsch), flush=True)
-        continue
+        return
     # --- FN explicite eventuel dans la ligne -v ---
     mfn = re.search(r"\bFN[:=]?\s*(\d+)", line)
     if mfn: last_fn = int(mfn.group(1))
     # --- ligne SI hexa ---
     lstr = line.strip()
     m = re.search(r":\s+([0-9a-fA-F][0-9a-fA-F ]+)$", lstr)
-    if not m: continue
+    if not m: return
     try: by = bytes(int(x,16) for x in m.group(1).split())
-    except: continue
+    except: return
     if len(by) >= 3 and by[1] == 0x06 and (by[2] in SI or by[2] in CCCH or by[2] in PAGING):
         mline_fn = re.match(r"^\s*(\d+)\b", lstr)
         si_fn = int(mline_fn.group(1)) if mline_fn else last_fn
@@ -107,4 +107,85 @@ for line in p.stdout:
             if nsd <= 20 or nsd % 50 == 0:
                 print("[si-bridge] SDCCH/4 SS0 DL (a0=0x%02x c=0x%02x) FN=%d (%%51=%d) -> feed_sdcch (4730)  #%d [new]"
                       % (by[0], ctrl, sd_fn, sd_fn%51, nsd), flush=True)
-print("[si-bridge] fini, %d SI / %d SCH transmis" % (n, nsch), flush=True)
+    # --- SACCH (SDCCH/4 SS0) DL : SI5(0x1d)/SI6(0x1e) REELS -> feed_sacch ---
+    # Slots SACCH SS0 (combine CCCH+SDCCH/4) : fn%51 in {42-45}. grgsm donne le
+    # bloc 23o = [L1 hdr 2][LAPDm: 03 03 len 06 mt L3...]. On detecte le RR header
+    # "06 1d"/"06 1e" et on forwarde le bloc TEL QUEL au shunt (sub_type 0x87 =
+    # SDCCH4|ACCH) -> feed_sacch REEL, remplace la fabrication SI3->SI6.
+    if len(by) >= 8 and (sd_fn % 51) in (42, 43, 44, 45):
+        mt_sa = None
+        for off in range(2, min(9, len(by) - 1)):
+            if by[off] == 0x06 and by[off + 1] in (0x1d, 0x1e):
+                mt_sa = by[off + 1]; break
+        if mt_sa is not None and sd_fn != last_sa_fn:
+            last_sa_fn = sd_fn
+            L2 = (by[:23] + b"\x2b" * 23)[:23]
+            s.sendto(gsmtap(sd_fn, GSMTAP_SACCH, L2), ("127.0.0.1", 4730))
+            nsa += 1
+            if nsa <= 20 or nsa % 50 == 0:
+                print("[si-bridge] SACCH SI%d (mt=0x%02x) FN=%d (%%51=%d) -> feed_sacch REEL (4730)  #%d"
+                      % (5 if mt_sa == 0x1d else 6, mt_sa, sd_fn, sd_fn % 51, nsa), flush=True)
+# === STAGE 3 : DECHIFFREMENT DL ============================================
+# osmo-bts chiffre le DL (SDCCH/SACCH dedie) une fois le CIPHER MODE COMPLETE
+# accepte. grgsm sait dechiffrer si on lui passe -e <A5> -k <Kc>. Le Kc est
+# capture par osmocon (filtre) dans /dev/shm/calypso_kc des le CIPHER MODE
+# COMMAND. On (re)lance donc grgsm AVEC -k quand un Kc apparait, et SANS quand
+# il disparait (seq=0 = canal libere -> le canal suivant redemarre EN CLAIR ;
+# grgsm -k corromprait les bursts dedies non chiffres). grgsm ne dechiffre que
+# les canaux dedies (SDCCH/TCH) -> le BCCH/CCCH (jamais chiffre) reste OK.
+def read_kc():
+    try:
+        with open("/dev/shm/calypso_kc", "rb") as f:
+            b = f.read(32)
+    except OSError:
+        return (0, 0, None)
+    if len(b) < 14:
+        return (0, 0, None)
+    seq = int.from_bytes(b[0:4], "little")
+    if seq == 0:
+        return (0, 0, None)
+    return (seq, b[4], b[6:14].hex())
+
+def grgsm_cmd(algo, kc_hex):
+    cmd = ["grgsm_decode", "-m", "BCCH_SDCCH4", "-t", "0", "-a", str(ARFCN),
+           "-c", CF, "-s", "1083333", "-v"]
+    if kc_hex and algo in (1, 2, 3):
+        cmd += ["-e", str(algo), "-k", kc_hex]
+    return cmd
+
+CIPH = {"applied": (0, None), "proc": None}
+
+def kc_monitor():
+    """Surveille /dev/shm/calypso_kc ; sur changement, tue grgsm -> respawn."""
+    while True:
+        time.sleep(0.5)
+        seq, algo, kc = read_kc()
+        want = (algo, kc) if seq else (0, None)
+        if want != CIPH["applied"]:
+            print("[si-bridge] Kc change -> respawn grgsm (%s)"
+                  % ("A5/%d kc=%s" % (algo, kc) if seq else "clair"), flush=True)
+            p = CIPH["proc"]
+            if p is not None:
+                try: p.kill()
+                except Exception: pass
+
+threading.Thread(target=kc_monitor, daemon=True).start()
+
+# Boucle de (re)lancement : grgsm tourne ; s'il meurt (tue par le monitor sur
+# changement de Kc, ou crash), on relance avec l'etat Kc courant.
+while True:
+    seq, algo, kc = read_kc()
+    CIPH["applied"] = (algo, kc) if seq else (0, None)
+    cmd = grgsm_cmd(algo, kc) if seq else grgsm_cmd(0, None)
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                         stderr=subprocess.DEVNULL, text=True)
+    CIPH["proc"] = p
+    print("[si-bridge] grgsm spawn: %s"
+          % ("A5/%d kc=%s" % (algo, kc) if seq else "clair (pas de Kc)"), flush=True)
+    for line in p.stdout:
+        handle_line(line)
+    try: p.wait(timeout=2)
+    except Exception: pass
+    print("[si-bridge] grgsm termine (n=%d nsch=%d nsd=%d nsa=%d) -> respawn"
+          % (n, nsch, nsd, nsa), flush=True)
+    time.sleep(0.2)

@@ -38,6 +38,7 @@
 #include <osmocom/core/logging.h>
 #include <osmocom/core/bits.h>
 #include <osmocom/coding/gsm0503_coding.h>
+#include <osmocom/gsm/a5.h>      /* osmo_a5() : chiffrement A5/1 UL */
 
 #include "debug.h"
 #include "ipc_shm.h"
@@ -784,6 +785,24 @@ static int calypso_rach_read(uint8_t *ra, uint8_t *bsic, uint32_t *fn)
     return 1;
 }
 
+/* Lit /dev/shm/calypso_kc (ecrit par QEMU l1ctl_sock sur L1CTL_CRYPTO_REQ) :
+ * [0..3]seq(LE) [4]algo [5]key_len [6..21]Kc. Retourne le seq (0 = pas de cipher
+ * actif : aucun CIPHER MODE COMMAND, ou canal reset via DM_EST/DM_REL). */
+static uint32_t calypso_kc_read(uint8_t *algo, uint8_t *kc, uint8_t *klen)
+{
+    static int fd = -1;
+    if (fd < 0) fd = open("/dev/shm/calypso_kc", O_RDONLY);
+    if (fd < 0) return 0;
+    uint8_t buf[32];
+    if (pread(fd, buf, sizeof(buf), 0) != (ssize_t)sizeof(buf)) return 0;
+    uint32_t seq; memcpy(&seq, buf, 4);
+    if (seq == 0) return 0;
+    if (algo) *algo = buf[4];
+    if (klen) *klen = buf[5];
+    if (kc)   memcpy(kc, buf + 6, 16);
+    return seq;
+}
+
 /* SDCCH/SACCH UL sideband (#12 PIÈCE 2) : lit la L2 montante (a_cu) publiée par QEMU
  * (calypso_dsp_shunt) dans /dev/shm/calypso_sdcch_ul. Layout 48o : seq@0(u32)
  * l1s_fn@4(u32) fn@8(u32) task_u@12(u16) l1s%51@14(u8) l2[23]@16. Retourne 1 si seq>0. */
@@ -853,7 +872,7 @@ static void ul_drain(void)
                  * nb de slots eligibles a tenter (def 8 ~ couvre >1 multiframe-51). */
                 memcpy(g_rach_iq, g_ul_iq, sizeof(g_rach_iq));
                 { static int rsticky = -1;
-                  if (rsticky < 0) { const char *e = getenv("CALYPSO_UL_RACH_STICKY"); rsticky = (e && *e) ? atoi(e) : 8; }
+                  if (rsticky < 0) { const char *e = getenv("CALYPSO_UL_RACH_STICKY"); rsticky = (e && *e) ? atoi(e) : 0;        /* defaut OFF (gate vide) : sticky retire */ }
                   g_rach_pending = rsticky; g_rach_arm_seq++; }
                 used_tab = 1;
                 static int last_ra = -1;
@@ -940,6 +959,116 @@ static void relay_init(void)
          host, rx_port, tx_port);
 }
 
+/* === FIFO writer FRAME-ATOMIQUE, decouple du hot-path (fix SACCH grgsm) =======
+ * BUG corrige (construction IQ "mauvaise a partir de la fifo") : l'ancien
+ * write(O_NONBLOCK) direct sur le pipe (a) laissait passer des writes PARTIELS
+ * (0<w<fbytes) -> desalignement byte PERMANENT du flux fc32 -> grgsm en garbage ;
+ * (b) DROPpait des trames sur EAGAIN -> trous temporels -> grgsm perd la
+ * 51-multitrame -> SDCCH/4 SACCH (SI5/SI6) jamais decodee (le BCCH/CCCH resync
+ * lui via FCCH/SCH, d'ou "ca marche a moitie").
+ * FIX : 1 thread writer DEDIE par FIFO + ring de TRAMES. Le hot-path DL pousse
+ * une trame (memcpy sous lock court ~20KB) ou la DROP ENTIERE si le ring est
+ * plein ; le writer fait des write() BLOQUANTS COMPLETS (jamais partiels) ->
+ * alignement byte toujours correct, jamais d'underrun cote QEMU. */
+enum { RELAY_NFIFO_MAX = 4, RELAY_RING = 64,
+       RELAY_FRAME_FLOATS = CALYPSO_SHM_BUFSIZE * 2 };
+typedef struct {
+    char            path[128];
+    int             fd;                 /* writer-thread-owned */
+    pthread_t       th;
+    pthread_mutex_t mtx;
+    pthread_cond_t  cv;
+    float           ring[RELAY_RING][RELAY_FRAME_FLOATS];
+    size_t          rlen[RELAY_RING];
+    unsigned        head, tail;         /* SPSC : producer=hot-path, consumer=thread */
+    unsigned long   dropped, written;
+} relay_fifo_t;
+static relay_fifo_t g_rfifo[RELAY_NFIFO_MAX];
+static int          g_rfifo_n = -1;
+
+static void *relay_fifo_writer(void *arg)
+{
+    relay_fifo_t *rf = arg;
+    static __thread float local[RELAY_FRAME_FLOATS];
+    for (;;) {
+        size_t nfloats;
+        pthread_mutex_lock(&rf->mtx);
+        while (rf->head == rf->tail)
+            pthread_cond_wait(&rf->cv, &rf->mtx);
+        unsigned h = rf->head % RELAY_RING;
+        nfloats = rf->rlen[h];
+        memcpy(local, rf->ring[h], nfloats * sizeof(float));
+        rf->head++;
+        pthread_mutex_unlock(&rf->mtx);
+
+        if (rf->fd < 0) {
+            rf->fd = open(rf->path, O_WRONLY);   /* BLOQUANT : attend grgsm */
+            if (rf->fd < 0) continue;
+            fcntl(rf->fd, F_SETPIPE_SZ, 1 << 20);
+        }
+        const char *p = (const char *)local;
+        size_t left = nfloats * sizeof(float);
+        while (left) {                            /* write COMPLET, jamais partiel */
+            ssize_t w = write(rf->fd, p, left);
+            if (w > 0) { p += (size_t)w; left -= (size_t)w; continue; }
+            if (w < 0 && errno == EINTR) continue;
+            close(rf->fd); rf->fd = -1; break;    /* EPIPE/EBADF : reader parti */
+        }
+        if (!left) rf->written++;
+    }
+    return NULL;
+}
+
+static void relay_fifo_init(void)
+{
+    if (g_rfifo_n >= 0) return;
+    g_rfifo_n = 0;
+    const char *e = getenv("CALYPSO_RELAY_FIFOS");
+    const char *list = (e && *e) ? e
+        : "/tmp/iq_fft.fifo:/tmp/iq_grgsm.fifo:/tmp/iq_record.fifo";
+    char buf[512];
+    strncpy(buf, list, sizeof(buf) - 1); buf[sizeof(buf) - 1] = 0;
+    char *sav = NULL, *tok = strtok_r(buf, ":", &sav);
+    while (tok && g_rfifo_n < RELAY_NFIFO_MAX) {
+        relay_fifo_t *rf = &g_rfifo[g_rfifo_n];
+        strncpy(rf->path, tok, 127); rf->path[127] = 0;
+        rf->fd = -1; rf->head = rf->tail = 0; rf->dropped = rf->written = 0;
+        pthread_mutex_init(&rf->mtx, NULL);
+        pthread_cond_init(&rf->cv, NULL);
+        mkfifo(rf->path, 0666);                  /* ignore EEXIST */
+        pthread_create(&rf->th, NULL, relay_fifo_writer, rf);
+        g_rfifo_n++;
+        tok = strtok_r(NULL, ":", &sav);
+    }
+    LOGP(DDEV, LOGL_NOTICE,
+         "RELAY FIFO: %d writer-threads (frame-atomic, ring=%d trames)\n",
+         g_rfifo_n, RELAY_RING);
+}
+
+/* hot-path : pousse 1 trame dans chaque FIFO ; DROP entiere si ring plein. */
+static void relay_fifo_push(const float *frame, size_t nfloats)
+{
+    if (g_rfifo_n < 0) relay_fifo_init();
+    if (nfloats > (size_t)RELAY_FRAME_FLOATS) nfloats = RELAY_FRAME_FLOATS;
+    for (int f = 0; f < g_rfifo_n; f++) {
+        relay_fifo_t *rf = &g_rfifo[f];
+        pthread_mutex_lock(&rf->mtx);
+        if (rf->tail - rf->head >= RELAY_RING) {
+            rf->dropped++;                        /* ring plein -> drop TRAME entiere */
+            if ((rf->dropped % 500) == 1)
+                LOGP(DDEV, LOGL_INFO, "RELAY FIFO %s drop=%lu written=%lu\n",
+                     rf->path, rf->dropped, rf->written);
+        } else {
+            unsigned t = rf->tail % RELAY_RING;
+            memcpy(rf->ring[t], frame, nfloats * sizeof(float));
+            rf->rlen[t] = nfloats;
+            rf->tail++;
+            pthread_cond_signal(&rf->cv);
+        }
+        pthread_mutex_unlock(&rf->mtx);
+    }
+}
+
 /* ---- RX (uplink_thread loop) : produces UL heartbeat zeros to osmo-trx ---- */
 
 int32_t uhdwrap_read(void *dev, uint32_t num_chans)
@@ -975,9 +1104,9 @@ int32_t uhdwrap_read(void *dev, uint32_t num_chans)
      *                        CCCH+SDCCH4 : osmo_fn%51 in {4,5,14..36,45,46}).
      * CALYPSO_UL_SLOT_OFFSET : offset intra-slot (samples) du burst (TOA). */
     static int ul_fnoff = -99999, ul_fngate = -1, ul_slotoff = -1;
-    if (ul_fnoff == -99999) { const char *e = getenv("CALYPSO_UL_FN_OFFSET"); ul_fnoff = e ? atoi(e) : 31; }
+    if (ul_fnoff == -99999) { const char *e = getenv("CALYPSO_UL_FN_OFFSET"); ul_fnoff = (e && *e) ? atoi(e) : 36;       /* hardcode : offset FN device->osmo-trx (gate vide=36) */ }
     if (ul_fngate < 0)      { const char *e = getenv("CALYPSO_UL_FN_GATE");   ul_fngate = (!e || *e != '0'); }
-    if (ul_slotoff < 0)     { const char *e = getenv("CALYPSO_UL_SLOT_OFFSET"); ul_slotoff = e ? atoi(e) : 0; }
+    if (ul_slotoff < 0)     { const char *e = getenv("CALYPSO_UL_SLOT_OFFSET"); ul_slotoff = (e && *e) ? atoi(e) : 1875;   /* hardcode : TOA intra-slot RACH (gate vide=1875) */ }
     uint32_t internal_fn = (uint32_t)(d->rx_ts / (uint64_t)CALYPSO_FRAME_SAMPLES);
     uint32_t osmo_fn = internal_fn + (uint32_t)ul_fnoff;     /* FN tel que vu par osmo-trx (SDCCH only) */
     /* FN-GATE RACH (FIX MT-SMS 2026-06-09) : osmo-trx TAMPONNE+CORRELE le burst injecte
@@ -1132,6 +1261,42 @@ int32_t uhdwrap_read(void *dev, uint32_t num_chans)
             if (blk_valid) {
                 int8_t ab[CALYPSO_BSP_BURSTLEN];
                 ul_build_sdcch_burst(ab, blk_l2, bid);
+                /* === CHIFFREMENT A5 UL ============================================
+                 * Si un Kc a ete capture (CIPHER MODE COMMAND -> /dev/shm/calypso_kc),
+                 * on chiffre les 114 bits data du burst (mapping IDENTIQUE a osmo-bts
+                 * scheduler.c:1614 : negation soft-bit ab[i+3] / ab[i+88]). osmo-bts
+                 * dechiffre l'UL avec le FN du burst -> A5 est FN-keye : FN = osmo_fn
+                 * (+ CALYPSO_CIPH_FN_ADJ, sweepable car l'alignement FN device<->bts
+                 * est la variable critique). CALYPSO_CIPH_A5 force le n (debug). */
+                {
+                    static int ci_init = -1, ci_fn_adj = 0, ci_force_n = -1;
+                    static uint8_t kc[16]; static int n_a5 = 0;
+                    if (ci_init < 0) {
+                        const char *e = getenv("CALYPSO_CIPH_FN_ADJ"); ci_fn_adj = e ? atoi(e) : 0;
+                        const char *f = getenv("CALYPSO_CIPH_A5");     ci_force_n = (f && *f) ? atoi(f) : -1;
+                        ci_init = 1;
+                    }
+                    uint8_t cgalgo = 0, cklen = 0;
+                    if (calypso_kc_read(&cgalgo, kc, &cklen))
+                        n_a5 = (ci_force_n >= 0) ? ci_force_n
+                                                 : ((cgalgo >= 1 && cgalgo <= 3) ? cgalgo : 0);
+                    else
+                        n_a5 = 0;                       /* seq=0 -> cipher off */
+                    if (n_a5 >= 1 && n_a5 <= 3) {
+                        ubit_t ks[114];
+                        uint32_t fnc = (uint32_t)((long)osmo_fn + ci_fn_adj);
+                        osmo_a5(n_a5, kc, fnc, NULL, ks);       /* keystream UL */
+                        for (int i = 0; i < 57; i++) {
+                            if (ks[i])      ab[i + 3]  = (int8_t)-ab[i + 3];
+                            if (ks[i + 57]) ab[i + 88] = (int8_t)-ab[i + 88];
+                        }
+                        static unsigned nci = 0;
+                        if (nci++ < 30 || (nci % 100) == 0)
+                            LOGP(DDEV, LOGL_NOTICE,
+                                 "UL CIPHER A5/%d bid=%d fn=%u (adj=%d) Kc=%02x%02x%02x%02x..\n",
+                                 n_a5, bid, fnc, ci_fn_adj, kc[0], kc[1], kc[2], kc[3]);
+                    }
+                }
                 ul_mod_laurent(ab, CALYPSO_BSP_BURSTLEN, g_ul_iq);  /* modulateur EXACT osmo-trx */
                 memset(ul_chunk, 0, sizeof(ul_chunk));
                 /* offset ÉCHANTILLON dédié au burst NORMAL (≠ access-burst RACH) : le
@@ -1332,52 +1497,12 @@ int32_t uhdwrap_write(void *dev, uint32_t num_chans, bool *underrun)
                 sendto(g_relay_dl_fd, g_relay_fbuf, (size_t)ns * 2 * sizeof(float),
                        MSG_DONTWAIT, (struct sockaddr *)&g_relay_dl_dst,
                        sizeof(g_relay_dl_dst));
-            /* FIFOs LIVE frame-par-frame : on pousse CHAQUE "trame cfile" (le
-             * full chunk relay continu = ns*2 floats fc32, 1 write() = 1 trame)
-             * dans 1 FIFO par consommateur (fft, grgsm, record). NON-BLOQUANT :
-             * si un lecteur est lent/absent on DROP la trame => aucun stall du
-             * hot-path DL => PLUS d'underrun. (C'est le fwrite du RING cfile
-             * entier 128MB sur tmpfs + fseek qui causait les underruns.)
-             * Le RECORD se fait A COTE : un drainer externe (run.sh) lit
-             * iq_record.fifo -> record.cfile, hors du hot-path qemu.
-             * Liste CALYPSO_RELAY_FIFOS (':'-separes), defaut fft:grgsm:record.*/
-            {
-                enum { MAXFIFO = 4 };
-                static int   fifo_fd[MAXFIFO];
-                static char  fifo_path[MAXFIFO][128];
-                static int   nfifo = -1;
-                if (nfifo < 0) {
-                    nfifo = 0;
-                    const char *e = getenv("CALYPSO_RELAY_FIFOS");
-                    const char *list = (e && *e) ? e
-                        : "/tmp/iq_fft.fifo:/tmp/iq_grgsm.fifo:/tmp/iq_record.fifo";
-                    char buf[512];
-                    strncpy(buf, list, sizeof(buf) - 1); buf[sizeof(buf) - 1] = 0;
-                    char *sav = NULL, *tok = strtok_r(buf, ":", &sav);
-                    while (tok && nfifo < MAXFIFO) {
-                        strncpy(fifo_path[nfifo], tok, 127);
-                        fifo_path[nfifo][127] = 0;
-                        fifo_fd[nfifo] = -1;
-                        mkfifo(fifo_path[nfifo], 0666);   /* ignore EEXIST */
-                        nfifo++;
-                        tok = strtok_r(NULL, ":", &sav);
-                    }
-                }
-                size_t fbytes = (size_t)ns * 2 * sizeof(float);   /* 1 trame cfile */
-                for (int f = 0; f < nfifo; f++) {
-                    if (fifo_fd[f] < 0) {
-                        /* O_NONBLOCK : -1/ENXIO tant qu'aucun lecteur n'a ouvert */
-                        fifo_fd[f] = open(fifo_path[f], O_WRONLY | O_NONBLOCK);
-                        if (fifo_fd[f] < 0) continue;
-                        fcntl(fifo_fd[f], F_SETPIPE_SZ, 1 << 20); /* 1MB = marge ~50 trames */
-                    }
-                    ssize_t w = write(fifo_fd[f], g_relay_fbuf, fbytes);
-                    if (w < 0 && (errno == EPIPE || errno == EBADF)) {
-                        close(fifo_fd[f]); fifo_fd[f] = -1;   /* lecteur parti -> reouvrira */
-                    }
-                    /* EAGAIN (pipe plein, lecteur lent) : DROP cette trame. */
-                }
-            }
+            /* FIFOs LIVE frame-par-frame -> writer-thread FRAME-ATOMIQUE
+             * (cf relay_fifo_push / relay_fifo_writer ci-dessus). Plus de write
+             * partiel ni de desalignement byte -> grgsm garde la 51-multitrame
+             * -> SDCCH/4 SACCH (SI5/SI6) decodee. Drop = TRAME entiere si ring
+             * plein (continuite byte preservee). CALYPSO_RELAY_FIFOS (':'-sep).*/
+            relay_fifo_push(g_relay_fbuf, (size_t)ns * 2);
             /* RELAY+BSP (#3 cfile) : si CALYPSO_RELAY_ALSO_BSP=1, on NE
              * `continue` PAS — on tombe dans l'extraction TS0→TRXDv0→BSP pour
              * alimenter feed_iq (cfile + shm ring grgsm↔BSP). Defaut: relais pur. */
