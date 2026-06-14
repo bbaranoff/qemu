@@ -23,6 +23,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <math.h>
+#include <signal.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <stdbool.h>
@@ -970,7 +971,7 @@ static void relay_init(void)
  * une trame (memcpy sous lock court ~20KB) ou la DROP ENTIERE si le ring est
  * plein ; le writer fait des write() BLOQUANTS COMPLETS (jamais partiels) ->
  * alignement byte toujours correct, jamais d'underrun cote QEMU. */
-enum { RELAY_NFIFO_MAX = 4, RELAY_RING = 64,
+enum { RELAY_NFIFO_MAX = 8, RELAY_RING = 64,   /* 8 : fft+grgsm+record+asciifft + grgsm_ciph (decipher DL) */
        RELAY_FRAME_FLOATS = CALYPSO_SHM_BUFSIZE * 2 };
 typedef struct {
     char            path[128];
@@ -1002,9 +1003,21 @@ static void *relay_fifo_writer(void *arg)
         pthread_mutex_unlock(&rf->mtx);
 
         if (rf->fd < 0) {
-            rf->fd = open(rf->path, O_WRONLY);   /* BLOQUANT : attend grgsm */
-            if (rf->fd < 0) continue;
-            fcntl(rf->fd, F_SETPIPE_SZ, 1 << 20);
+            /* OUVERTURE NON-BLOQUANTE : pas de lecteur (ENXIO) -> on DROP cette
+             * trame et on retentera a la suivante. CRUCIAL : l'ancien open(O_WRONLY)
+             * BLOQUANT figeait ce thread tant qu'aucun grgsm n'etait lecteur ; or
+             * quand si_bridge TUE grgsm pour le respawn cipher, le lecteur
+             * disparait -> ce writer + la cascade relay gelaient l'ipc-device
+             * (DL FIFO plein -> osmo-trx SETPOWER no-response -> feed_iq gele ->
+             * pas de LU accept). Avec O_NONBLOCK le churn de lecteur (kill/respawn
+             * grgsm) est INOFFENSIF. Une fois ouvert, on RETIRE O_NONBLOCK pour
+             * garder des write() BLOQUANTS COMPLETS (frame-atomique preserve). */
+            int fd = open(rf->path, O_WRONLY | O_NONBLOCK);
+            if (fd < 0) { rf->dropped++; continue; }   /* ENXIO : aucun lecteur */
+            int fl = fcntl(fd, F_GETFL, 0);
+            if (fl >= 0) fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);  /* writes bloquants */
+            fcntl(fd, F_SETPIPE_SZ, 1 << 20);
+            rf->fd = fd;
         }
         const char *p = (const char *)local;
         size_t left = nfloats * sizeof(float);
@@ -1022,6 +1035,10 @@ static void *relay_fifo_writer(void *arg)
 static void relay_fifo_init(void)
 {
     if (g_rfifo_n >= 0) return;
+    /* SIGPIPE ignore : un write() sur une FIFO dont le lecteur (grgsm) vient de
+     * disparaitre doit renvoyer EPIPE (gere par la boucle write -> reopen), PAS
+     * tuer le process. */
+    signal(SIGPIPE, SIG_IGN);
     g_rfifo_n = 0;
     const char *e = getenv("CALYPSO_RELAY_FIFOS");
     const char *list = (e && *e) ? e

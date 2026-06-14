@@ -125,14 +125,41 @@ def handle_line(line):
             if nsa <= 20 or nsa % 50 == 0:
                 print("[si-bridge] SACCH SI%d (mt=0x%02x) FN=%d (%%51=%d) -> feed_sacch REEL (4730)  #%d"
                       % (5 if mt_sa == 0x1d else 6, mt_sa, sd_fn, sd_fn % 51, nsa), flush=True)
-# === STAGE 3 : DECHIFFREMENT DL ============================================
-# osmo-bts chiffre le DL (SDCCH/SACCH dedie) une fois le CIPHER MODE COMPLETE
-# accepte. grgsm sait dechiffrer si on lui passe -e <A5> -k <Kc>. Le Kc est
-# capture par osmocon (filtre) dans /dev/shm/calypso_kc des le CIPHER MODE
-# COMMAND. On (re)lance donc grgsm AVEC -k quand un Kc apparait, et SANS quand
-# il disparait (seq=0 = canal libere -> le canal suivant redemarre EN CLAIR ;
-# grgsm -k corromprait les bursts dedies non chiffres). grgsm ne dechiffre que
-# les canaux dedies (SDCCH/TCH) -> le BCCH/CCCH (jamais chiffre) reste OK.
+
+# === STAGE 3 : DECHIFFREMENT DL — DEUX grgsm QUI SE DELEGUENT ================
+# PROBLEME resolu : tuer grgsm pour le relancer avec -k au CIPHER MODE retirait
+# le lecteur de la FIFO -> l'ipc-device se figeait (DL FIFO plein -> osmo-trx
+# SETPOWER no-response -> feed_iq gele -> pas de LU accept).
+# SOLUTION (design B) : on ne tue JAMAIS le grgsm CLAIR. Deux process tournent
+# en parallele, chacun sur SA FIFO (les deux alimentees par l'ipc-device relay) :
+#   - grgsm CLAIR  sur CF (iq_grgsm.fifo)  : decode etablissement/ID/AUTH(RAND)/
+#     CIPHER MODE COMMAND. Ne sort QUE des trames CRC-valides -> se tait tout seul
+#     sur le dedie une fois le DL chiffre.
+#   - grgsm CHIFFRE sur CIPH_CF (-e -k)    : spawne des qu'un Kc apparait (fenetre
+#     RAND->cipher : il a le temps de locker FCCH/SCH AVANT que le DL passe chiffre),
+#     decode le dedie chiffre (LU ACCEPT...). Tue seulement au release (Kc efface).
+# Les deux sorties sont fusionnees par handle_line (sous lock) : le CRC de grgsm
+# fait le tri, le dedup par FN evite les doublons. ZERO trou de lecteur sur la
+# FIFO clair -> l'ipc-device ne gele plus. Le churn (spawn/kill) du grgsm chiffre
+# est inoffensif grace au writer ipc-device non-bloquant (relay_fifo_writer).
+CIPH_CF = os.environ.get("CALYPSO_CIPH_FIFO", "/tmp/iq_grgsm_ciph.fifo")
+_hl_lock = threading.Lock()
+
+def spawn_grgsm(fifo, algo=0, kc_hex=None):
+    cmd = ["grgsm_decode", "-m", "BCCH_SDCCH4", "-t", "0", "-a", str(ARFCN),
+           "-c", fifo, "-s", "1083333", "-v"]
+    if kc_hex and algo in (1, 2, 3):
+        cmd += ["-e", str(algo), "-k", kc_hex]
+    return subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, text=True)
+
+def reader_loop(proc, tag):
+    for line in proc.stdout:
+        with _hl_lock:
+            handle_line(line)
+    print("[si-bridge] grgsm %s termine (n=%d nsch=%d nsd=%d nsa=%d)"
+          % (tag, n, nsch, nsd, nsa), flush=True)
+
 def read_kc():
     try:
         with open("/dev/shm/calypso_kc", "rb") as f:
@@ -146,46 +173,40 @@ def read_kc():
         return (0, 0, None)
     return (seq, b[4], b[6:14].hex())
 
-def grgsm_cmd(algo, kc_hex):
-    cmd = ["grgsm_decode", "-m", "BCCH_SDCCH4", "-t", "0", "-a", str(ARFCN),
-           "-c", CF, "-s", "1083333", "-v"]
-    if kc_hex and algo in (1, 2, 3):
-        cmd += ["-e", str(algo), "-k", kc_hex]
-    return cmd
+# --- grgsm CLAIR : toujours vivant (watchdog respawn si crash), JAMAIS tue au cipher ---
+clear = {"proc": None}
+def ensure_clear():
+    p = clear["proc"]
+    if p is None or p.poll() is not None:
+        clear["proc"] = spawn_grgsm(CF)
+        threading.Thread(target=reader_loop, args=(clear["proc"], "clair"),
+                         daemon=True).start()
+        print("[si-bridge] grgsm CLAIR spawn sur %s (jamais tue au cipher)" % CF, flush=True)
 
-CIPH = {"applied": (0, None), "proc": None}
+ensure_clear()
 
-def kc_monitor():
-    """Surveille /dev/shm/calypso_kc ; sur changement, tue grgsm -> respawn."""
-    while True:
-        time.sleep(0.5)
-        seq, algo, kc = read_kc()
-        want = (algo, kc) if seq else (0, None)
-        if want != CIPH["applied"]:
-            print("[si-bridge] Kc change -> respawn grgsm (%s)"
-                  % ("A5/%d kc=%s" % (algo, kc) if seq else "clair"), flush=True)
-            p = CIPH["proc"]
-            if p is not None:
-                try: p.kill()
-                except Exception: pass
-
-threading.Thread(target=kc_monitor, daemon=True).start()
-
-# Boucle de (re)lancement : grgsm tourne ; s'il meurt (tue par le monitor sur
-# changement de Kc, ou crash), on relance avec l'etat Kc courant.
+# --- grgsm CHIFFRE : spawne/tue selon le Kc, TOUJOURS sur CIPH_CF (jamais sur CF) ---
+ciph = {"applied": (0, None), "proc": None}
 while True:
+    time.sleep(0.5)
+    ensure_clear()                     # watchdog du grgsm clair
     seq, algo, kc = read_kc()
-    CIPH["applied"] = (algo, kc) if seq else (0, None)
-    cmd = grgsm_cmd(algo, kc) if seq else grgsm_cmd(0, None)
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                         stderr=subprocess.DEVNULL, text=True)
-    CIPH["proc"] = p
-    print("[si-bridge] grgsm spawn: %s"
-          % ("A5/%d kc=%s" % (algo, kc) if seq else "clair (pas de Kc)"), flush=True)
-    for line in p.stdout:
-        handle_line(line)
-    try: p.wait(timeout=2)
-    except Exception: pass
-    print("[si-bridge] grgsm termine (n=%d nsch=%d nsd=%d nsa=%d) -> respawn"
-          % (n, nsch, nsd, nsa), flush=True)
-    time.sleep(0.2)
+    want = (algo, kc) if (seq and algo in (1, 2, 3)) else (0, None)
+    if want == ciph["applied"]:
+        continue
+    # etat Kc change -> on (re)cycle UNIQUEMENT le grgsm chiffre (sur CIPH_CF)
+    p = ciph["proc"]
+    if p is not None:
+        try: p.kill(); p.wait(timeout=2)
+        except Exception: pass
+        ciph["proc"] = None
+    ciph["applied"] = want
+    if want[0]:
+        np = spawn_grgsm(CIPH_CF, algo=want[0], kc_hex=want[1])
+        ciph["proc"] = np
+        threading.Thread(target=reader_loop, args=(np, "chiffre"),
+                         daemon=True).start()
+        print("[si-bridge] grgsm CHIFFRE spawn sur %s : A5/%d kc=%s (decipher DL)"
+              % (CIPH_CF, want[0], want[1]), flush=True)
+    else:
+        print("[si-bridge] Kc efface -> grgsm chiffre arrete (clair seul)", flush=True)
