@@ -145,18 +145,52 @@ def handle_line(line):
 CIPH_CF = os.environ.get("CALYPSO_CIPH_FIFO", "/tmp/iq_grgsm_ciph.fifo")
 _hl_lock = threading.Lock()
 
-def spawn_grgsm(fifo, algo=0, kc_hex=None):
-    cmd = ["grgsm_decode", "-m", "BCCH_SDCCH4", "-t", "0", "-a", str(ARFCN),
+# grgsm_decode HARDCODE le port GSMTAP UDP 4729 (socket_pdu UDP_SERVER+CLIENT, pas
+# d'option). Deux instances -> "bind: Address already in use" -> le 2e crash
+# (silencieux car stderr=DEVNULL) -> jamais de decode chiffre. On lit le STDOUT
+# (-v), pas le 4729 -> on patche une COPIE pour le grgsm chiffre sur un port libre
+# (4799). Genere au demarrage -> reproductible, survit au reclone du conteneur.
+import shutil
+def make_ciph_binary():
+    src = shutil.which("grgsm_decode")
+    if not src:
+        return "grgsm_decode"
+    dst = "/tmp/grgsm_decode_ciph"
+    try:
+        with open(src) as f:
+            code = f.read()
+        code = code.replace('"4729"', '"4799"')   # port GSMTAP unique (pas de conflit avec le clair)
+        with open(dst, "w") as f:
+            f.write(code)
+        os.chmod(dst, 0o755)
+        print("[si-bridge] grgsm chiffre patche -> %s (GSMTAP 4729->4799)" % dst, flush=True)
+        return dst
+    except Exception as e:
+        print("[si-bridge] patch grgsm chiffre echoue (%s) -> fallback partage 4729" % e, flush=True)
+        return src
+GRGSM_CIPH = make_ciph_binary()
+
+def spawn_grgsm(fifo, algo=0, kc_hex=None, binary="grgsm_decode", errlog=None):
+    cmd = [binary, "-m", "BCCH_SDCCH4", "-t", "0", "-a", str(ARFCN),
            "-c", fifo, "-s", "1083333", "-v"]
     if kc_hex and algo in (1, 2, 3):
         cmd += ["-e", str(algo), "-k", kc_hex]
-    return subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                            stderr=subprocess.DEVNULL, text=True)
+    err = open(errlog, "w") if errlog else subprocess.DEVNULL
+    return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err, text=True)
 
 def reader_loop(proc, tag):
+    # log brut par grgsm (diagnostic decipher) : /root/grgsm_clair.raw / _ciph.raw
+    try: raw = open("/root/grgsm_%s.raw" % tag, "w")
+    except Exception: raw = None
     for line in proc.stdout:
+        if raw:
+            try: raw.write(line); raw.flush()
+            except Exception: pass
         with _hl_lock:
             handle_line(line)
+    if raw:
+        try: raw.close()
+        except Exception: pass
     print("[si-bridge] grgsm %s termine (n=%d nsch=%d nsd=%d nsa=%d)"
           % (tag, n, nsch, nsd, nsa), flush=True)
 
@@ -202,7 +236,8 @@ while True:
         ciph["proc"] = None
     ciph["applied"] = want
     if want[0]:
-        np = spawn_grgsm(CIPH_CF, algo=want[0], kc_hex=want[1])
+        np = spawn_grgsm(CIPH_CF, algo=want[0], kc_hex=want[1], binary=GRGSM_CIPH,
+                         errlog="/root/grgsm_ciph.err")
         ciph["proc"] = np
         threading.Thread(target=reader_loop, args=(np, "chiffre"),
                          daemon=True).start()

@@ -1301,7 +1301,13 @@ int32_t uhdwrap_read(void *dev, uint32_t num_chans)
                         n_a5 = 0;                       /* seq=0 -> cipher off */
                     if (n_a5 >= 1 && n_a5 <= 3) {
                         ubit_t ks[114];
-                        uint32_t fnc = (uint32_t)((long)osmo_fn + ci_fn_adj);
+                        /* FN du keystream = internal_fn (= horloge osmo-trx/osmo-bts,
+                         * PROUVE par la RACH-DET a osmo-trx fn==internal_fn), PAS osmo_fn
+                         * (=internal_fn+36, label legacy trompeur). osmo-bts dechiffre le
+                         * burst UL recu avec SON FN = internal_fn ; on doit chiffrer au
+                         * meme FN sinon keystream different (A5 FN-keye) -> CIPHER MODE
+                         * COMPLETE illisible -> pas de LU ACCEPT. CALYPSO_CIPH_FN_ADJ=0. */
+                        uint32_t fnc = (uint32_t)((long)internal_fn + ci_fn_adj);
                         osmo_a5(n_a5, kc, fnc, NULL, ks);       /* keystream UL */
                         for (int i = 0; i < 57; i++) {
                             if (ks[i])      ab[i + 3]  = (int8_t)-ab[i + 3];
