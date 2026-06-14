@@ -1,12 +1,8 @@
 #!/bin/bash
-# Lance si_bridge (2 grgsm : clair toujours-on + chiffre spawne sur Kc) en boucle.
-# --line-buffered : sinon le grep bufferise par blocs (4KB) -> logs en retard,
-# impossible de voir le respawn/Kc en temps reel. On laisse passer aussi les
-# erreurs/tracebacks Python (sinon invisibles).
+# Decode le cfile continu en boucle, AFFICHE les SI + les transmet a feed_si.
 source /root/.env/bin/activate 2>/dev/null
-echo "[si-bridge] 2 grgsm (clair iq_grgsm.fifo + chiffre iq_grgsm_ciph.fifo) -> feed_*"
+echo "[si-bridge] grgsm_decode -c /tmp/iq_grgsm.fifo -s 1083333 -> SI -> feed_si"
 while true; do
-  python3 /opt/GSM/si_bridge.py /tmp/iq_grgsm.fifo 2>&1 \
-    | grep --line-buffered -E "si-bridge|SI|Traceback|Error|error|Exception"
+  python3 /opt/GSM/si_bridge.py /tmp/iq_grgsm.fifo 2>&1 | grep -E "si-bridge|SI"
   sleep 2
 done
