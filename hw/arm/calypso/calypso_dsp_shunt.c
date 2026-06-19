@@ -111,6 +111,23 @@
 #define SB_DSP_TASK         6
 #define ALLC_DSP_TASK       24
 
+/* ---- TCH/F voix (a′). JALON 1 = DL seulement ; UL (a_du_1) = JALON 3, gated. ----
+ * Le shunt fait UNIQUEMENT le relais NDB ; le codage canal (gsm0503_tch_fr) est cote
+ * qemu_wrap/gr-gsm. task ids : l1_environment.h:50-76. dsp_task_iq_swap (dsp.h:46) peut
+ * OR 0x8000 -> comparer avec (& 0x7FFF). */
+#define DUL_DSP_TASK        12     /* SDCCH/SACCH UL (sideband calypso_sdcch_ul existant) */
+#define TCHT_DSP_TASK       13     /* TCH traffic : RX(d_task_d) ET TX(d_task_u) — le vrai trafic */
+#define TCHA_DSP_TASK       14     /* TCH SACCH */
+#define TCHD_DSP_TASK       28     /* TCH dummy (RX-only, PAS de data UL) — ne PAS relayer en UL */
+/* Offsets NDB (BASE_API_NDB), confirmes DWARF layer1.highram.elf (T_NDB sizeof=0x18d4). */
+#define NDB_A_DD_0          0x238  /* DL traffic FR sub0 : [0]@+0 hdr, [2]@+4 biterr, [3]@+6 (33o) */
+#define NDB_A_DU_1          0x134  /* PIEGE #1 : UL sub0 = a_du_1 (PAS a_du_0=0x2A0) cf prim_tch.c:485. JALON 3. */
+#define NDB_D_TCH_MODE      0x006
+/* a_dd_0[0] header bits (l1_environment.h:267-270) */
+#define B_FIRE0             5
+#define B_FIRE1             6
+#define B_BLUD              15     /* data block present (1<<15 = 0x8000) */
+
 #define D_TOA               0
 #define D_PM                1
 #define D_ANGLE             2
@@ -130,6 +147,10 @@ struct dsp_shunt_state {
     uint16_t   d_burst_d;
     uint16_t   d_fn;
     uint32_t   tick_cnt;              /* FRAME IRQ ticks since shunt enabled */
+    /* TCH/F DL (JALON 1) : derniere trame FR 33o lue du sideband /dev/shm/calypso_tch_dl */
+    uint8_t    tch_dl_fr[33];
+    bool       tch_dl_valid;
+    uint32_t   tch_dl_seq;
     /* SI réel injecté (gr-gsm ou démod C native) via calypso_dsp_shunt_feed_si.
      * Si si_valid, shunt_dispatch_allc écrit si_buf dans a_cd au lieu du canned. */
     uint8_t    si_buf[23];
@@ -909,12 +930,55 @@ static void shunt_dispatch_nb(uint8_t page_idx, uint16_t task_d)
         page_idx, task_d);
 }
 
+/* ---- TCH/F DL (JALON 1) : sideband /dev/shm/calypso_tch_dl -> a_dd_0 ----
+ * Producteur = qemu_wrap/gr-gsm (decode 8 bursts -> gsm0503_tch_fr_decode -> 33o FR) ou
+ * l'injecteur de test (tone 600). Layout 48o : seq@0(u32 LE) fn@4(u32 LE) fr[33]@8.
+ * Consume-once par seq (modele calypso_rach_read). */
+static void calypso_tch_dl_poll(void)
+{
+    static int fd = -2;
+    if (fd == -2)
+        fd = open("/dev/shm/calypso_tch_dl", O_CREAT | O_RDWR, 0644); /* cree -> open une fois */
+    if (fd < 0)
+        return;
+    uint8_t buf[48];
+    if (pread(fd, buf, sizeof(buf), 0) != (ssize_t)sizeof(buf))
+        return;
+    uint32_t seq;
+    memcpy(&seq, buf, 4);
+    if (seq == 0 || seq == g_shunt.tch_dl_seq)
+        return;                         /* pas de nouvelle trame */
+    g_shunt.tch_dl_seq = seq;
+    memcpy(g_shunt.tch_dl_fr, buf + 8, 33);
+    g_shunt.tch_dl_valid = true;
+}
+
+/* Ecrit la trame FR 33o dans a_dd_0 (sub0). Le firmware (prim_tch.c:322 sub0->a_dd_0) la
+ * lit en fin-de-bloc (FN%13 in {3,7,11}) ssi a_dd_0[0]&B_BLUD, puis L1CTL_TRAFFIC_IND->gapk.
+ * PIEGE #2 : packing BIG-ENDIAN intra-mot (dsp_memcpy_from_api BE=1, dsp.c:278) = l'INVERSE
+ * du a_cd existant (BE=0, lo|(hi<<8)). word = (fr[i]<<8)|fr[i+1] ; mot impair = fr[32]<<8. */
+static void shunt_dispatch_tch_dl(uint8_t page_idx)
+{
+    (void)page_idx;                     /* a_dd_0 non page (T_NDB partage) */
+    if (!g_shunt.tch_dl_valid)
+        return;
+    uint32_t aa = BASE_API_NDB + NDB_A_DD_0;
+    shunt_write_w(aa + 0, (1u << B_BLUD));   /* a_dd_0[0] : B_BLUD=1, FIRE=00 (no error) */
+    shunt_write_w(aa + 2, 0x0000);           /* a_dd_0[1] : inutilise */
+    shunt_write_w(aa + 4, 0x0000);           /* a_dd_0[2] : num_biterr = 0 */
+    const uint8_t *fr = g_shunt.tch_dl_fr;   /* a_dd_0[3..] = 33o @ aa+6, BE=1 */
+    for (int i = 0; i < 32; i += 2)
+        shunt_write_w(aa + 6 + i, ((uint16_t)fr[i] << 8) | fr[i + 1]);
+    shunt_write_w(aa + 6 + 32, (uint16_t)fr[32] << 8);  /* octet impair en poids fort */
+}
+
 /* ---- Service hook : called from calypso_trx frame_irq tick ---- */
 void calypso_dsp_shunt_on_frame_tick(void)
 {
     if (!g_shunt.active)
         return;
     shunt_poll_si_shm();   /* gr-gsm a-t-il ecrit un nouveau SI dans le shm ? */
+    calypso_tch_dl_poll(); /* nouvelle trame FR DL dans le sideband ? (toujours, hors gate pending) */
     if (!g_shunt.pending) {
         return;
     }
@@ -934,6 +998,8 @@ void calypso_dsp_shunt_on_frame_tick(void)
         shunt_dispatch_sb(page);
     } else if (td == ALLC_DSP_TASK) {
         shunt_dispatch_allc(page);
+    } else if ((td & 0x7FFF) == TCHT_DSP_TASK) {   /* TCH/F DL (JALON 1) : sub0 -> a_dd_0 */
+        shunt_dispatch_tch_dl(page);
     } else if (td != 0) {
         shunt_dispatch_nb(page, td);
     }
