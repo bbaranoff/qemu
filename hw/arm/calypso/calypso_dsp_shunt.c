@@ -55,6 +55,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <fcntl.h>
 
 /* ---- Memory map (ARM-side addresses, from osmocom-bb dsp_api.h:18-23) ---- */
@@ -1314,8 +1315,11 @@ struct dsp_shunt_shm {
 
 static struct dsp_shunt_shm *g_shm;
 static uint32_t              g_shm_last_si_seq;
-static FILE                 *g_iq_cfile;   /* enreg .cfile fc32 de l'I/Q d'entree */
 static FILE                 *g_iq_cfile2;  /* cfile #2 FN-espace (zero-fill) -> test grgsm SACCH */
+static int                   g_iq_fd      = -1;   /* fd brut I/Q : fichier ou FIFO live */
+static int                   g_iq_is_fifo = 0;    /* 1 = FIFO -> non bloquant + drop */
+static char                  g_iq_path[256];      /* chemin memorise pour retry FIFO */
+static FILE                 *g_iq_rec;            /* record disque .cfile contigu (rejeu), EN PLUS du live */
 
 static void shunt_shm_init(void)
 {
@@ -1350,11 +1354,40 @@ static void shunt_shm_init(void)
     if (!cf)
         cf = "/root/dsp_iq.cfile";
     if (*cf) {
-        g_iq_cfile = fopen(cf, "wb");
-        if (g_iq_cfile)
-            error_report("[dsp-shunt] enregistre l'I/Q d'entree -> %s (cfile fc32)", cf);
+        struct stat st;
+        g_iq_is_fifo = (stat(cf, &st) == 0 && S_ISFIFO(st.st_mode));
+        snprintf(g_iq_path, sizeof(g_iq_path), "%s", cf);
+        if (g_iq_is_fifo) {
+            g_iq_fd = open(cf, O_WRONLY | O_NONBLOCK);          /* FIFO : jamais bloquant, pas de create */
+            if (g_iq_fd >= 0)
+                error_report("[dsp-shunt] I/Q -> %s (FIFO live fc32, non bloquant)", cf);
+            else if (errno == ENXIO)
+                error_report("[dsp-shunt] FIFO %s sans lecteur — open differe au feed", cf);
+            else
+                error_report("[dsp-shunt] open(%s) FIFO: %s", cf, strerror(errno));
+        } else {
+            g_iq_fd = open(cf, O_WRONLY | O_CREAT | O_TRUNC, 0644);   /* cfile rejeu */
+            if (g_iq_fd >= 0)
+                error_report("[dsp-shunt] enregistre l'I/Q -> %s (cfile fc32)", cf);
+            else
+                error_report("[dsp-shunt] open(%s) cfile: %s", cf, strerror(errno));
+        }
+    }
+    /* Record disque .cfile contigu (capture brute fc32) EN PLUS de la sortie live :
+     * la FIFO sert au live (FFT) sans rien garder, ce record garde tout pour le
+     * rejeu deterministe (grgsm_cfile_decode.py). Fichier regulier -> fwrite jamais
+     * bloquant. Defaut /dev/shm/dsp_iq.cfile ; CALYPSO_SHUNT_IQ_RECORD= (vide) pour
+     * desactiver. On evite le double-open si le record vise le meme fichier que la
+     * sortie live (cas live=fichier, pas FIFO). */
+    const char *rec = getenv("CALYPSO_SHUNT_IQ_RECORD");
+    if (!rec)
+        rec = "/dev/shm/dsp_iq.cfile";
+    if (*rec && !(g_iq_fd >= 0 && !g_iq_is_fifo && strcmp(rec, g_iq_path) == 0)) {
+        g_iq_rec = fopen(rec, "wb");
+        if (g_iq_rec)
+            error_report("[dsp-shunt] record disque I/Q -> %s (cfile fc32 contigu)", rec);
         else
-            error_report("[dsp-shunt] fopen(%s) cfile: %s", cf, strerror(errno));
+            error_report("[dsp-shunt] fopen(%s) record: %s", rec, strerror(errno));
     }
     /* cfile #2 : reconstruction FN-espacee (zero-fill des trames manquantes) pour
      * que grgsm retrouve la 51-mf et decode la SACCH (SI5/SI6). Test offline, ne
@@ -1391,12 +1424,25 @@ void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
     __sync_synchronize();
     g_shm->iq_wr++;               /* publie le burst (le lecteur poll iq_wr) */
 
-    /* Enregistre aussi l'I/Q en .cfile fc32 (rejeu deterministe). */
-    if (g_iq_cfile) {
+    /* Sorties fc32 (I,Q normalise) : (a) live -> FIFO (FFT, drop) ou fichier, via
+     * g_iq_fd ; (b) record disque contigu -> g_iq_rec (rejeu deterministe). fbuf
+     * calcule une seule fois et diffuse aux deux. */
+    if (g_iq_is_fifo && g_iq_fd < 0)
+        g_iq_fd = open(g_iq_path, O_WRONLY | O_NONBLOCK);     /* retry : le lecteur est-il apparu ? */
+    if (g_iq_fd >= 0 || g_iq_rec) {
         float fbuf[SHM_IQ_LEN];
         for (int i = 0; i < n; i++)
             fbuf[i] = (float)iq[i] / 32768.0f;
-        fwrite(fbuf, sizeof(float), (size_t)n, g_iq_cfile);
+        if (g_iq_fd >= 0) {
+            ssize_t w = write(g_iq_fd, fbuf, (size_t)n * sizeof(float));
+            if (w < 0 && g_iq_is_fifo && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                /* pipe plein -> drop ce burst (FFT live, perte tolerable) */
+            } else if (w < 0 && g_iq_is_fifo && (errno == EPIPE || errno == ENXIO)) {
+                close(g_iq_fd); g_iq_fd = -1;   /* lecteur parti -> on reessaiera */
+            }
+        }
+        if (g_iq_rec)                                  /* record disque : jamais bloquant */
+            fwrite(fbuf, sizeof(float), (size_t)n, g_iq_rec);
     }
     /* cfile #2 FN-espace : chaque burst TS0 a sa position de trame
      * ((fn-base)*spf int16), trames manquantes zero-fillees -> grgsm retrouve la

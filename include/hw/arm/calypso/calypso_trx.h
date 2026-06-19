@@ -84,8 +84,11 @@
 #define ULPD_GAUGING_CTRL     0x24
 #define ULPD_GSM_TIMER        0x28
 
-/* GSM timing — real 4.615ms TDMA frame period */
-#define GSM_TDMA_NS           4615000
+/* GSM timing — vraie période trame TDMA = 60/13 ms = 4 615 384,6 ns.
+ * 4615384 matche EXACTEMENT osmo-trx (WALL_TDMA_NS, 1250 smpl / 270833,33 sps)
+ * -> zéro dérive FN QEMU↔radio. L'ancien 4615000 était 384 ns/trame TROP RAPIDE
+ * (~83 µs/s) = source des 'We were N FN faster than TRX'. */
+#define GSM_TDMA_NS           4615384
 #define GSM_HYPERFRAME        2715648
 
 /* DSP boot */

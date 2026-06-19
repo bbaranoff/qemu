@@ -184,7 +184,7 @@ fi
 
 # ── Attendre/creer les 2 cfiles en RAM (fft refuse de partir sinon) ──
 echo "[*] Préparation des cfiles I/Q (/dev/shm/{dsp_iq,record}.cfile) dans $CONTAINER…"
-for cf in /dev/shm/dsp_iq.cfile /dev/shm/record.cfile; do
+for cf in /dev/shm/dsp_iq.fifo /dev/shm/record.cfile; do
   docker exec "$CONTAINER" test -f "$cf" 2>/dev/null || docker exec "$CONTAINER" touch "$cf"
 done
 
@@ -198,7 +198,7 @@ if [[ -n "${DISPLAY:-}" || -n "${WAYLAND_DISPLAY:-}" ]]; then
   setsid sudo -u "$CFG_USER" \
     env DISPLAY="${DISPLAY:-}" WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-}" \
         XAUTHORITY="${XAUTHORITY:-/home/$CFG_USER/.Xauthority}" XDG_RUNTIME_DIR="/run/user/$CFG_UID" \
-        CONTAINER="$CONTAINER" CFILE=/dev/shm/dsp_iq.cfile ARFCN=MS-dsp_iq \
+        CONTAINER="$CONTAINER" CFILE=/dev/shm/dsp_iq.fifo ARFCN=MS-dsp_iq \
     bash /tmp/fft.sh  >/dev/null 2>&1 </dev/null &
   setsid sudo -u "$CFG_USER" \
     env DISPLAY="${DISPLAY:-}" WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-}" \
@@ -226,7 +226,7 @@ docker exec -dt "$CONTAINER" bash -lc '
   CALYPSO_UL_FN_GATE=0 CALYPSO_UL_RA=3 CALYPSO_UL_DEBUG=1 \
   CALYPSO_REQREF_REWRITE=1 CALYPSO_REQREF_ADJ=1 CALYPSO_NB_MAXDLY=40 \
   CALYPSO_START_FN=0 CALYPSO_UL_SDCCH_OFS=19 CALYPSO_UL_SABM_TTL=200 \
-  CALYPSO_SHUNT_IQ_CFILE=/dev/shm/dsp_iq.cfile \
+  CALYPSO_SHUNT_IQ_CFILE=/dev/shm/dsp_iq.fifo \
   ./run.sh > /tmp/run.log 2>&1'
 
 # Atterrir direct sur la fenetre multi-pane "all" a l'attach : on attend que la

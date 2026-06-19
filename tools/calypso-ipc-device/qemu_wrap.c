@@ -546,6 +546,12 @@ static int16_t g_rach_iq[CALYPSO_BSP_BURSTLEN * CALYPSO_TRX_OSR * 2]; /* wavefor
 static volatile int g_rach_pending = 0;       /* nb de slots RACH-eligibles restants a tenter */
 static volatile uint32_t g_rach_arm_seq = 0;  /* incremente a chaque nouvel arm (debug) */
 
+/* Record .cfile de l'I/Q UL synthetise (fc32), symetrique du DL dsp_iq. Ecrit
+ * UNIQUEMENT depuis le thread uhdwrap_read (ul_drain + uhdwrap_read) -> pas de
+ * race, lazy-open suffisant. */
+static FILE *g_ul_rec      = NULL;
+static int   g_ul_rec_init = 0;
+
 /* MSK phase-continue a OSR samples/symbole : 148 soft-bits (±127) -> 148*OSR
  * cs16 I/Q. Increment de phase ±(π/2)/OSR par SAMPLE (convention osmo-trx :
  * bit 1 → +π/2 par symbole). Amplitude ~0.6 full-scale (override CALYPSO_UL_AMP). */
@@ -691,6 +697,33 @@ static void ul_mod_laurent(const int8_t *bits, int nbits, int16_t *iq)
         if (Q>32767.0) Q=32767.0; else if (Q<-32768.0) Q=-32768.0;
         iq[2*n] = (int16_t)I; iq[2*n+1] = (int16_t)Q;
     }
+}
+
+/* Enregistre l'I/Q UL synthetise (cs16 -> fc32 normalise -1..1) dans un .cfile,
+ * exactement comme le DL dsp_iq (gr_complex, 4 SPS = 1083333 Hz). Bursts
+ * concatenes (pas de framing TDMA) : decodable comme le dsp_iq DL. Lazy-open ;
+ * CALYPSO_UL_IQ_RECORD=<chemin> (defaut /dev/shm/dsp_ul_iq.cfile), vide=off.
+ * nsamp = nb de samples COMPLEXES (592 = CALYPSO_BSP_BURSTLEN*OSR par burst). */
+static void ul_iq_record(const int16_t *iq, int nsamp)
+{
+    if (!g_ul_rec_init) {
+        g_ul_rec_init = 1;
+        const char *p = getenv("CALYPSO_UL_IQ_RECORD");
+        if (!p) p = "/dev/shm/dsp_ul_iq.cfile";
+        if (*p) {
+            g_ul_rec = fopen(p, "wb");
+            if (g_ul_rec)
+                LOGP(DDEV, LOGL_NOTICE, "[ul-rec] record I/Q UL -> %s (cfile fc32 @ 4 SPS)\n", p);
+            else
+                LOGP(DDEV, LOGL_ERROR, "[ul-rec] fopen(%s): %s\n", p, strerror(errno));
+        }
+    }
+    if (!g_ul_rec || nsamp <= 0) return;
+    static float fbuf[CALYPSO_BSP_BURSTLEN * CALYPSO_TRX_OSR * 2];
+    int nf = nsamp * 2;
+    if (nf > (int)(sizeof(fbuf)/sizeof(fbuf[0]))) nf = (int)(sizeof(fbuf)/sizeof(fbuf[0]));
+    for (int i = 0; i < nf; i++) fbuf[i] = (float)iq[i] / 32768.0f;
+    fwrite(fbuf, sizeof(float), (size_t)nf, g_ul_rec);
 }
 
 /* RACH access-burst complet en soft-bits +/-1 pour ul_gmsk_mod :
@@ -866,6 +899,7 @@ static void ul_drain(void)
                 int8_t ab_rach[CALYPSO_BSP_BURSTLEN];
                 ul_build_rach_ra(ab_rach, (int)real_ra, (int)real_bsic);
                 ul_mod_laurent(ab_rach, 88, g_ul_iq);   /* 88 bits actifs = access-burst */
+                ul_iq_record(g_ul_iq, CALYPSO_BSP_BURSTLEN * CALYPSO_TRX_OSR);  /* record I/Q UL (RACH paging-resp) */
                 /* FIX MT-SMS : latch la waveform RACH dans son buffer dedie et arme
                  * STICKY sur N slots RACH-eligibles. Le chemin SDCCH-idle ecrase g_ul_iq
                  * a chaque frame ; g_rach_iq lui reste intact -> la paging-response (un
@@ -896,6 +930,7 @@ static void ul_drain(void)
              * Channel Request. Fin des RACH RA=3 fantomes qui inondaient le BSC en CHAN
              * RQD et saturaient le pool SDCCH. */
             ul_gmsk_mod(bits, g_ul_iq);
+            ul_iq_record(g_ul_iq, CALYPSO_BSP_BURSTLEN * CALYPSO_TRX_OSR);  /* record I/Q UL (RACH brute BSP) */
         }
         got = 1;
         /* INSTR 2026-06-04 : dump one-shot des 1ers bursts UL recus du BSP pour
@@ -1321,6 +1356,7 @@ int32_t uhdwrap_read(void *dev, uint32_t num_chans)
                     }
                 }
                 ul_mod_laurent(ab, CALYPSO_BSP_BURSTLEN, g_ul_iq);  /* modulateur EXACT osmo-trx */
+                ul_iq_record(g_ul_iq, CALYPSO_BSP_BURSTLEN * CALYPSO_TRX_OSR);  /* record I/Q UL (SDCCH/SACCH) */
                 memset(ul_chunk, 0, sizeof(ul_chunk));
                 /* offset ÉCHANTILLON dédié au burst NORMAL (≠ access-burst RACH) : le
                  * détecteur normal-burst d'osmo-trx corrèle le TSC à une position
