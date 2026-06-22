@@ -1802,8 +1802,19 @@ if [ -x "$_NM" ] && [ -r "$FW_ELF" ]; then
     [ -n "$_L1S" ] && export CALYPSO_L1S_FN_ADDR="$_L1S"
     [ -n "$_LR" ]  && export CALYPSO_LAST_RACH_FN_ADDR="$_LR"
     echo "[run.sh] dsp-shunt addrs (nm $FW_ELF) : l1s=${CALYPSO_L1S_FN_ADDR:-?} last_rach=${CALYPSO_LAST_RACH_FN_ADDR:-?}"
+    # --- c54x (full / vrai DSP) : MEME derivation nm pour la fenetre cpu-idle ---
+    # Le gouverneur cpu-idle (calypso_trx.c CALYPSO_IDLE_PC_LO/HI) park l'ARM quand
+    # le PC est dans [l1a_l23_handler, l1a_compl_execute]. Ces symboles BOUGENT a
+    # chaque rebuild firmware ; les defauts hardcodes (0x823000/0x826000) etaient
+    # approximatifs (vrais = 0x823f9c/0x825180) -> fenetre perimee -> ARM parke au
+    # mauvais PC -> skew DSP/ARM -> instabilite FB/TOA. On les nm-derive aussi.
+    _IDLO=$("$_NM" "$FW_ELF" 2>/dev/null | awk '$3=="l1a_l23_handler"{print "0x"$1}'  | head -1)
+    _IDHI=$("$_NM" "$FW_ELF" 2>/dev/null | awk '$3=="l1a_compl_execute"{print "0x"$1}' | head -1)
+    [ -n "$_IDLO" ] && export CALYPSO_IDLE_PC_LO="$_IDLO"
+    [ -n "$_IDHI" ] && export CALYPSO_IDLE_PC_HI="$_IDHI"
+    echo "[run.sh] c54x cpu-idle window (nm $FW_ELF) : lo=${CALYPSO_IDLE_PC_LO:-?} (l1a_l23_handler) hi=${CALYPSO_IDLE_PC_HI:-?} (l1a_compl_execute)"
 else
-    echo "[run.sh] WARN: nm/ELF absent, dsp-shunt garde ses adresses par defaut (peut casser l'AGCH si firmware rebuild)"
+    echo "[run.sh] WARN: nm/ELF absent, dsp-shunt ET c54x cpu-idle gardent leurs adresses par defaut (peut casser AGCH + skew ARM/DSP si firmware rebuild)"
 fi
 
 L1CTL_SOCK="$QEMU_DUMMY_SOCK" \
