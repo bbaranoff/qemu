@@ -1467,16 +1467,11 @@ struct dsp_shunt_shm {
 
 static struct dsp_shunt_shm *g_shm;
 static uint32_t              g_shm_last_si_seq;
-<<<<<<< HEAD
 static FILE                 *g_iq_cfile2;  /* cfile #2 FN-espace (zero-fill) -> test grgsm SACCH */
 static int                   g_iq_fd      = -1;   /* fd brut I/Q : fichier ou FIFO live */
 static int                   g_iq_is_fifo = 0;    /* 1 = FIFO -> non bloquant + drop */
 static char                  g_iq_path[256];      /* chemin memorise pour retry FIFO */
 static FILE                 *g_iq_rec;            /* record disque .cfile contigu (rejeu), EN PLUS du live */
-=======
-static FILE                 *g_iq_cfile;   /* enreg .cfile fc32 de l'I/Q d'entree */
-static FILE                 *g_iq_cfile2;  /* cfile #2 FN-espace (zero-fill) -> test grgsm SACCH */
->>>>>>> 478b538a2567eca68c10fbd85ee0b4f31bf58341
 
 static void shunt_shm_init(void)
 {
@@ -1545,15 +1540,6 @@ static void shunt_shm_init(void)
             error_report("[dsp-shunt] record disque I/Q -> %s (cfile fc32 contigu)", rec);
         else
             error_report("[dsp-shunt] fopen(%s) record: %s", rec, strerror(errno));
-    }
-    /* cfile #2 : reconstruction FN-espacee (zero-fill des trames manquantes) pour
-     * que grgsm retrouve la 51-mf et decode la SACCH (SI5/SI6). Test offline, ne
-     * touche PAS au cfile live. Active via CALYPSO_SHUNT_IQ_CFILE2=<chemin>. */
-    const char *cf2 = getenv("CALYPSO_SHUNT_IQ_CFILE2");
-    if (cf2 && *cf2) {
-        g_iq_cfile2 = fopen(cf2, "wb");
-        if (g_iq_cfile2)
-            error_report("[dsp-shunt] cfile #2 FN-espace -> %s (gap zero-fill)", cf2);
     }
     /* cfile #2 : reconstruction FN-espacee (zero-fill des trames manquantes) pour
      * que grgsm retrouve la 51-mf et decode la SACCH (SI5/SI6). Test offline, ne
