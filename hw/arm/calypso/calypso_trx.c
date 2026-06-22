@@ -208,7 +208,7 @@ static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
     if (size == 2 && offset == 0x01F0) {
         static uint16_t fbdet_last = 0xFFFF;
         static unsigned fbdet_log;
-        if ((uint16_t)val != fbdet_last && fbdet_log < 100) {
+        if ((uint16_t)val != fbdet_last && (fbdet_log < 100 || (fbdet_log % 20) == 0)) {
             fprintf(stderr,
                     "[FBDET-RD] ARM read d_fb_det(0x01F0)=0x%04x fn=%u\n",
                     (unsigned)val, (unsigned)s->fn);
@@ -249,10 +249,18 @@ static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
         case 0x009E: tag = "SB a_sch[4] BSIC p1"; break;
         default: break;
         }
-        if (tag && fbsbres_log < 150) {
-            fprintf(stderr, "[FBSBRES-RD] %s(0x%04x)=0x%04x fn=%u\n",
-                    tag, (unsigned)offset, (unsigned)val, (unsigned)s->fn);
-            fbsbres_log++;
+        if (tag) {
+            /* SB (db_r 0x60..0x9E) = rare -> cap haut ; FB (a_sync_demod) =
+             * frequent -> 150 premiers + echantillon 1/2000 pour voir le
+             * steady-state (le TOA converge-t-il apres le fix DL FN-LOCK ?). */
+            static unsigned sb_log = 0;
+            bool is_sb = (offset >= 0x0060 && offset <= 0x009E);
+            bool emit = is_sb ? (sb_log < 3000)
+                              : (fbsbres_log < 150 || (fbsbres_log % 2000) == 0);
+            if (is_sb) sb_log++; else fbsbres_log++;
+            if (emit)
+                fprintf(stderr, "[FBSBRES-RD] %s(0x%04x)=0x%04x fn=%u\n",
+                        tag, (unsigned)offset, (unsigned)val, (unsigned)s->fn);
         }
     }
     /* CALYPSO_FORCE_TOA=<N> (env gated, rigolo) : force une détection FB
