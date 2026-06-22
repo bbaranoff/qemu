@@ -3768,6 +3768,44 @@ static uint16_t resolve_smem(C54xState *s, uint16_t opcode, bool *indirect)
     }
 }
 
+/* Resolve an Lmem (long-word, 32-bit) operand for the dual long-word family
+ * (DADD/DSUB/DLD/DRSUB/DADST/DSUBT/DSADT, 0x50-0x5F). Returns the even-aligned
+ * base address (data[addr]=high, data[addr+1]=low) and applies the LONG-operand
+ * post-modify: the implicit unit step is 2 words, NOT 1 (SPRU172C, e.g. the
+ * DADST example: "long-operand instruction, AR incremented/decremented by 2").
+ * AR0-indexed and long-offset (lk) steps use their value as-is. Mirrors
+ * resolve_smem's MOD field decode (bits 6:3). */
+static uint16_t resolve_lmem(C54xState *s, uint16_t opcode)
+{
+    if (!(opcode & 0x80)) {
+        /* Direct (DP-relative) — dmad pair, no post-mod. */
+        uint16_t dp = s->st0 & ST0_DP_MASK;
+        return (uint16_t)(((dp << 7) | (opcode & 0x7F)) & 0xFFFE);
+    }
+    int mod = (opcode >> 3) & 0x0F;
+    int nar = opcode & 0x07;
+    uint16_t addr = s->ar[nar] & 0xFFFE;
+    switch (mod) {
+    case 0x0: break;                                              /* *ARn      */
+    case 0x1: s->ar[nar] -= 2; break;                             /* *ARn-     */
+    case 0x2: s->ar[nar] += 2; break;                             /* *ARn+     */
+    case 0x3: s->ar[nar] += 2; addr = s->ar[nar] & 0xFFFE; break; /* *+ARn     */
+    case 0x4: case 0x5: s->ar[nar] -= s->ar[0]; break;            /* *ARn-0(B) */
+    case 0x6: case 0x7: s->ar[nar] += s->ar[0]; break;            /* *ARn+0(B) */
+    case 0x8: s->ar[nar] = c54x_circ_ref(s->ar[nar], -2, s->bk); break;                 /* *ARn-%  */
+    case 0x9: s->ar[nar] = c54x_circ_ref(s->ar[nar], -(int16_t)s->ar[0], s->bk); break; /* *ARn-0% */
+    case 0xA: s->ar[nar] = c54x_circ_ref(s->ar[nar], +2, s->bk); break;                 /* *ARn+%  */
+    case 0xB: s->ar[nar] = c54x_circ_ref(s->ar[nar], +(int16_t)s->ar[0], s->bk); break; /* *ARn+0% */
+    case 0xC: addr = (uint16_t)((s->ar[nar] + prog_fetch(s, s->pc + 1)) & 0xFFFE); s->lk_used = true; break;
+    case 0xD: s->ar[nar] += prog_fetch(s, s->pc + 1); addr = s->ar[nar] & 0xFFFE; s->lk_used = true; break;
+    case 0xE: { uint16_t lk = prog_fetch(s, s->pc + 1);
+                s->ar[nar] = c54x_circ_ref(s->ar[nar], (int16_t)lk, s->bk);
+                addr = s->ar[nar] & 0xFFFE; s->lk_used = true; break; }
+    case 0xF: addr = (uint16_t)(prog_fetch(s, s->pc + 1) & 0xFFFE); s->lk_used = true; break;
+    }
+    return addr;
+}
+
 /* SP ledger for IRQ-asymmetry diag (web 2026-05-23).
  * Pushes/pops counted by SP delta sign in dispatch loop (c54x_run).
  * IRQ entries counted explicitly in c54x_interrupt_ex with word count.
@@ -7821,6 +7859,44 @@ static int c54x_exec_one(C54xState *s)
          * MVPD is at 0x8Cxx (hi8=0x8C). The old 0x56 MVPD decode was wrong
          * and caused writes to MMR_SP via resolve_smem, corrupting the stack. */
         {
+            /* === Dual long-word DADST/DSADT, Lmem,dst (1 word) — fix revival
+             * dsp (2026-06-22). Encodage SPRU172C : 0101 101D = DADST (0x5A/5B),
+             * 0101 111D = DSADT (0x5E/5F) ; D(bit8)=dst (0=A,1=B) ; bits[7:0]=Smem
+             * (Lmem). Sans ce handler ces opcodes tombaient dans le bloc SFTA/SFTL
+             * ci-dessous → corrélateur FCCH aplati en "dst>>=ASM", d_fb_det=0
+             * (sonde SHADOW-DADST : shiftLike=1, walked=0). Sémantique (vérifiée
+             * sur les exemples chiffrés SPRU172C) :
+             *   C16=1 (dual-16, non saturé) :
+             *     DADST: dst(39-16)=Lmem.hi+T ; dst(15-0)=Lmem.lo-T
+             *     DSADT: dst(39-16)=Lmem.hi-T ; dst(15-0)=Lmem.lo+T
+             *   C16=0 (double-precision, SXM) :
+             *     DADST: dst=Lmem+((T<<16)|T) ; DSADT: dst=Lmem-((T<<16)|T)
+             * Lmem post-mod = ±2 (long-operand, via resolve_lmem). Le mode C16
+             * réel est lu à l'exécution (ST1.C16, suivi par SSBX/RSBX C16). */
+            uint8_t dl_hi = (op >> 8) & 0xFF;
+            if (dl_hi == 0x5A || dl_hi == 0x5B || dl_hi == 0x5E || dl_hi == 0x5F) {
+                int      is_dadst = (dl_hi == 0x5A || dl_hi == 0x5B);
+                int64_t *dl_dst   = (dl_hi & 1) ? &s->b : &s->a;   /* bit8 = D */
+                uint16_t laddr    = resolve_lmem(s, op);
+                uint16_t lhi      = data_read(s, laddr);
+                uint16_t llo      = data_read(s, (uint16_t)(laddr + 1));
+                int16_t  t16      = (int16_t)s->t;
+                int64_t  r;
+                if (s->st1 & ST1_C16) {
+                    int sgn = is_dadst ? +1 : -1;
+                    int32_t rh = (int32_t)(int16_t)lhi + sgn * (int32_t)t16;
+                    int32_t rl = (int32_t)(int16_t)llo - sgn * (int32_t)t16;
+                    r = ((int64_t)rh << 16) | ((uint32_t)rl & 0xFFFF);
+                } else {
+                    uint32_t lmem32 = ((uint32_t)lhi << 16) | llo;
+                    uint32_t tt32   = ((uint32_t)(uint16_t)t16 << 16) | (uint16_t)t16;
+                    int64_t lv = (s->st1 & ST1_SXM) ? (int64_t)(int32_t)lmem32 : (int64_t)(uint32_t)lmem32;
+                    int64_t tv = (s->st1 & ST1_SXM) ? (int64_t)(int32_t)tt32   : (int64_t)(uint32_t)tt32;
+                    r = is_dadst ? (lv + tv) : (lv - tv);
+                }
+                *dl_dst = sext40(r);
+                return consumed + s->lk_used;
+            }
             int dst = (op >> 8) & 1;
             int64_t *acc = dst ? &s->b : &s->a;
             int sub = (op >> 9) & 0x7;
@@ -7860,12 +7936,19 @@ static int c54x_exec_one(C54xState *s)
          * 0x91: MACR Xmem,Ymem,A  0x93: MACR Xmem,Ymem,B
          * Same encoding as 0xA4 family: OOOO OOOD XXXX YYYY */
         if (hi8 == 0x90 || hi8 == 0x91 || hi8 == 0x92 || hi8 == 0x93) {
-            int xar_m = (op >> 4) & 0x07;
-            int yar_m = op & 0x07;
+            /* FIX 2026-06-22 (sweep) : décodage Xmem/Ymem 2-bit SPRU131G T.5-6/5-8
+             * (Xmod[7:6] Xar[5:4] Ymod[3:2] Yar[1:0], AR=field+2, mod 1=*AR- 2=*AR+
+             * 3=*AR+0%) au lieu du raw 3-bit/1-bit. */
+            int xar_m  = ((op >> 4) & 0x03) + 2;
+            int yar_m  = (op & 0x03) + 2;
+            int xmod_m = (op >> 6) & 0x03;
+            int ymod_m = (op >> 2) & 0x03;
             uint16_t xval_m = data_read(s, s->ar[xar_m]);
             uint16_t yval_m = data_read(s, s->ar[yar_m]);
-            if ((op >> 7) & 1) s->ar[xar_m]--; else s->ar[xar_m]++;
-            if ((op & 0x08) == 0) s->ar[yar_m]++; else s->ar[yar_m]--;
+            switch (xmod_m) { case 1: s->ar[xar_m]--; break; case 2: s->ar[xar_m]++; break;
+                case 3: s->ar[xar_m] = c54x_circ_ref(s->ar[xar_m], +(int16_t)s->ar[0], s->bk); break; }
+            switch (ymod_m) { case 1: s->ar[yar_m]--; break; case 2: s->ar[yar_m]++; break;
+                case 3: s->ar[yar_m] = c54x_circ_ref(s->ar[yar_m], +(int16_t)s->ar[0], s->bk); break; }
             int64_t prod_m = (int64_t)(int16_t)s->t * (int64_t)(int16_t)xval_m;
             if (s->st1 & ST1_FRCT) prod_m <<= 1;
             if (hi8 & 0x01) prod_m += 0x8000; /* round */
@@ -8360,13 +8443,32 @@ static int c54x_exec_one(C54xState *s)
         if (hi8 == 0xA4 || hi8 == 0xA5 || hi8 == 0xA6 || hi8 == 0xA7 ||
             hi8 == 0xB4 || hi8 == 0xB5 || hi8 == 0xB6 || hi8 == 0xB7 ||
             hi8 == 0xB0 || hi8 == 0xB1 || hi8 == 0xB2 || hi8 == 0xB3) {
-            int xar_d = (op >> 4) & 0x07;
-            int yar_d = op & 0x07;
+            /* FIX revival dsp 2026-06-22 : décodage Xmem/Ymem 2-bit (SPRU131G
+             * Table 5-6/5-8, identique à resolve_xmem et au handler D0-D9) au
+             * lieu du raw 3-bit. L'ancien (op>>4)&7 / op&7 + post-mod 1-bit lisait
+             * les MAUVAIS AR : ex op=0xb4f5 @PC=0xf170 (corrélateur TOA steady-
+             * state) donnait Xmem=AR7/Ymem=AR5 (hors-buffer) au lieu de Xmem=AR5
+             * (*AR5+0% circ) / Ymem=AR3 (*AR3-) → Ymem lu hors-buffer=0 → T=0 →
+             * MAC=0 → A garbage → a_sync_demod[D_TOA]=garbage (0xc3f0). Format :
+             * Xmod[7:6] Xar[5:4] Ymod[3:2] Yar[1:0] ; AR = field+2 (AR2..AR5) ;
+             * mod 0=*AR 1=*AR- 2=*AR+ 3=*AR+0% circ (BK, +AR0). */
+            int xar_d  = ((op >> 4) & 0x03) + 2;
+            int yar_d  = (op & 0x03) + 2;
+            int xmod_d = (op >> 6) & 0x03;
+            int ymod_d = (op >> 2) & 0x03;
             uint16_t xval_d = data_read(s, s->ar[xar_d]);
             uint16_t yval_d = data_read(s, s->ar[yar_d]);
-            /* Post-modify */
-            if ((op >> 7) & 1) s->ar[xar_d]--; else s->ar[xar_d]++;
-            if ((op & 0x08) == 0) s->ar[yar_d]++; else s->ar[yar_d]--;
+            /* Post-modify (SPRU131G Table 5-8) */
+            switch (xmod_d) {
+            case 1: s->ar[xar_d]--; break;
+            case 2: s->ar[xar_d]++; break;
+            case 3: s->ar[xar_d] = c54x_circ_ref(s->ar[xar_d], +(int16_t)s->ar[0], s->bk); break;
+            }
+            switch (ymod_d) {
+            case 1: s->ar[yar_d]--; break;
+            case 2: s->ar[yar_d]++; break;
+            case 3: s->ar[yar_d] = c54x_circ_ref(s->ar[yar_d], +(int16_t)s->ar[0], s->bk); break;
+            }
             /* Multiply T * Xmem */
             int64_t prod = (int64_t)(int16_t)s->t * (int64_t)(int16_t)xval_d;
             if (s->st1 & ST1_FRCT) prod <<= 1;
@@ -8401,12 +8503,17 @@ static int c54x_exec_one(C54xState *s)
          * Encoding: 1010 0001 XXXX YYYY
          * Per SPRU172C: B += (AH - Xmem)^2; A = Ymem << 16; T = Xmem */
         if (hi8 == 0xA1) {
-            int xar_sq = (op >> 4) & 0x07;
-            int yar_sq = op & 0x07;
+            /* FIX 2026-06-22 (sweep) : décodage Xmem/Ymem 2-bit SPRU131G T.5-6/5-8. */
+            int xar_sq  = ((op >> 4) & 0x03) + 2;
+            int yar_sq  = (op & 0x03) + 2;
+            int xmod_sq = (op >> 6) & 0x03;
+            int ymod_sq = (op >> 2) & 0x03;
             uint16_t xval_sq = data_read(s, s->ar[xar_sq]);
             uint16_t yval_sq = data_read(s, s->ar[yar_sq]);
-            if ((op >> 7) & 1) s->ar[xar_sq]--; else s->ar[xar_sq]++;
-            if ((op & 0x08) == 0) s->ar[yar_sq]++; else s->ar[yar_sq]--;
+            switch (xmod_sq) { case 1: s->ar[xar_sq]--; break; case 2: s->ar[xar_sq]++; break;
+                case 3: s->ar[xar_sq] = c54x_circ_ref(s->ar[xar_sq], +(int16_t)s->ar[0], s->bk); break; }
+            switch (ymod_sq) { case 1: s->ar[yar_sq]--; break; case 2: s->ar[yar_sq]++; break;
+                case 3: s->ar[yar_sq] = c54x_circ_ref(s->ar[yar_sq], +(int16_t)s->ar[0], s->bk); break; }
             int16_t ah_sq = (int16_t)((s->a >> 16) & 0xFFFF);
             int32_t diff = (int32_t)ah_sq - (int32_t)(int16_t)xval_sq;
             int64_t sq = (int64_t)diff * (int64_t)diff;
@@ -8422,12 +8529,17 @@ static int c54x_exec_one(C54xState *s)
          *           1011 111D XXXX YYYY (0xBE/0xBF variants — ABDST or POLY)
          * Per SPRU172C: B += AH * T (with round); A = Xmem << 16; T = Ymem */
         if (hi8 == 0xBC || hi8 == 0xBD || hi8 == 0xBE || hi8 == 0xBF) {
-            int xar_p = (op >> 4) & 0x07;
-            int yar_p = op & 0x07;
+            /* FIX 2026-06-22 (sweep) : décodage Xmem/Ymem 2-bit SPRU131G T.5-6/5-8. */
+            int xar_p  = ((op >> 4) & 0x03) + 2;
+            int yar_p  = (op & 0x03) + 2;
+            int xmod_p = (op >> 6) & 0x03;
+            int ymod_p = (op >> 2) & 0x03;
             uint16_t xval_p = data_read(s, s->ar[xar_p]);
             uint16_t yval_p = data_read(s, s->ar[yar_p]);
-            if ((op >> 7) & 1) s->ar[xar_p]--; else s->ar[xar_p]++;
-            if ((op & 0x08) == 0) s->ar[yar_p]++; else s->ar[yar_p]--;
+            switch (xmod_p) { case 1: s->ar[xar_p]--; break; case 2: s->ar[xar_p]++; break;
+                case 3: s->ar[xar_p] = c54x_circ_ref(s->ar[xar_p], +(int16_t)s->ar[0], s->bk); break; }
+            switch (ymod_p) { case 1: s->ar[yar_p]--; break; case 2: s->ar[yar_p]++; break;
+                case 3: s->ar[yar_p] = c54x_circ_ref(s->ar[yar_p], +(int16_t)s->ar[0], s->bk); break; }
             int16_t ah_p = (int16_t)((s->a >> 16) & 0xFFFF);
             int64_t prod_p = (int64_t)ah_p * (int64_t)(int16_t)s->t;
             if (s->st1 & ST1_FRCT) prod_p <<= 1;
@@ -8442,12 +8554,17 @@ static int c54x_exec_one(C54xState *s)
         if (hi8 == 0xB8 || hi8 == 0xB9 || hi8 == 0xBA || hi8 == 0xBB) {
             /* Check if it's actually LDMM (BA) or POPM (BD) — those are handled below */
             if (hi8 == 0xBA) goto ba_handler;
-            int xar_b8 = (op >> 4) & 0x07;
-            int yar_b8 = op & 0x07;
+            /* FIX 2026-06-22 (sweep) : décodage Xmem/Ymem 2-bit SPRU131G T.5-6/5-8. */
+            int xar_b8  = ((op >> 4) & 0x03) + 2;
+            int yar_b8  = (op & 0x03) + 2;
+            int xmod_b8 = (op >> 6) & 0x03;
+            int ymod_b8 = (op >> 2) & 0x03;
             uint16_t xval_b8 = data_read(s, s->ar[xar_b8]);
             uint16_t yval_b8 = data_read(s, s->ar[yar_b8]);
-            if ((op >> 7) & 1) s->ar[xar_b8]--; else s->ar[xar_b8]++;
-            if ((op & 0x08) == 0) s->ar[yar_b8]++; else s->ar[yar_b8]--;
+            switch (xmod_b8) { case 1: s->ar[xar_b8]--; break; case 2: s->ar[xar_b8]++; break;
+                case 3: s->ar[xar_b8] = c54x_circ_ref(s->ar[xar_b8], +(int16_t)s->ar[0], s->bk); break; }
+            switch (ymod_b8) { case 1: s->ar[yar_b8]--; break; case 2: s->ar[yar_b8]++; break;
+                case 3: s->ar[yar_b8] = c54x_circ_ref(s->ar[yar_b8], +(int16_t)s->ar[0], s->bk); break; }
             int64_t prod_b8 = (int64_t)(int16_t)s->t * (int64_t)(int16_t)xval_b8;
             if (s->st1 & ST1_FRCT) prod_b8 <<= 1;
             if (hi8 & 0x01) prod_b8 += 0x8000;
@@ -8648,14 +8765,14 @@ ba_handler:
             uint16_t yval_c = data_read(s, s->ar[yar_c]);
             switch (xmod_c) {
             case 0: break;
-            case 1: s->ar[xar_c]++; break;
-            case 2: s->ar[xar_c]--; break;
+            case 1: s->ar[xar_c]--; break;   /* *AR- (SPRU131G T.5-8 : 01=dec) — fix 2026-06-22 */
+            case 2: s->ar[xar_c]++; break;   /* *AR+ (10=inc) */
             case 3: s->ar[xar_c] = c54x_circ_ref(s->ar[xar_c], +(int16_t)s->ar[0], s->bk); break; /* *AR+0% circ — fix 2026-06-01 */
             }
             switch (ymod_c) {
             case 0: break;
-            case 1: s->ar[yar_c]++; break;
-            case 2: s->ar[yar_c]--; break;
+            case 1: s->ar[yar_c]--; break;   /* fix 2026-06-22 (SPRU131G T.5-8) */
+            case 2: s->ar[yar_c]++; break;
             case 3: s->ar[yar_c] = c54x_circ_ref(s->ar[yar_c], +(int16_t)s->ar[0], s->bk); break; /* *AR+0% circ (Ymem 0xd3dc @0xfa98) — fix 2026-06-01 */
             }
             /* MAC dual-mem formula : T × Xmem (pas X × Y per SPRU pure).
@@ -8702,14 +8819,14 @@ ba_handler:
             (void)data_read(s, s->ar[yar_db]); /* Ymem read (unused) */
             switch (xmod_db) {
             case 0: break;
-            case 1: s->ar[xar_db]++; break;
-            case 2: s->ar[xar_db]--; break;
+            case 1: s->ar[xar_db]--; break;   /* fix 2026-06-22 (SPRU131G T.5-8) */
+            case 2: s->ar[xar_db]++; break;
             case 3: s->ar[xar_db] = c54x_circ_ref(s->ar[xar_db], +(int16_t)s->ar[0], s->bk); break; /* *AR+0% circ — fix 2026-06-01 */
             }
             switch (ymod_db) {
             case 0: break;
-            case 1: s->ar[yar_db]++; break;
-            case 2: s->ar[yar_db]--; break;
+            case 1: s->ar[yar_db]--; break;   /* fix 2026-06-22 (SPRU131G T.5-8) */
+            case 2: s->ar[yar_db]++; break;
             case 3: s->ar[yar_db] = c54x_circ_ref(s->ar[yar_db], +(int16_t)s->ar[0], s->bk); break; /* *AR+0% circ — fix 2026-06-01 */
             }
             int64_t prod_db = (int64_t)(int16_t)s->t * (int64_t)(int16_t)xval_db;
@@ -8731,14 +8848,14 @@ ba_handler:
             (void)data_read(s, s->ar[yar_dc]); /* Ymem pipeline read */
             switch (xmod_dc) {
             case 0: break;
-            case 1: s->ar[xar_dc]++; break;
-            case 2: s->ar[xar_dc]--; break;
+            case 1: s->ar[xar_dc]--; break;   /* fix 2026-06-22 (SPRU131G T.5-8) */
+            case 2: s->ar[xar_dc]++; break;
             case 3: s->ar[xar_dc] = c54x_circ_ref(s->ar[xar_dc], +(int16_t)s->ar[0], s->bk); break; /* *AR+0% circ — fix 2026-06-01 */
             }
             switch (ymod_dc) {
             case 0: break;
-            case 1: s->ar[yar_dc]++; break;
-            case 2: s->ar[yar_dc]--; break;
+            case 1: s->ar[yar_dc]--; break;   /* fix 2026-06-22 (SPRU131G T.5-8) */
+            case 2: s->ar[yar_dc]++; break;
             case 3: s->ar[yar_dc] = c54x_circ_ref(s->ar[yar_dc], +(int16_t)s->ar[0], s->bk); break; /* *AR+0% circ — fix 2026-06-01 */
             }
             s->t = xval_dc;
@@ -8914,8 +9031,8 @@ ba_handler:
             if (d_acc) s->b = sext40(loaded); else s->a = sext40(loaded);
             switch (xmod) {
             case 0: break;                             /* *ARi (no mod) */
-            case 1: s->ar[xar]++; break;               /* *ARi+ */
-            case 2: s->ar[xar]--; break;               /* *ARi- */
+            case 1: s->ar[xar]--; break;               /* *ARi- (SPRU131G T.5-8 : 01=dec) — fix 2026-06-22 */
+            case 2: s->ar[xar]++; break;               /* *ARi+ (10=inc) */
             case 3:                                    /* *ARi+0% — CIRCULAIRE modulo BK
                                                         * (était linear += AR0 → AR drift
                                                         * 16-bit vers 0x18=MMR_SP → SP-CATAS).
@@ -8932,8 +9049,8 @@ ba_handler:
             }
             switch (ymod) {
             case 0: break;
-            case 1: s->ar[yar]++; break;
-            case 2: s->ar[yar]--; break;
+            case 1: s->ar[yar]--; break;               /* *ARi- (SPRU131G 01=dec) — fix 2026-06-22 */
+            case 2: s->ar[yar]++; break;               /* *ARi+ (10=inc) */
             case 3:                                    /* *ARi+0% — circulaire modulo BK */
                 if (s->bk) {
                     uint16_t base = s->ar[yar] - (s->ar[yar] % s->bk);
@@ -11235,7 +11352,54 @@ int c54x_run(C54xState *s, int n_insns)
         }
         uint16_t sp_before_exec = s->sp;
         uint16_t ds_before = s->delay_slots;  /* delay-slot word-count fix 2026-05-31 */
+        /* ===== SHADOW-DADST pre-capture (RO, revival dsp 2026-06-22) —
+         * GATÉ SUR L'OPCODE DADST/DSADT (0x5a/0x5b/0x5e/0x5f) PARTOUT (pas le PC
+         * 0x9a80, qui est run-variant : narrow vs wide). Cette famille tombe en
+         * SFTL (case 0x5). Capture l'état AVANT pour ΔA/ΔB, marche AR5, et le
+         * résultat shadow-correct. Strictement RO. Le PC loggé révèle où elle tourne. */
+        int64_t  sd_a0 = s->a, sd_b0 = s->b;
+        uint16_t sd_ar5_0 = s->ar[5], sd_lhi = 0, sd_llo = 0;
+        uint8_t  sd_sub = (exec_op >> 8) & 0xFF;
+        int sd_armed = (sd_sub == 0x5a || sd_sub == 0x5b
+                        || sd_sub == 0x5e || sd_sub == 0x5f);
+        if (sd_armed) {
+            sd_lhi = s->data[s->ar[5]];
+            sd_llo = s->data[(uint16_t)(s->ar[5] + 1)];
+        }
         consumed = c54x_exec_one(s);
+        /* ===== SHADOW-DADST post-compute + oracle (RO, logs only,
+         * cap = 40 premiers (boot) + 1/2000 (régime permanent) ) ===== */
+        if (sd_armed) {
+            static unsigned sd_n = 0;
+            if (sd_n < 40 || (sd_n % 2000) == 0) {
+                int64_t a1 = s->a, b1 = s->b;
+                int asm5 = s->st1 & ST1_ASM_MASK; if (asm5 & 0x10) asm5 -= 32; /* ASM signé 5b */
+                uint64_t a0u = sd_a0 & 0xFFFFFFFFFFULL;
+                int64_t pure_sh = (asm5 >= 0) ? (int64_t)(a0u << asm5)
+                                              : (int64_t)(a0u >> (-asm5));
+                int shiftLike = ((a1 & 0xFFFFFFFFFFULL) == (pure_sh & 0xFFFFFFFFFFULL)); /* OBS1 */
+                int16_t T = (int16_t)s->t, lhi = (int16_t)sd_lhi, llo = (int16_t)sd_llo;
+                int is_dadst = (sd_sub == 0x5a || sd_sub == 0x5b);
+                int32_t sh_hi = is_dadst ? (lhi + T) : (lhi - T); /* SPRU131 dual-16, signe TBC */
+                int32_t sh_lo = is_dadst ? (llo - T) : (llo + T);
+                int64_t shadow = (((int64_t)sh_hi & 0xFFFF) << 16) | (uint16_t)sh_lo; /* OBS3 */
+                fprintf(stderr,
+                  "[c54x] SHADOW-DADST #%u pc=0x%04x op=0x%04x xpc=%u C16=%d FRCT=%d ASM=%d BK=0x%04x\n"
+                  "[c54x]   A %010llx->%010llx dA=%lld shiftLike=%d  B %010llx->%010llx dB=%lld\n"
+                  "[c54x]   AR5 0x%04x->0x%04x walked=%d  T=0x%04x  Lmem@AR5 hi=0x%04x lo=0x%04x\n"
+                  "[c54x]   shadow=%s hi%+d lo%+d packed=%010llx insn=%u\n",
+                  sd_n, exec_pc, exec_op, s->xpc & 0xFF,
+                  !!(s->st1 & ST1_C16), !!(s->st1 & ST1_FRCT), asm5, s->bk,
+                  (unsigned long long)a0u, (unsigned long long)(a1 & 0xFFFFFFFFFFULL),
+                  (long long)(a1 - sd_a0), shiftLike,
+                  (unsigned long long)(sd_b0 & 0xFFFFFFFFFFULL),
+                  (unsigned long long)(b1 & 0xFFFFFFFFFFULL), (long long)(b1 - sd_b0),
+                  sd_ar5_0, s->ar[5], (s->ar[5] != sd_ar5_0),                       /* OBS2 */
+                  s->t, sd_lhi, sd_llo, is_dadst ? "DADST" : "DSADT", sh_hi, sh_lo,
+                  (unsigned long long)(shadow & 0xFFFFFFFFFFULL), s->insn_count);
+            }
+            sd_n++;
+        }
 
         /* === DECODE-AUDIT (2026-06-02, brief CC-web : audit différentiel) ===
          * Inventaire du décodeur sur l'overlay corrélateur 0x8000-0x9FFF :
