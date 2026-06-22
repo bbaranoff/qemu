@@ -2280,6 +2280,15 @@ static void stkw_rec(C54xState *s, uint16_t addr, uint16_t val)
 
 static void data_write(C54xState *s, uint16_t addr, uint16_t val)
 {
+    /* TASKTAB-WR (revival dsp 2026-06-22, RO) : qui sème data[0x4c5b/0x4c5c]
+     * (table de tâches lue par LD *(0x4c5c),A puis CALA ; devrait venir du
+     * handler FRAME 0xA04C). 0 write = jamais semée → CALA A=0 → boot stub. */
+    if (addr >= 0x4c5b && addr <= 0x4c5d) {
+        static unsigned ttab_n = 0;
+        if (ttab_n++ < 80)
+            fprintf(stderr, "[c54x] TASKTAB-WR data[0x%04x] <- 0x%04x PC=0x%04x insn=%u\n",
+                    addr, val, s->pc, s->insn_count);
+    }
     /* === SENTINELLE cohérence ARM<->DSP (CALYPSO_FBDET_SENTINEL=1) ===
      * Force toute écriture DSP de d_fb_det (0x08f8) à 0xDEAD. L'ARM lit ce mot
      * via arm=0x01f0 -> s->dsp->data[0x08f8] (calypso_trx.c). La sonde "ARM RD
@@ -3064,6 +3073,18 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
         case MMR_REA:  s->rea = val; return;
         case MMR_PMST:
             {
+                /* PMST-WR (revival dsp 2026-06-22, RO) : un-gated — tranche « IPTR
+                 * relocalisé 0x140 perdu vs jamais émis ». 300 premiers + TOUJOURS si 0x140. */
+                {
+                    static unsigned pmst_n = 0;
+                    uint16_t niptr = (val >> PMST_IPTR_SHIFT) & 0x1FF;
+                    if (pmst_n < 300 || niptr == 0x140) {
+                        pmst_n++;
+                        fprintf(stderr, "[c54x] PMST-WR #%u val=0x%04x IPTR=0x%03x PC=0x%04x insn=%u%s\n",
+                                pmst_n, val, niptr, s->pc, s->insn_count,
+                                niptr == 0x140 ? "  <<< IPTR=0x140 EMITTED" : "");
+                    }
+                }
                 static unsigned pmst_wr_attempts = 0;
                 if (pmst_wr_attempts++ < 100)
                     C54_LOG("PMST WR attempt #%u: val=0x%04x cur=0x%04x PC=0x%04x insn=%u",
@@ -7874,27 +7895,61 @@ static int c54x_exec_one(C54xState *s)
              * Lmem post-mod = ±2 (long-operand, via resolve_lmem). Le mode C16
              * réel est lu à l'exécution (ST1.C16, suivi par SSBX/RSBX C16). */
             uint8_t dl_hi = (op >> 8) & 0xFF;
-            if (dl_hi == 0x5A || dl_hi == 0x5B || dl_hi == 0x5E || dl_hi == 0x5F) {
-                int      is_dadst = (dl_hi == 0x5A || dl_hi == 0x5B);
-                int64_t *dl_dst   = (dl_hi & 1) ? &s->b : &s->a;   /* bit8 = D */
-                uint16_t laddr    = resolve_lmem(s, op);
-                uint16_t lhi      = data_read(s, laddr);
-                uint16_t llo      = data_read(s, (uint16_t)(laddr + 1));
-                int16_t  t16      = (int16_t)s->t;
-                int64_t  r;
-                if (s->st1 & ST1_C16) {
-                    int sgn = is_dadst ? +1 : -1;
-                    int32_t rh = (int32_t)(int16_t)lhi + sgn * (int32_t)t16;
-                    int32_t rl = (int32_t)(int16_t)llo - sgn * (int32_t)t16;
-                    r = ((int64_t)rh << 16) | ((uint32_t)rl & 0xFFFF);
-                } else {
-                    uint32_t lmem32 = ((uint32_t)lhi << 16) | llo;
-                    uint32_t tt32   = ((uint32_t)(uint16_t)t16 << 16) | (uint16_t)t16;
-                    int64_t lv = (s->st1 & ST1_SXM) ? (int64_t)(int32_t)lmem32 : (int64_t)(uint32_t)lmem32;
-                    int64_t tv = (s->st1 & ST1_SXM) ? (int64_t)(int32_t)tt32   : (int64_t)(uint32_t)tt32;
-                    r = is_dadst ? (lv + tv) : (lv - tv);
+            if (dl_hi >= 0x50 && dl_hi <= 0x5F) {
+                /* === Famille dual long-word COMPLÈTE (SPRU172C, sweep §4-E 2026-06-22) :
+                 *   0x50-53 DADD(00SD) 0x54-55 DSUB(010S) 0x56-57 DLD(011D)
+                 *   0x58-59 DRSUB(100S) 0x5A-5B DADST(101D) 0x5C-5D DSUBT(110D)
+                 *   0x5E-5F DSADT(111D). Lmem 32-bit via resolve_lmem (post-mod ±2),
+                 * branche sur ST1.C16. Vérifié bit-à-bit vs exemples chiffrés SPRU172C
+                 * (DADD/DADST/DSADT). Avant : 0x50-59/5C-5D tombaient en SFTA/SFTL. */
+                uint16_t laddr  = resolve_lmem(s, op);
+                uint16_t lhi    = data_read(s, laddr);
+                uint16_t llo    = data_read(s, (uint16_t)(laddr + 1));
+                int      c16    = (s->st1 & ST1_C16) != 0;
+                int      sxm    = (s->st1 & ST1_SXM) != 0;
+                int16_t  lhi16  = (int16_t)lhi, llo16 = (int16_t)llo;
+                uint32_t lmem32 = ((uint32_t)lhi << 16) | llo;
+                int64_t  lmem40 = sxm ? (int64_t)(int32_t)lmem32 : (int64_t)(uint32_t)lmem32;
+                if (dl_hi <= 0x53) {                 /* DADD Lmem,src[,dst] : dst = src + Lmem */
+                    int64_t *src = ((op >> 9) & 1) ? &s->b : &s->a;
+                    int64_t *dst = ((op >> 8) & 1) ? &s->b : &s->a;
+                    if (!c16) *dst = sext40(*src + lmem40);
+                    else { int32_t hi = (int32_t)(int16_t)((*src >> 16) & 0xFFFF) + lhi16;
+                           int32_t lo = (int32_t)(int16_t)(*src & 0xFFFF) + llo16;
+                           *dst = sext40(((int64_t)hi << 16) | ((uint32_t)lo & 0xFFFF)); }
+                } else if (dl_hi <= 0x55) {          /* DSUB Lmem,src : src = src - Lmem */
+                    int64_t *src = ((op >> 8) & 1) ? &s->b : &s->a;
+                    if (!c16) *src = sext40(*src - lmem40);
+                    else { int32_t hi = (int32_t)(int16_t)((*src >> 16) & 0xFFFF) - lhi16;
+                           int32_t lo = (int32_t)(int16_t)(*src & 0xFFFF) - llo16;
+                           *src = sext40(((int64_t)hi << 16) | ((uint32_t)lo & 0xFFFF)); }
+                } else if (dl_hi <= 0x57) {          /* DLD Lmem,dst : dst = Lmem */
+                    int64_t *dst = ((op >> 8) & 1) ? &s->b : &s->a;
+                    if (!c16) *dst = sext40(lmem40);
+                    else *dst = sext40(((int64_t)lhi16 << 16) | (uint16_t)llo);
+                } else if (dl_hi <= 0x59) {          /* DRSUB Lmem,src : src = Lmem - src */
+                    int64_t *src = ((op >> 8) & 1) ? &s->b : &s->a;
+                    if (!c16) *src = sext40(lmem40 - *src);
+                    else { int32_t hi = lhi16 - (int32_t)(int16_t)((*src >> 16) & 0xFFFF);
+                           int32_t lo = llo16 - (int32_t)(int16_t)(*src & 0xFFFF);
+                           *src = sext40(((int64_t)hi << 16) | ((uint32_t)lo & 0xFFFF)); }
+                } else {                              /* DADST/DSUBT/DSADT Lmem,dst : use T */
+                    int64_t *dst = ((op >> 8) & 1) ? &s->b : &s->a;
+                    int16_t t16 = (int16_t)s->t;
+                    int64_t r;
+                    if (c16) {
+                        int sgn_hi = (dl_hi <= 0x5B) ? +1 : -1;   /* DADST hi+T ; DSUBT/DSADT hi-T */
+                        int sgn_lo = (dl_hi <= 0x5D) ? -1 : +1;   /* DADST/DSUBT lo-T ; DSADT lo+T */
+                        int32_t hi = (int32_t)lhi16 + sgn_hi * (int32_t)t16;
+                        int32_t lo = (int32_t)llo16 + sgn_lo * (int32_t)t16;
+                        r = ((int64_t)hi << 16) | ((uint32_t)lo & 0xFFFF);
+                    } else {
+                        uint32_t tt32 = ((uint32_t)(uint16_t)t16 << 16) | (uint16_t)t16;
+                        int64_t tt40 = sxm ? (int64_t)(int32_t)tt32 : (int64_t)(uint32_t)tt32;
+                        r = (dl_hi <= 0x5B) ? (lmem40 + tt40) : (lmem40 - tt40); /* DADST add ; else sub */
+                    }
+                    *dst = sext40(r);
                 }
-                *dl_dst = sext40(r);
                 return consumed + s->lk_used;
             }
             int dst = (op >> 8) & 1;
