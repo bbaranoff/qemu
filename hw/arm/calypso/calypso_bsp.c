@@ -443,6 +443,22 @@ static void bsp_trxd_readable(void *opaque)
                    ((uint32_t)buf[3]<<8)|buf[4];
     bsp.last_att = (n > 5) ? buf[5] : 0;
 
+    /* DL-TOA probe (revival dsp 2026-06-22, read-only) : le ToA intra-slot du
+     * burst DL (header TRXDv0 buf[6..7], int16 q4 BE) = le "2e offset" (l'analogue
+     * DL de UL_SLOT_OFFSET), actuellement IGNORE par le BSP (qemu_wrap.c:98).
+     * On le MESURE pour savoir de combien decaler la position du burst en DARAM.
+     * Capé + periodique. q4 = quart-de-bit ; samples ~= toa_q4/4*SPS. */
+    {
+        int16_t dl_toa_q4 = (n >= 8) ? (int16_t)(((uint16_t)buf[6] << 8) | buf[7]) : 0;
+        static unsigned dltoa_n = 0;
+        if (dltoa_n < 40 || (dltoa_n % 4000) == 0) {
+            fprintf(stderr, "[BSP] DL-TOA tn=%u fn=%u rssi=%u toa_q4=%d "
+                    "(bits~%d) n=%zd\n", tn, fn, (unsigned)bsp.last_att,
+                    dl_toa_q4, dl_toa_q4 / 4, n);
+            dltoa_n++;
+        }
+    }
+
     int nbits = (int)n - 8;  /* TRXDv0 header is 8 bytes (TS+FN+RSSI+ToA) */
     if (nbits > 148) nbits = 148;
     if (nbits <= 0) return;

@@ -214,6 +214,26 @@ static unsigned g_ar_log_cap    = 50;
 
 static void ar_write_track(C54xState *s, unsigned idx, uint16_t new_val)
 {
+    /* AR3-PRELOAD (revival dsp 2026-06-22, read-only, toujours actif, cape 120) :
+     * capture les LOADS d'AR3 dans/autour du buffer I/Q [0x2a00..0x2c00). Le
+     * correlateur PC=0xee38 lit AR3=0x2b97 (HORS buffer, fin=0x2b28). ar_write_track
+     * n'est appele QUE sur load MMR (STM/STLM/MVDM), PAS sur auto-increment.
+     * VERDICT :
+     *  - AR3 loade a ~0x2a00 (debut buffer) et AUCUN load >=0x2b28 ici -> le 0x2b97
+     *    vient d'INCREMENTS = boucle trop longue / buffer trop court = FIX B (BSP).
+     *  - AR3 loade directement >=0x2b28 (flag OUT-OF-BUF) -> instruction mal emulee
+     *    = FIX A (decodage c54x), avec le PC/op coupable. */
+    if (idx == 3 && new_val >= 0x2a00 && new_val < 0x2c00) {
+        static unsigned ar3p_n = 0;
+        if (ar3p_n < 120) {
+            uint16_t op = prog_fetch(s, s->pc);
+            fprintf(stderr, "[c54x] AR3-PRELOAD PC=0x%04x op=0x%04x AR3 %04x->%04x "
+                    "%s insn=%u\n", s->pc, op, s->ar[3], new_val,
+                    new_val >= 0x2b28 ? "*** OUT-OF-BUF ***" : "(in-buf)",
+                    s->insn_count);
+            ar3p_n++;
+        }
+    }
     if (g_ar_enabled < 0) {
         const char *e = getenv("CALYPSO_AR_TRACE");
         g_ar_mask = (e && *e) ? (unsigned)strtoul(e, NULL, 0) : 0xFFu;
@@ -3443,6 +3463,26 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
                     "INTM=%d insn=%u\n", addr, s->data[addr], val, s->pc,
                     !!(s->st1 & ST1_INTM), s->insn_count);
             fw_n++;
+        }
+    }
+
+    /* SBSLOT-WR probe (revival dsp 2026-06-22, read-only) : QUI ecrit le slot
+     * SB a_serv_demod[D_TOA] db_r (p0 data[0x0830] / p1 data[0x0844]) et a_sch[3]
+     * (p0 data[0x083a] / p1 data[0x084e]) ? Trou de couverture qui a induit le
+     * faux "stale". Tranche scatter-write (PC=0xa1d6 ?) vs autre vs jamais ecrit.
+     * Logue PC, op, A.low, val. Cape 300. */
+    if (addr == 0x0830 || addr == 0x0844 || addr == 0x083a || addr == 0x084e) {
+        static unsigned sbw_n = 0;
+        if (sbw_n < 300) {
+            const char *what = (addr == 0x0830) ? "SERV_TOA_p0" :
+                               (addr == 0x0844) ? "SERV_TOA_p1" :
+                               (addr == 0x083a) ? "A_SCH3_p0"   : "A_SCH3_p1";
+            fprintf(stderr, "[c54x] SBSLOT-WR %s data[0x%04x] 0x%04x->0x%04x "
+                    "PC=0x%04x op=0x%04x A=0x%010llx insn=%u\n",
+                    what, addr, s->data[addr], val, s->pc,
+                    prog_fetch(s, s->pc),
+                    (unsigned long long)(s->a & 0xFFFFFFFFFFULL), s->insn_count);
+            sbw_n++;
         }
     }
 
