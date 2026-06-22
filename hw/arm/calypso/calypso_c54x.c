@@ -3002,13 +3002,13 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
             g_last_st0w_op = prog_fetch(s, s->pc); g_last_st0w_xpc = s->xpc;
             g_last_st0w_prev = g_prev_pc;
             st0_ring_rec(s, val, 'p'); /* pop/write ST0 (C-sweep) */
-            if (g_orphan_on > 0 && s->pc == 0xf48b) {
+            if (g_orphan_on > 0 && (s->pc == 0xf48b || s->pc == 0x7737 || (val & 0x1FF) == 0x124)) {
                 /* POPM ST0 @0xf48b : le slot juste poppé = data[sp-1]. Cherche
                  * son dernier écrivain dans le ring pile. NO-WRITER = slot stale
                  * → SP désaligné (POP sans PUSH apparié, cas b de CC). */
                 uint16_t slot = (uint16_t)(s->sp - 1);
-                fprintf(stderr, "[c54x] ORPHAN@f48b SP=0x%04x slot=0x%04x val=0x%04x(DP=%03x)",
-                        s->sp, slot, val, (unsigned)(val & 0x1FF));
+                fprintf(stderr, "[c54x] ORPHAN@%04x SP=0x%04x slot=0x%04x val=0x%04x(DP=%03x)",
+                        s->pc, s->sp, slot, val, (unsigned)(val & 0x1FF));
                 int found = 0;
                 unsigned rn = g_stkw_idx < STKW_RING_N ? g_stkw_idx : STKW_RING_N;
                 for (unsigned i = 0; i < rn; i++) {
@@ -6154,17 +6154,36 @@ static int c54x_exec_one(C54xState *s)
                 }
                 return 2;  /* skip 2 words, fall through */
             }
-            /* F84x/F85x: BANZ with condition / CALL variants */
+            /* F84x/F85x: BC pmad, ACC-condition (2 mots). FIX 2026-06-23 (ROOT du
+             * derail SP) : ces opcodes sont des BC, PAS des BANZ (BANZ = 0x6Cxx, un
+             * encodage DISJOINT — SPRU172C:16188/16266). cc = octet bas : cc&0x40 =
+             * groupe ACC, cc&0x08 = B vs A, cc&0x07 = test {2:GEQ 3:LT 4:NEQ 5:EQ
+             * 6:GT 7:LEQ}. Le firmware @0x772f émet F844 = BC 0x7737,ANEQ (branche si
+             * A!=0). L'ANCIEN décode `BANZ AR4` testait/décrémentait AR4 au lieu de
+             * l'accumulateur → la branche tirait sur AR4!=0 → atterrissait sur le
+             * POPM ST0 @0x7737 SANS son PSHM ST0 (@0x770d, chemin disjoint) → pop
+             * orphelin → SP monte +1/tour → DP=0x124 → derail → SP collapse → spin.
+             * BC ne push RIEN (pile intacte) ; SURGICAL : 0x4/0x5 seul, 0x2/0x3
+             * (dialecte, fix BC strict reverté 2026-05-15) inchangés ; disjoint du
+             * catch-all 0x7000 (STM #lk,SP). */
             if (sub == 0x4 || sub == 0x5) {
                 op2 = prog_fetch(s, s->pc + 1);
-                /* BANZ ARn, pmad */
-                int ar_idx = op & 0x07;
-                if (s->ar[ar_idx] != 0) {
-                    s->ar[ar_idx]--;
-                    s->pc = op2;
-                    return 0;
+                consumed = 2;
+                uint8_t cc = op & 0xFF;
+                int64_t acc  = (cc & 0x08) ? s->b : s->a;
+                int64_t accs = (acc & 0x8000000000LL) ? (acc | ~0xFFFFFFFFFFLL) : acc;
+                bool take;
+                switch (cc & 0x07) {
+                case 0x2: take = (accs >= 0); break;   /* AGEQ */
+                case 0x3: take = (accs <  0); break;   /* ALT  */
+                case 0x4: take = (accs != 0); break;   /* ANEQ */
+                case 0x5: take = (accs == 0); break;   /* AEQ  */
+                case 0x6: take = (accs >  0); break;   /* AGT  */
+                case 0x7: take = (accs <= 0); break;   /* ALEQ */
+                default:  take = false;       break;   /* 0/1 réservé */
                 }
-                return 2;
+                if (take) { s->pc = op2; return 0; }
+                return consumed + s->lk_used;
             }
             /* F8Cx-F8Fx: CALL/CALLD pmad (2 words) */
             if (sub >= 0xC) {
@@ -8558,7 +8577,8 @@ static int c54x_exec_one(C54xState *s)
          * Encoding: 1010 0001 XXXX YYYY
          * Per SPRU172C: B += (AH - Xmem)^2; A = Ymem << 16; T = Xmem */
         if (hi8 == 0xA1) {
-            /* FIX 2026-06-22 (sweep) : décodage Xmem/Ymem 2-bit SPRU131G T.5-6/5-8. */
+            /* Xmem/Ymem 2-bit SPRU131G T.5-6/5-8 (sweep ; régression 0xfe36 ÉCARTÉE :
+             * derail byte-identique insn=193093 avec ce handler reverté → hors cause). */
             int xar_sq  = ((op >> 4) & 0x03) + 2;
             int yar_sq  = (op & 0x03) + 2;
             int xmod_sq = (op >> 6) & 0x03;
@@ -11422,6 +11442,75 @@ int c54x_run(C54xState *s, int n_insns)
             sd_llo = s->data[(uint16_t)(s->ar[5] + 1)];
         }
         consumed = c54x_exec_one(s);
+        /* SP-COLLAPSE probe (RO, revival dsp 2026-06-22) : attrape l'instruction
+         * EXACTE qui effondre SP sous 0x0800 (1ère + 30 suivantes) — le seed de
+         * toute la cascade (boot-stub / spin 0xc6ac). */
+        {
+            static uint16_t sp_prev = 0xffff;
+            static unsigned spc_n = 0;
+            if (sp_prev >= 0x0800 && s->sp < 0x0800 && spc_n < 30) {
+                spc_n++;
+                fprintf(stderr, "[c54x] SP-COLLAPSE #%u exec_pc=0x%04x exec_op=0x%04x "
+                        "prev_PC=0x%04x prev_op=0x%04x SP 0x%04x->0x%04x B=0x%010llx insn=%u\n",
+                        spc_n, exec_pc, exec_op, s->last_exec_pc, s->last_exec_op,
+                        sp_prev, s->sp,
+                        (unsigned long long)(s->b & 0xFFFFFFFFFFULL), s->insn_count);
+            }
+            sp_prev = s->sp;
+        }
+        /* FEXX-ENTRY probe (RO, revival dsp 2026-06-22) : capture le saut/vecteur
+         * qui transfère le contrôle DANS la ROM 0xfe00-0xff7f (data table + init
+         * 0xff00) = la VRAIE entrée du déraillement (le CALL statique 0xfe00 @0xfdd5
+         * ne s'exécute jamais → c'est un branchement CALCULÉ). prev_PC/op = coupable,
+         * A = la cible si c'est un CALA. 1ère + 20 suivantes. */
+        {
+            static int fe_was_in = 0;
+            static unsigned fe_n = 0;
+            int fe_in = (exec_pc >= 0xfe00 && exec_pc < 0xff80);
+            if (fe_in && !fe_was_in && fe_n < 20) {
+                fe_n++;
+                fprintf(stderr, "[c54x] FEXX-ENTRY #%u entered 0x%04x from prev_PC=0x%04x "
+                        "prev_op=0x%04x A=0x%010llx SP=0x%04x insn=%u\n",
+                        fe_n, exec_pc, s->last_exec_pc, s->last_exec_op,
+                        (unsigned long long)(s->a & 0xFFFFFFFFFFULL), s->sp, s->insn_count);
+            }
+            fe_was_in = fe_in;
+        }
+        /* DISP-A probe (RO, revival dsp 2026-06-22) : évolution de A à travers le
+         * dispatcher 0x80b0-0x80c9 → quel LD pose A=0xfe36 (le handler garbage du
+         * FCALAD @0x80c8) et depuis quelle case data. */
+        if (exec_pc >= 0x80b0 && exec_pc < 0x80ca) {
+            static unsigned da_n = 0;
+            uint16_t alo = (uint16_t)(s->a & 0xFFFF);
+            int garbage = (exec_pc == 0x80c2 && alo >= 0xfe00); /* le LD du derail */
+            if (da_n < 40 || garbage) {
+                da_n++;
+                uint16_t dp = s->st0 & 0x1FF;
+                fprintf(stderr, "[c54x] DISP-A pc=0x%04x op=0x%04x A.lo=0x%04x DP=0x%03x "
+                        "AR1=0x%04x AR2=0x%04x AR3=0x%04x d[DP:9]=0x%04x insn=%u%s\n",
+                        exec_pc, exec_op, alo, dp, s->ar[1], s->ar[2], s->ar[3],
+                        s->data[(uint16_t)((dp << 7) | 0x09)], s->insn_count,
+                        garbage ? "  <<< A=GARBAGE handler = LE DERAIL" : "");
+            }
+        }
+        /* DP-AT-DISP probe (RO, revival dsp 2026-06-22) : tracke la DERNIÈRE
+         * instruction qui change DP (ST0[8:0]), et au moment où le dispatcher
+         * entre (0x80b0) logue DP + qui l'a posé → trouve qui met DP=0x124 (la
+         * mauvaise page = table coefficient 0x9200 au lieu d'un handler). */
+        {
+            static uint16_t dp_prev = 0xFFFF, dp_set_pc = 0, dp_set_op = 0;
+            uint16_t dp_now = s->st0 & 0x1FF;
+            if (dp_now != dp_prev) { dp_set_pc = exec_pc; dp_set_op = exec_op; dp_prev = dp_now; }
+            if (exec_pc == 0x80b0) {
+                static unsigned dpw_n = 0;
+                if (dpw_n < 20 || dp_now == 0x124) {
+                    dpw_n++;
+                    fprintf(stderr, "[c54x] DP-AT-DISP DP=0x%03x set_by_PC=0x%04x set_op=0x%04x insn=%u%s\n",
+                            dp_now, dp_set_pc, dp_set_op, s->insn_count,
+                            (dp_now == 0x124) ? "  <<< BAD DP (coefficient page = LE DERAIL)" : "");
+                }
+            }
+        }
         /* ===== SHADOW-DADST post-compute + oracle (RO, logs only,
          * cap = 40 premiers (boot) + 1/2000 (régime permanent) ) ===== */
         if (sd_armed) {
