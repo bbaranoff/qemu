@@ -1155,10 +1155,16 @@ int32_t uhdwrap_read(void *dev, uint32_t num_chans)
      * CALYPSO_UL_FN_GATE   : 1 = n'injecter que sur un FN RACH-eligible (combined
      *                        CCCH+SDCCH4 : osmo_fn%51 in {4,5,14..36,45,46}).
      * CALYPSO_UL_SLOT_OFFSET : offset intra-slot (samples) du burst (TOA). */
-    static int ul_fnoff = -99999, ul_fngate = -1, ul_slotoff = -1;
-    if (ul_fnoff == -99999) { const char *e = getenv("CALYPSO_UL_FN_OFFSET"); ul_fnoff = (e && *e) ? atoi(e) : 36;       /* hardcode : offset FN device->osmo-trx (gate vide=36) */ }
+    static int ul_fnoff = -99999, ul_fngate = -1, ul_slotoff = -1, ul_dsp_shunt = -1;
+    /* GATE PAR MODE (revival dsp 2026-06-22) : les offsets de RACH SYNTHETIQUE
+     * (FN=36, slot=1875) ne valent QU'EN dsp-shunt (qemu_wrap REFAIT le RACH car
+     * le DSP est shunte). En c54x (vrai DSP, UL reel genere par le firmware), le
+     * default devient 0 (aucun decalage synthetique a appliquer). L'override env
+     * CALYPSO_UL_FN_OFFSET / CALYPSO_UL_SLOT_OFFSET reste prioritaire dans les 2 modes. */
+    if (ul_dsp_shunt < 0)   { const char *e = getenv("CALYPSO_DSP_SHUNT"); ul_dsp_shunt = (e && *e == '1') ? 1 : 0; }
+    if (ul_fnoff == -99999) { const char *e = getenv("CALYPSO_UL_FN_OFFSET"); ul_fnoff = (e && *e) ? atoi(e) : (ul_dsp_shunt ? 36 : 0);     /* gate: shunt=36, c54x=0 */ }
     if (ul_fngate < 0)      { const char *e = getenv("CALYPSO_UL_FN_GATE");   ul_fngate = (!e || *e != '0'); }
-    if (ul_slotoff < 0)     { const char *e = getenv("CALYPSO_UL_SLOT_OFFSET"); ul_slotoff = (e && *e) ? atoi(e) : 1875;   /* hardcode : TOA intra-slot RACH (gate vide=1875) */ }
+    if (ul_slotoff < 0)     { const char *e = getenv("CALYPSO_UL_SLOT_OFFSET"); ul_slotoff = (e && *e) ? atoi(e) : (ul_dsp_shunt ? 1875 : 0); /* gate: shunt=1875, c54x=0 */ }
     uint32_t internal_fn = (uint32_t)(d->rx_ts / (uint64_t)CALYPSO_FRAME_SAMPLES);
     uint32_t osmo_fn = internal_fn + (uint32_t)ul_fnoff;     /* FN tel que vu par osmo-trx (SDCCH only) */
     /* FN-GATE RACH (FIX MT-SMS 2026-06-09) : osmo-trx TAMPONNE+CORRELE le burst injecte

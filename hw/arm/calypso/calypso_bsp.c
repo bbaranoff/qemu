@@ -113,6 +113,10 @@ static struct {
     uint64_t   bursts_dropped_no_window;
     uint64_t   bursts_dropped_queue_full;
     uint64_t   bursts_dropped_stale;
+    /* DL FN-LOCK (revival dsp) : offset constant burst_fn(base osmo-trx ts/5000)
+     * vs current_fn(base g_wall_fn=0 au boot), auto-mesure 1x au 1er burst. */
+    int32_t    dl_fnoff;
+    int        dl_fnoff_done;
     uint8_t    inject_canary;     /* CALYPSO_BSP_INJECT_CANARY=1 :
                                       overwrite samples avec 0xCAFE pour
                                       identifier buffer cible via read trace */
@@ -275,11 +279,33 @@ static BspBurstSlot *bsp_take_for_fn(uint8_t tn, uint32_t current_fn)
     for (int i = 0; i < BSP_QUEUE_LEN; i++) {
         BspBurstSlot *s = &qq->slot[i];
         if (!s->valid) continue;
-        int32_t d = bsp_fn_delta(s->fn, current_fn);
+        /* DL FN-LOCK : auto-mesure l'offset d'epoque UNE FOIS (miroir cal_off UL /
+         * du shunt qui lit l1s.fn). dl_fnoff = current_fn - burst_fn ; on l'ajoute
+         * a burst_fn pour le match -> delta ~0 si offset constant. Override
+         * CALYPSO_DL_FN_OFFSET=<n>. Si dl_fnoff mesure ~0 -> pas un offset
+         * d'epoque (= back-pressure de drain), le flood stale persistera (auto-diag). */
+        if (!bsp.dl_fnoff_done) {
+            const char *e = getenv("CALYPSO_DL_FN_OFFSET");
+            bsp.dl_fnoff = (e && *e) ? (int32_t)strtol(e, NULL, 0)
+                                     : bsp_fn_delta(current_fn, s->fn);
+            bsp.dl_fnoff_done = 1;
+            fprintf(stderr, "[BSP] DL FN-LOCK dl_fnoff=%d (burst_fn=%u cur_fn=%u "
+                    "%s)\n", bsp.dl_fnoff, s->fn, current_fn,
+                    (e && *e) ? "env" : "auto");
+        }
+        int32_t d = bsp_fn_delta(s->fn + (uint32_t)bsp.dl_fnoff, current_fn);
         int32_t ad = d < 0 ? -d : d;
         if (d < -BSP_FN_MATCH_WINDOW) {
             s->valid = false;
             bsp.bursts_dropped_stale++;
+            /* sonde residuelle : si ca droppe ENCORE apres l'offset -> drift
+             * (back-pressure ou offset non constant). Logue raw vs ajuste. */
+            { static uint64_t pn = 0;
+              if (pn < 30 || (pn % 5000) == 0)
+                fprintf(stderr, "[BSP] DL-OFFSET-PROBE burst_fn=%u cur_fn=%u "
+                        "raw=%d adj=%d off=%d\n", s->fn, current_fn,
+                        bsp_fn_delta(s->fn, current_fn), d, bsp.dl_fnoff);
+              pn++; }
         } else if (ad <= BSP_FN_MATCH_WINDOW && ad < best_abs) {
             match = s;
             best_abs = ad;
@@ -416,6 +442,22 @@ static void bsp_trxd_readable(void *opaque)
     uint32_t fn  = ((uint32_t)buf[1]<<24)|((uint32_t)buf[2]<<16)|
                    ((uint32_t)buf[3]<<8)|buf[4];
     bsp.last_att = (n > 5) ? buf[5] : 0;
+
+    /* DL-TOA probe (revival dsp 2026-06-22, read-only) : le ToA intra-slot du
+     * burst DL (header TRXDv0 buf[6..7], int16 q4 BE) = le "2e offset" (l'analogue
+     * DL de UL_SLOT_OFFSET), actuellement IGNORE par le BSP (qemu_wrap.c:98).
+     * On le MESURE pour savoir de combien decaler la position du burst en DARAM.
+     * Capé + periodique. q4 = quart-de-bit ; samples ~= toa_q4/4*SPS. */
+    {
+        int16_t dl_toa_q4 = (n >= 8) ? (int16_t)(((uint16_t)buf[6] << 8) | buf[7]) : 0;
+        static unsigned dltoa_n = 0;
+        if (dltoa_n < 40 || (dltoa_n % 4000) == 0) {
+            fprintf(stderr, "[BSP] DL-TOA tn=%u fn=%u rssi=%u toa_q4=%d "
+                    "(bits~%d) n=%zd\n", tn, fn, (unsigned)bsp.last_att,
+                    dl_toa_q4, dl_toa_q4 / 4, n);
+            dltoa_n++;
+        }
+    }
 
     int nbits = (int)n - 8;  /* TRXDv0 header is 8 bytes (TS+FN+RSSI+ToA) */
     if (nbits > 148) nbits = 148;

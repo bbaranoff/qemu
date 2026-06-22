@@ -201,6 +201,68 @@ static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
               (size == 4) ? ((uint32_t)src[0] | ((uint32_t)src[1] << 16)) :
               ((uint8_t *)src)[offset & 1];
     }
+    /* === FBDET-RD (revival dsp) : l'ARM lit-il d_fb_det (offset 0x01F0) != 0 =
+     * le résultat FB écrit par le DSP (data[0x08F8]=0x6b34) ? Log sur CHANGEMENT
+     * de valeur (capté 100) → on voit la transition 0 -> FOUND. Lit la vraie
+     * valeur (avant tout FORCE_TOA). */
+    if (size == 2 && offset == 0x01F0) {
+        static uint16_t fbdet_last = 0xFFFF;
+        static unsigned fbdet_log;
+        if ((uint16_t)val != fbdet_last && (fbdet_log < 100 || (fbdet_log % 20) == 0)) {
+            fprintf(stderr,
+                    "[FBDET-RD] ARM read d_fb_det(0x01F0)=0x%04x fn=%u\n",
+                    (unsigned)val, (unsigned)s->fn);
+            fbdet_last = (uint16_t)val;
+            fbdet_log++;
+        }
+    }
+    /* === FBSBRES-RD (read-only, 2026-06-22) : logue le BLOC RESULTAT FB et SB
+     * lu par l'ARM, AVANT tout FORCE_TOA, sur les offsets MMIO CONFIRMES par
+     * VerifyOffsets (identiques aux dérivés ; convention DSP word = 0x0800 +
+     * off/2) :
+     *   FB a_sync_demod (NDB) : D_TOA 0x01F4 / D_PM 0x01F6 / D_ANGLE 0x01F8 /
+     *                           D_SNR 0x01FA
+     *   SB a_serv_demod[D_TOA] : page0 0x0060 / page1 0x0088
+     *   SB a_sch (BSIC/CRC) : a_sch[0] CRC 0x006E(p0)/0x0096(p1),
+     *                         a_sch[3] 0x0074(p0)/0x009C(p1),
+     *                         a_sch[4] 0x0076(p0)/0x009E(p1)
+     * Permet de voir si ces words portent une valeur valide ou du garbage
+     * (cause "SB N bits in the future"). Compteur capé ~150, ne spamme pas. */
+    if (size == 2) {
+        static unsigned fbsbres_log = 0;
+        const char *tag = NULL;
+        switch (offset) {
+        /* --- bloc FB (a_sync_demod, NDB) --- */
+        case 0x01F4: tag = "FB a_sync_demod[D_TOA]";   break;
+        case 0x01F6: tag = "FB a_sync_demod[D_PM]";    break;
+        case 0x01F8: tag = "FB a_sync_demod[D_ANGLE]"; break;
+        case 0x01FA: tag = "FB a_sync_demod[D_SNR]";   break;
+        /* --- bloc SB (a_serv_demod[D_TOA], db_r page0/page1) --- */
+        case 0x0060: tag = "SB a_serv_demod[D_TOA] p0"; break;
+        case 0x0088: tag = "SB a_serv_demod[D_TOA] p1"; break;
+        /* --- bloc SB BSIC / CRC (a_sch, db_r page0/page1) --- */
+        case 0x006E: tag = "SB a_sch[0] CRC p0"; break;
+        case 0x0096: tag = "SB a_sch[0] CRC p1"; break;
+        case 0x0074: tag = "SB a_sch[3] BSIC p0"; break;
+        case 0x009C: tag = "SB a_sch[3] BSIC p1"; break;
+        case 0x0076: tag = "SB a_sch[4] BSIC p0"; break;
+        case 0x009E: tag = "SB a_sch[4] BSIC p1"; break;
+        default: break;
+        }
+        if (tag) {
+            /* SB (db_r 0x60..0x9E) = rare -> cap haut ; FB (a_sync_demod) =
+             * frequent -> 150 premiers + echantillon 1/2000 pour voir le
+             * steady-state (le TOA converge-t-il apres le fix DL FN-LOCK ?). */
+            static unsigned sb_log = 0;
+            bool is_sb = (offset >= 0x0060 && offset <= 0x009E);
+            bool emit = is_sb ? (sb_log < 3000)
+                              : (fbsbres_log < 150 || (fbsbres_log % 2000) == 0);
+            if (is_sb) sb_log++; else fbsbres_log++;
+            if (emit)
+                fprintf(stderr, "[FBSBRES-RD] %s(0x%04x)=0x%04x fn=%u\n",
+                        tag, (unsigned)offset, (unsigned)val, (unsigned)s->fn);
+        }
+    }
     /* CALYPSO_FORCE_TOA=<N> (env gated, rigolo) : force une détection FB
      * complète vue par l'ARM, sans toucher le DSP. osmocom prim_fbsb.c
      * n'atteint read_fb_result (lecture TOA dans ndb->a_sync_demod[D_TOA]
@@ -1282,6 +1344,32 @@ static void calypso_tdma_tick(void *opaque) {
                 (unsigned long long)tdma_ticks, s->fn, (long long)entry_t,
                 dsp_n_exec_2, dsp_n_exec_5,
                 (unsigned long long)dsp_insn_total, dsp_budget);
+    }
+
+    /* === POST-WATCH (revival dsp) : l'ARM poste-t-il jamais d_task_d/d_burst_d
+     * (db_w command), et le DSP les voit-il ? On lit les mots depuis dsp_ram[]
+     * (partagé = ce que le DSP lit via api_ram) ET dsp->data[] (copie privée
+     * prog-fetch) pour distinguer "post jamais émis" (tout=0) de "post non
+     * miroité" (RAM != DATA). Log seulement quand non-nul, capé 200. */
+    if (s->dsp && s->dsp->data) {
+        uint16_t r_td0 = s->dsp_ram[0x00], r_bd0 = s->dsp_ram[0x01];
+        uint16_t r_td1 = s->dsp_ram[0x14], r_bd1 = s->dsp_ram[0x15];
+        uint16_t d_td0 = s->dsp->data[0x800], d_bd0 = s->dsp->data[0x801];
+        uint16_t d_td1 = s->dsp->data[0x814], d_bd1 = s->dsp->data[0x815];
+        if (r_td0|r_bd0|r_td1|r_bd1|d_td0|d_bd0|d_td1|d_bd1) {
+            static unsigned pw_log;
+            if (pw_log < 200) {
+                fprintf(stderr,
+                  "[POST-WATCH] fn=%u RAM td0=%04x bd0=%04x td1=%04x bd1=%04x "
+                  "DATA td0=%04x bd0=%04x td1=%04x bd1=%04x%s\n",
+                  (unsigned)s->fn, r_td0, r_bd0, r_td1, r_bd1,
+                  d_td0, d_bd0, d_td1, d_bd1,
+                  (r_td0 != d_td0 || r_bd0 != d_bd0 ||
+                   r_td1 != d_td1 || r_bd1 != d_bd1)
+                    ? " *MIRROR-MISMATCH*" : "");
+                pw_log++;
+            }
+        }
     }
 
     /* ── 6. BSP DL delivery is now driven by wall-clock drain timer in
