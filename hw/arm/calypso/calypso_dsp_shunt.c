@@ -1467,11 +1467,16 @@ struct dsp_shunt_shm {
 
 static struct dsp_shunt_shm *g_shm;
 static uint32_t              g_shm_last_si_seq;
+<<<<<<< HEAD
 static FILE                 *g_iq_cfile2;  /* cfile #2 FN-espace (zero-fill) -> test grgsm SACCH */
 static int                   g_iq_fd      = -1;   /* fd brut I/Q : fichier ou FIFO live */
 static int                   g_iq_is_fifo = 0;    /* 1 = FIFO -> non bloquant + drop */
 static char                  g_iq_path[256];      /* chemin memorise pour retry FIFO */
 static FILE                 *g_iq_rec;            /* record disque .cfile contigu (rejeu), EN PLUS du live */
+=======
+static FILE                 *g_iq_cfile;   /* enreg .cfile fc32 de l'I/Q d'entree */
+static FILE                 *g_iq_cfile2;  /* cfile #2 FN-espace (zero-fill) -> test grgsm SACCH */
+>>>>>>> 478b538a2567eca68c10fbd85ee0b4f31bf58341
 
 static void shunt_shm_init(void)
 {
@@ -1550,6 +1555,15 @@ static void shunt_shm_init(void)
         if (g_iq_cfile2)
             error_report("[dsp-shunt] cfile #2 FN-espace -> %s (gap zero-fill)", cf2);
     }
+    /* cfile #2 : reconstruction FN-espacee (zero-fill des trames manquantes) pour
+     * que grgsm retrouve la 51-mf et decode la SACCH (SI5/SI6). Test offline, ne
+     * touche PAS au cfile live. Active via CALYPSO_SHUNT_IQ_CFILE2=<chemin>. */
+    const char *cf2 = getenv("CALYPSO_SHUNT_IQ_CFILE2");
+    if (cf2 && *cf2) {
+        g_iq_cfile2 = fopen(cf2, "wb");
+        if (g_iq_cfile2)
+            error_report("[dsp-shunt] cfile #2 FN-espace -> %s (gap zero-fill)", cf2);
+    }
 }
 
 /* ENTREE du DSP shunte : la BSP appelle ceci avec l'I/Q DL (cs16, n int16
@@ -1610,6 +1624,26 @@ void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
         }
         if (g_iq_rec)                                  /* record disque : jamais bloquant */
             fwrite(fbuf, sizeof(float), (size_t)n, g_iq_rec);
+    }
+    /* cfile #2 FN-espace : chaque burst TS0 a sa position de trame
+     * ((fn-base)*spf int16), trames manquantes zero-fillees -> grgsm retrouve la
+     * 51-mf -> SACCH (SI5/SI6) decodable. spf = int16/trame TDMA (def 2500=1x,
+     * sweepable via CALYPSO_IQ_CFILE_SPF pour le test offline). */
+    if (g_iq_cfile2) {
+        static int spf = -1; static uint32_t base_fn = 0; static int64_t pos = 0; static int have_base = 0;
+        if (spf < 0) { const char *e = getenv("CALYPSO_IQ_CFILE_SPF"); spf = (e && *e) ? atoi(e) : 2500; }
+        if (!have_base) { base_fn = fn; pos = 0; have_base = 1; }
+        int64_t target = (int64_t)fn - (int64_t)base_fn;
+        if (target < 0) target += 2715648;            /* hyperframe wrap */
+        target *= spf;
+        int64_t gap = target - pos;
+        if (gap < 0 || gap > (int64_t)spf * 300) { base_fn = fn; pos = 0; gap = 0; }  /* rebase si saut anormal */
+        static const float zeros[512] = {0};
+        while (gap > 0) { int c = gap > 512 ? 512 : (int)gap; fwrite(zeros, sizeof(float), (size_t)c, g_iq_cfile2); pos += c; gap -= c; }
+        float fbuf2[SHM_IQ_LEN];
+        for (int i = 0; i < n; i++) fbuf2[i] = (float)iq[i] / 32768.0f;
+        fwrite(fbuf2, sizeof(float), (size_t)n, g_iq_cfile2);
+        pos += n;
     }
     /* cfile #2 FN-espace : chaque burst TS0 a sa position de trame
      * ((fn-base)*spf int16), trames manquantes zero-fillees -> grgsm retrouve la
