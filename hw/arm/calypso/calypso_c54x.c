@@ -2402,6 +2402,30 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
 
 static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
 {
+    /* SONDE GAP-1 : transitions du pointeur de handler data[0x3f5e] (machine à
+     * états L1) + cellules de contrôle API 0x0908/0x0909 au même instant. Montre
+     * si le scheduler avance l'état ou reste figé sur 0x7013 (FB), et d'où (PC). */
+    if (addr == 0x3f5e) {
+        static unsigned stwr = 0;
+        if (stwr++ < 80)
+            fprintf(stderr, "[c54x] STATE-WR data[0x3f5e] 0x%04x -> 0x%04x PC=0x%04x "
+                    "api[0x908]=0x%04x api[0x909]=0x%04x api[0x945]=0x%04x insn=%u\n",
+                    s->data[0x3f5e], val, s->pc, s->data[0x0908], s->data[0x0909],
+                    s->data[0x0945], s->insn_count);
+    }
+
+    /* SONDE GAP-1 : qui ECRIT data[0x0c36] (le pointeur de TACHE CALA'd a 0xb3a5,
+     * nul -> derail) ? Catch des writes DSP (y compris indirect via AR). */
+    if (addr == 0x0c36) {
+        static unsigned tw = 0;
+        if (tw++ < 60)
+            fprintf(stderr, "[c54x] TASKPTR-WR data[0x0c36] 0x%04x -> 0x%04x PC=0x%04x "
+                    "XPC=%u AR[0..7]=%04x,%04x,%04x,%04x,%04x,%04x,%04x,%04x insn=%u\n",
+                    s->data[0x0c36], val, s->pc, s->xpc,
+                    s->ar[0], s->ar[1], s->ar[2], s->ar[3],
+                    s->ar[4], s->ar[5], s->ar[6], s->ar[7], s->insn_count);
+    }
+
     /* === NDB-CTL-WR : trace ARM-side writes to NDB control flags in
      * [data[0x08F8]..data[0x0900]] = d_fb_det, d_fb_mode, a_sync_demod[],
      * d_sb_ext, etc. The firmware writes mode flags before scheduling
@@ -11491,6 +11515,66 @@ int c54x_run(C54xState *s, int n_insns)
             g_prev_op = s_last_run_op;
             s_last_run_pc = s->pc;
             s_last_run_op = exec_op;
+        }
+
+        /* SONDE post-bootstub-ret (GAP-1) : prologue @0x7013 (pshm contexte) et
+         * epilogue @0x7020 (popm ar1/st0/st1/pmst; ret). Si l'epilogue depile un
+         * contexte/retPC stale (pas de prologue/IT correspondant) -> desync pile
+         * post-bacc. retPC = data[SP+4] (apres les 4 popm). */
+        if (exec_pc == 0x7013) {
+            static unsigned pbp = 0;
+            if (pbp++ < 40)
+                fprintf(stderr, "[c54x] PBPRO #%u from=0x%04x SP=0x%04x insn=%u\n",
+                        pbp, g_prev_pc, s->sp, s->insn_count);
+        }
+        if (exec_pc == 0x7020) {
+            static unsigned pbr = 0;
+            if (pbr++ < 40)
+                fprintf(stderr, "[c54x] PBRET #%u from=0x%04x SP=0x%04x pop[ar1=0x%04x "
+                        "st0=0x%04x st1=0x%04x pmst=0x%04x retPC=0x%04x] insn=%u\n",
+                        pbr, g_prev_pc, s->sp,
+                        s->data[s->sp], s->data[(uint16_t)(s->sp+1)],
+                        s->data[(uint16_t)(s->sp+2)], s->data[(uint16_t)(s->sp+3)],
+                        s->data[(uint16_t)(s->sp+4)], s->insn_count);
+        }
+
+        /* SONDE GAP-1 DERAIL-ZERO : entrée dans la zone 0x0000-0x0008 = le CALA
+         * vers un pointeur de fonction NUL (slot dispatcher SARAM = 0). Logge le
+         * site du CALA (g_prev_pc), les accumulateurs (le 0), et les 4 mots ROM
+         * AVANT le CALA (= le `ld *(slot),b` -> l'adresse du slot nul a decoder). */
+        if (exec_pc <= 0x0008 && g_prev_pc > 0x0008) {
+            static unsigned dz = 0;
+            if (dz++ < 60) {
+                uint16_t p4 = prog_fetch(s, (uint16_t)(g_prev_pc - 4));
+                uint16_t p3 = prog_fetch(s, (uint16_t)(g_prev_pc - 3));
+                uint16_t p2 = prog_fetch(s, (uint16_t)(g_prev_pc - 2));
+                uint16_t p1 = prog_fetch(s, (uint16_t)(g_prev_pc - 1));
+                fprintf(stderr, "[c54x] DERAIL-ZERO #%u PC=0x%04x from=0x%04x op=0x%04x "
+                        "A=0x%010llx B=0x%010llx SP=0x%04x prevwords=[%04x %04x %04x %04x] "
+                        "insn=%u\n",
+                        dz, exec_pc, g_prev_pc, g_prev_op,
+                        (unsigned long long)(s->a & 0xFFFFFFFFFFULL),
+                        (unsigned long long)(s->b & 0xFFFFFFFFFFULL), s->sp,
+                        p4, p3, p2, p1, s->insn_count);
+            }
+        }
+
+        /* SONDE GAP-1 DERAIL-ORIGIN : premiere entree dans la zone table garbage
+         * 0xf090-0xf0a0 depuis l'EXTERIEUR = le saut/chute qui deraille. Logge
+         * d'ou (g_prev_pc), l'opcode, les ARs (deja garbage ou non), le SP. */
+        if (exec_pc >= 0xf000 && exec_pc <= 0xf0ff
+            && (g_prev_pc < 0xf000 || g_prev_pc > 0xf0ff)) {
+            static unsigned dor = 0;
+            if (dor++ < 60) {
+                uint16_t q2 = prog_fetch(s, (uint16_t)(g_prev_pc - 2));
+                uint16_t q1 = prog_fetch(s, (uint16_t)(g_prev_pc - 1));
+                fprintf(stderr, "[c54x] DERAIL-ORIGIN #%u into=0x%04x from=0x%04x op=0x%04x "
+                        "prev=[%04x %04x] AR[2,3,4,5]=%04x,%04x,%04x,%04x SP=0x%04x XPC=%u "
+                        "insn=%u\n",
+                        dor, exec_pc, g_prev_pc, g_prev_op, q2, q1,
+                        s->ar[2], s->ar[3], s->ar[4], s->ar[5], s->sp, s->xpc,
+                        s->insn_count);
+            }
         }
         /* SURGICAL : capture silencieuse du slot LUT lu au 0x834d (LD
          * (DP<<7|0x07)<<1,A). 1 compare/insn, pas de log → ~zéro impact

@@ -24,4 +24,8 @@ int calypso_l1_c_active(void);
  * fn        = current TDMA frame number. */
 void calypso_layer1_tick(C54xState *dsp, uint16_t *dsp_ram, uint32_t fn);
 
+/* Latch the ARM's d_task_md write (called from calypso_dsp_write). The tick-time
+ * poll misses the transient task=5; this captures it at write time. */
+void calypso_layer1_on_task_write(uint16_t md);
+
 #endif /* CALYPSO_LAYER1_H */

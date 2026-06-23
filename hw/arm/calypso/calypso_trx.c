@@ -479,6 +479,16 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
     CalypsoTRX *s = opaque;
     if (offset >= CALYPSO_DSP_SIZE) return;
 
+    /* SONDE GAP-1 : l'ARM écrit-il data[0x0c36] (= ARM byte 0x86c), le pointeur
+     * de tâche que le DSP CALA à 0xb3a5 et qui est nul → derail ? */
+    if (offset == 0x086c && size == 2) {
+        static unsigned atw = 0;
+        if (atw < 40) { atw++;
+            fprintf(stderr, "[trx] TASKPTR-WR-ARM off=0x086c val=0x%04x fn=%u "
+                    "(-> data[0x0c36])\n", (unsigned)(value & 0xFFFF), s->fn);
+        }
+    }
+
     /* === HS-ARM-WR : boot-handshake write discriminator (reg_mode==c54x) ===
      * insn 10-11 proved one full command transits end-to-end; the suspect is that
      * the firmware never RE-ARMS command #2 after the DSP republishes IDLE. This
@@ -598,6 +608,11 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
      * devrait fire — mais on voit count=0 → contradiction à investiguer.
      * Gated par CALYPSO_DEBUG=D_TASK_MD_ALL. */
     if ((offset == 0x0008 || offset == 0x0030) && size == 2) {
+        /* Latch d_task_md pour calypso_layer1.c (CALYPSO_L1=c) : le poll tick-time
+         * rate le transient task=5, on le capture ici au write-time. */
+        if (calypso_l1_c_active()) {
+            calypso_layer1_on_task_write((uint16_t)value);
+        }
         if (calypso_debug_enabled("D_TASK_MD_ALL")) {
             static unsigned dtm_log = 0;
             if (dtm_log < 30 || (dtm_log % 100) == 0) {
@@ -1105,8 +1120,8 @@ static void calypso_tpu_write(void *o, hwaddr off, uint64_t val, unsigned sz) {
     CalypsoTRX *s=o; if (off/2<CALYPSO_TPU_SIZE/2) s->tpu_regs[off/2]=val;
     if (off==TPU_CTRL) {
         static int tpu_log = 0;
-        if (++tpu_log <= 50)
-            TRX_LOG("TPU_CTRL WR val=0x%04x (EN=%d DSP_EN=%d) fn=%u",
+        if (++tpu_log <= 50)   /* fprintf inconditionnel (GAP-1 ÉTAPE 0 : tracer si l'ARM arme le TPU) */
+            fprintf(stderr, "[trx] TPU_CTRL WR val=0x%04x (EN=%d DSP_EN=%d) fn=%u\n",
                     (unsigned)val, !!(val&TPU_CTRL_EN), !!(val&TPU_CTRL_DSP_EN), s->fn);
     }
     if (off==TPU_CTRL && (val&TPU_CTRL_EN)) {
@@ -1119,8 +1134,8 @@ static void calypso_tpu_write(void *o, hwaddr off, uint64_t val, unsigned sz) {
     }
     if (off==TPU_INT_CTRL) {
         static int ictrl_log = 0;
-        if (++ictrl_log <= 30)
-            TRX_LOG("INT_CTRL WR val=0x%02x (MCU_FRAME=%d DSP_FRAME=%d DSP_FORCE=%d) fn=%u",
+        if (++ictrl_log <= 30)   /* fprintf inconditionnel (GAP-1 ÉTAPE 0 : DSP_FRAME armé ?) */
+            fprintf(stderr, "[trx] INT_CTRL WR val=0x%02x (MCU_FRAME=%d DSP_FRAME=%d DSP_FORCE=%d) fn=%u\n",
                     (unsigned)val,
                     !!(val&ICTRL_MCU_FRAME), !!(val&ICTRL_DSP_FRAME),
                     !!(val&ICTRL_DSP_FRAME_FORCE), s->fn);
@@ -1423,8 +1438,27 @@ static void calypso_tdma_tick(void *opaque) {
 
         bool tpu_armed = !(s->tpu_regs[TPU_INT_CTRL/2] & ICTRL_DSP_FRAME);
         bool imr_armed = !!(s->dsp->imr & (1 << C54X_INT_FRAME_BIT));
-        bool periodic_armed = tpu_armed && imr_armed;
+        /* GAP-1 FIX FAITHFUL (2026-06-23) : l'IT trame DSP est une LIGNE INT3
+         * CÂBLÉE pilotée par le TPU — elle n'est PAS gatée par l'IMR du DSP en
+         * amont. L'ancien `&& imr_armed` (ajout empirique, cf 1419-1423) inversait
+         * la causalité silicium et créait un VERROU CIRCULAIRE : le DSP a besoin de
+         * recevoir l'IT pour atteindre son code d'armement IMR (ROM 0x702b
+         * `OR #0x001d,IMR`), mais l'IT était gatée sur IMR déjà armé → prouvé au
+         * runtime (tpu_armed=1, imr_armed=0, fire=0 à jamais). On délivre l'IT dès
+         * que le TPU l'arme ; c'est le c54x (IMR/INTM dans c54x_interrupt_ex, déjà
+         * fidèle SPRU131) qui décide de vectoriser ou juste sortir d'IDLE. Firmware
+         * INCHANGÉ. `imr_armed` conservé pour la sonde FRAME-GATE seulement. */
+        bool periodic_armed = tpu_armed;
+        (void)imr_armed;
         bool force_pulse    = !!(s->tpu_regs[TPU_CTRL/2] & TPU_CTRL_DSP_EN);
+        /* GAP-1 ÉTAPE 0 : état du gate au runtime (le verrou circulaire tpu_armed
+         * && imr_armed). Montre si l'IT trame est bloquée par imr_armed seul. */
+        { static unsigned gate_log = 0;
+          if (gate_log < 50) { gate_log++;
+            fprintf(stderr, "[trx] FRAME-GATE tpu_armed=%d imr_armed=%d(IMR=0x%04x) "
+                    "force=%d -> fire=%d fn=%u\n",
+                    tpu_armed, imr_armed, (unsigned)s->dsp->imr,
+                    force_pulse, (periodic_armed||force_pulse), s->fn); } }
         if (periodic_armed || force_pulse) {
             c54x_interrupt_ex(s->dsp, C54X_INT_FRAME_VEC, C54X_INT_FRAME_BIT);
             if (force_pulse)
