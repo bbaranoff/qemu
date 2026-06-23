@@ -7332,6 +7332,37 @@ static int c54x_exec_one(C54xState *s)
          * STL mis-décodé compensait. Critère de ré-application : fixer d'abord le
          * deadlock 0xee38 (AR3 hors-buffer) — passe séparée. Voir
          * project_state_20260602 mémoire. */
+        /* === PORTR 0x74 / PORTW 0x75 — longueur 3 mots si Smem absolu (revival
+         * c54x, 2026-06-23). tic54x-opc.c : portr {2,2,2,0x7400,0xFF00,
+         * {OP_PA,OP_Smem}} ; portw {2,2,2,0x7500,0xFF00,{OP_Smem,OP_PA}}.
+         * Base = 2 mots (opcode + PA) ; +1 mot quand le Smem utilise l'adressage
+         * absolu/long (binutils get_insn_size = words + has_lkaddr). Le catch-all
+         * générique `(op & 0xF800)==0x7000` ci-dessous les avalait en STL 1-mot
+         * (+lk) → perdait le mot PA → glissement d'alignement d'1 mot. Symptôme
+         * prouvé (oracle binutils-2.21.1) : PROM0 0xb416 `portw *(0x000e),0xf900`
+         * mal-dimensionné 2 mots → son PA 0xf900 relu comme un CC fantôme @0xb418
+         * → entrée nue dans l'épilogue 0x76f8 (POPM ST1 sans PSHM ST1) → sur-pop
+         * SP → collapse → d_fb_det=0. 128 `75f8` + 25 `74f8` dans le firmware.
+         * resolve_smem lit l'adresse Smem abs @pc+1 (pose lk_used) ; le PA suit
+         * @pc+1+lk_used — même convention que CMPM/BITF ci-dessous.
+         * NB : sémantique I/O réelle (PORTW: Smem→port PA ; PORTR: port PA→Smem,
+         * lien I/Q bsp_buf) = passe séparée ; ici on corrige d'abord la LONGUEUR
+         * (le 1er domino, falsifiable). */
+        if ((op & 0xFF00) == 0x7500) {        /* PORTW Smem, PA */
+            addr = resolve_smem(s, op, &ind); /* applique le post-modify AR, pose lk_used si abs */
+            uint16_t pa = prog_fetch(s, s->pc + 1 + (s->lk_used ? 1 : 0));
+            (void)pa; (void)addr;             /* écriture port externe : non modélisée (TODO sémantique) */
+            consumed = 2;                     /* opcode + PA */
+            return consumed + s->lk_used;
+        }
+        if ((op & 0xFF00) == 0x7400) {        /* PORTR PA, Smem */
+            addr = resolve_smem(s, op, &ind);
+            uint16_t pa = prog_fetch(s, s->pc + 1 + (s->lk_used ? 1 : 0));
+            (void)pa; (void)addr;             /* lecture port externe : non modélisée (TODO I/Q bsp_buf) */
+            consumed = 2;
+            return consumed + s->lk_used;
+        }
+
         /* LD / ST operations */
         if ((op & 0xF800) == 0x7000) {
             /* 70xx: STL src, Smem */
@@ -7736,11 +7767,27 @@ static int c54x_exec_one(C54xState *s)
     }
 
     case 0x3:
-        /* 3xxx: MAC / MAS */
+        /* 3xxx: MAC / MAS — mais d'ABORD SQURA (§4-A, fix 2026-06-23). */
         addr = resolve_smem(s, op, &ind);
         {
-            int dst = (op >> 8) & 1;
             uint16_t val = data_read(s, addr);
+            /* SQURA Smem, src (0x38/0x39, mask 0xFE00) : src = src + Smem*Smem.
+             * Per tic54x_hi8_map.md l.46 (0x3800/0xFE00, bit8=src A=0x38/B=0x39).
+             * Le case 0x3 « blind-MAC » exécutait SQURA comme `acc += T*Smem` →
+             * énergie (somme de carrés) calculée avec le mauvais opérande/signe →
+             * A reste ≤0 à PROM0 0x76ff/0x7700 → RCD LEQ@0x75e8 prend la sortie
+             * anticipée → saute le corps qui pousse ST1 → POPM ST1@0x7706 sur-pope
+             * (1er pop orphelin insn 146) → DP=0x124 → handler garbage → SP collapse.
+             * SQURA accumule un CARRÉ (contribution ≥0) → A>0 → RCD ne prend pas. */
+            if ((op & 0xFE00) == 0x3800) {
+                int64_t sq = (int64_t)(int16_t)val * (int64_t)(int16_t)val;
+                if (s->st1 & ST1_FRCT) sq <<= 1;
+                int sdst = (op >> 8) & 1;
+                if (sdst) s->b = sext40(s->b + sq);
+                else      s->a = sext40(s->a + sq);
+                return consumed + s->lk_used;
+            }
+            int dst = (op >> 8) & 1;
             int64_t product = (int64_t)(int16_t)s->t * (int64_t)(int16_t)val;
             if (s->st1 & ST1_FRCT) product <<= 1;
             if (dst) s->b = sext40(s->b + product);
@@ -10519,6 +10566,12 @@ int c54x_run(C54xState *s, int n_insns)
                 s->sp--;
                 data_write(s, s->sp, s->xpc);
                 s->st1 |= ST1_INTM;
+                /* corrélation IRQ (revival dsp 2026-06-23) : ce site de replay
+                 * in-loop posait g_last_intr_* nulle part → les sondes
+                 * HIGHVEC/DISP rataient les IT rejouées. On les pose ICI aussi,
+                 * fg_pc capturé AVANT que s->pc soit écrasé par le vecteur. */
+                g_last_intr_insn = s->insn_count; g_last_intr_vec = vec;
+                g_last_intr_fg_pc = (uint16_t)s->pc; g_last_intr_fg_dp = dp(s);
                 s->xpc = 0;
                 uint16_t iptr = (s->pmst >> PMST_IPTR_SHIFT) & 0x1FF;
                 s->pc = (iptr * 0x80) + vec * 4;
@@ -11475,6 +11528,75 @@ int c54x_run(C54xState *s, int n_insns)
                         (unsigned long long)(s->a & 0xFFFFFFFFFFULL), s->sp, s->insn_count);
             }
             fe_was_in = fe_in;
+        }
+        /* HIGHVEC-ENTRY probe (RO, revival dsp 2026-06-23) : entrée dans la PAGE
+         * VECTEUR IPTR=0x1FF [0xFF80..0xFFFF] = là où l'IRQ atterrit (vec19=0xffcc,
+         * vec21=0xffd4). LA question décisive (fusion §2 vs bugs séparés) :
+         * le contrôle entre-t-il via DISPATCH D'INTERRUPTION (prev = foreground
+         * préempté, d_irq~0) ou via un BRANCH/CALL firmware (prev = un opcode de
+         * branche ciblant ici, d_irq grand) ? Un dump, deux mondes. Épingle aussi
+         * le RÉGIME (ARs, A, B) au point d'entrée. Strictement RO. */
+        {
+            static int hv_was_in = 0;
+            static unsigned hv_n = 0;
+            int hv_in = (exec_pc >= 0xff80);
+            if (hv_in && !hv_was_in && hv_n < 24) {
+                hv_n++;
+                uint16_t hv_iptr = (s->pmst >> PMST_IPTR_SHIFT) & 0x1FF;
+                uint64_t d_irq = (uint64_t)s->insn_count - g_last_intr_insn;
+                int irq_driven = (d_irq <= 2 && g_last_intr_vec >= 0);
+                fprintf(stderr, "[c54x] HIGHVEC-ENTRY #%u entered 0x%04x prev_PC=0x%04x "
+                        "prev_op=0x%04x | %s d_irq=%llu lastvec=%d fg_pc=0x%04x | "
+                        "IPTR=0x%03x INTM=%d SP=0x%04x | AR3=0x%04x AR4=0x%04x AR5=0x%04x "
+                        "A=0x%010llx B=0x%010llx insn=%u\n",
+                        hv_n, exec_pc, s->last_exec_pc, s->last_exec_op,
+                        irq_driven ? "IRQ-DISPATCH" : "FW-BRANCH",
+                        (unsigned long long)d_irq, g_last_intr_vec, g_last_intr_fg_pc,
+                        hv_iptr, !!(s->st1 & ST1_INTM), s->sp,
+                        s->ar[3], s->ar[4], s->ar[5],
+                        (unsigned long long)(s->a & 0xFFFFFFFFFFULL),
+                        (unsigned long long)(s->b & 0xFFFFFFFFFFULL), s->insn_count);
+            }
+            hv_was_in = hv_in;
+        }
+        /* REGIME-PIN probe (RO, revival dsp 2026-06-23) : épingle SANS AMBIGUÏTÉ le
+         * régime du run COURANT. Les vieux logs disent AR5=0x80/AR3=0x000b ; ce soir
+         * AR3=AR4=0x2ace figés dans le buffer I/Q. Deux régimes = deux fantômes ;
+         * on en debugge UN. Dump complet du fichier registre à la 1ère + 10000e +
+         * 1Me visite du spin foreground [0x82c0..0x82f0] (la boucle IQ-READ gelée). */
+        if (exec_pc >= 0x82c0 && exec_pc <= 0x82f0) {
+            static unsigned rp_n = 0;
+            rp_n++;
+            if (rp_n == 1 || rp_n == 10000 || rp_n == 1000000) {
+                uint16_t rp_iptr = (s->pmst >> PMST_IPTR_SHIFT) & 0x1FF;
+                fprintf(stderr, "[c54x] REGIME-PIN #%u @0x%04x | "
+                        "AR0=%04x AR1=%04x AR2=%04x AR3=%04x AR4=%04x AR5=%04x AR6=%04x AR7=%04x | "
+                        "A=0x%010llx B=0x%010llx T=0x%04x | SP=0x%04x ST0=0x%04x ST1=0x%04x "
+                        "PMST=0x%04x IPTR=0x%03x INTM=%d insn=%u\n",
+                        rp_n, exec_pc,
+                        s->ar[0], s->ar[1], s->ar[2], s->ar[3], s->ar[4], s->ar[5], s->ar[6], s->ar[7],
+                        (unsigned long long)(s->a & 0xFFFFFFFFFFULL),
+                        (unsigned long long)(s->b & 0xFFFFFFFFFFULL), s->t,
+                        s->sp, s->st0, s->st1, s->pmst, rp_iptr,
+                        !!(s->st1 & ST1_INTM), s->insn_count);
+            }
+        }
+        /* SQURA-A probe (RO, revival dsp 2026-06-23) : voir A basculer >0 avec le
+         * fix SQURA. Logue A aux 2 SQURA (0x76ff/0x7700) + à la décision RCD
+         * LEQ@0x75e8 (prend si A<=0). Avec le blind-MAC A restait <=0 (RCD prend,
+         * over-pop) ; avec SQURA A doit devenir >0 (RCD ne prend pas). */
+        if (exec_pc == 0x76ff || exec_pc == 0x7700 || exec_pc == 0x75e8) {
+            static unsigned sqa_n = 0;
+            if (sqa_n < 30) {
+                sqa_n++;
+                int64_t av = (s->a & 0x8000000000ULL) ? (s->a | ~0xFFFFFFFFFFLL) : (s->a & 0xFFFFFFFFFFLL);
+                fprintf(stderr, "[c54x] SQURA-A pc=0x%04x op=0x%04x A=0x%010llx (signed=%lld) "
+                        "T=0x%04x AR2=0x%04x %sinsn=%u\n",
+                        exec_pc, exec_op, (unsigned long long)(s->a & 0xFFFFFFFFFFULL),
+                        (long long)av, s->t, s->ar[2],
+                        (exec_pc == 0x75e8) ? (av <= 0 ? "RCD-PREND(A<=0) " : "RCD-passe(A>0) ") : "",
+                        s->insn_count);
+            }
         }
         /* DISP-A probe (RO, revival dsp 2026-06-22) : évolution de A à travers le
          * dispatcher 0x80b0-0x80c9 → quel LD pose A=0xfe36 (le handler garbage du
@@ -12669,6 +12791,8 @@ void c54x_reset(C54xState *s)
             "L3609-src-dst=FIXED F-AUDIT-v5=max-min-cmpl-rnd-roltc-fixed "
             "F2xx-ALU-block=ADDED-2026-05-25-night "
             "F3xx-INTR-mis-REMOVED-ADD-SUB-LD-ADDED "
+            "PROBE-HIGHVEC-REGIME=2026-06-23 "
+            "SQURA-0x38-FIX=2026-06-23 "
             "2026-05-25");
 
 }
