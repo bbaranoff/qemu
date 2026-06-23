@@ -2437,6 +2437,29 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
                     (unsigned long long)(s->a & 0xFFFFFFFFFFULL), s->xpc, s->insn_count);
     }
 
+    /* SONDE Phase B DISPVAL-WR : qui ECRIT la valeur 0xf074 (= base LUT, la
+     * cible de bacc fautive) dans la table de dispatch 0x4300-0x43ff ? Nomme
+     * le planteur du pointeur de handler corrompu. Cap 60. */
+    if (val == 0xf074 && addr >= 0x4300 && addr < 0x4400) {
+        static unsigned dvw = 0;
+        if (dvw++ < 60)
+            fprintf(stderr, "[c54x] DISPVAL-WR data[0x%04x] <- 0xf074 PC=0x%04x "
+                    "A=0x%010llx XPC=%u insn=%u\n",
+                    addr, s->pc,
+                    (unsigned long long)(s->a & 0xFFFFFFFFFFULL), s->xpc, s->insn_count);
+    }
+
+    /* SONDE Phase B SEED-WR : qui ecrit la base de pile data[0x5ac8..0x5acc] =
+     * l'adresse de retour que le RET du handler no-op (0xab38) depile ? Si
+     * jamais ecrit (que le memset 0x88 en dessous) -> seed retour-scheduler
+     * jamais pose -> idle-path correct mais init manquante (#2). Cap 40. */
+    if (addr >= 0x5ac8 && addr <= 0x5acc) {
+        static unsigned sw = 0;
+        if (sw++ < 40)
+            fprintf(stderr, "[c54x] SEED-WR data[0x%04x] <- 0x%04x PC=0x%04x insn=%u\n",
+                    addr, val, s->pc, s->insn_count);
+    }
+
     /* === NDB-CTL-WR : trace ARM-side writes to NDB control flags in
      * [data[0x08F8]..data[0x0900]] = d_fb_det, d_fb_mode, a_sync_demod[],
      * d_sb_ext, etc. The firmware writes mode flags before scheduling
@@ -5785,7 +5808,7 @@ static int c54x_exec_one(C54xState *s)
                 op2 = prog_fetch(s, s->pc + 1);
                 consumed = 2;
                 s->rpt_count = op2;
-                s->rpt_active = true;
+                s->rpt_active = true; s->rpt_fresh = true;
                 s->pc += 2;
                 return 0;
             }
@@ -5796,7 +5819,7 @@ static int c54x_exec_one(C54xState *s)
                 int dst = (op >> 8) & 1; /* bit 8 via FEFF mask */
                 if (dst) s->b = 0; else s->a = 0;
                 s->rpt_count = op2;
-                s->rpt_active = true;
+                s->rpt_active = true; s->rpt_fresh = true;
                 s->pc += 2;
                 return 0;
             }
@@ -6266,7 +6289,7 @@ static int c54x_exec_one(C54xState *s)
             /* Fallback: RPT Smem (F8xx sub not handled above) */
             addr = resolve_smem(s, op, &ind);
             s->rpt_count = data_read(s, addr);
-            s->rpt_active = true;
+            s->rpt_active = true; s->rpt_fresh = true;
             s->pc += consumed;
             return 0;
         }
@@ -6641,7 +6664,7 @@ static int c54x_exec_one(C54xState *s)
              * their F4 counterparts, so they never reach this F5xx block. */
             /* RPT #k (short immediate) — kept as fallback, must advance PC. */
             s->rpt_count = op & 0xFF;
-            s->rpt_active = true;
+            s->rpt_active = true; s->rpt_fresh = true;
             s->pc += 1;
             return 0;
         }
@@ -7081,7 +7104,7 @@ static int c54x_exec_one(C54xState *s)
              * Must advance PC past RPT now and return 0 so the dispatcher
              * re-executes the NEXT instruction (not RPT itself). */
             s->rpt_count = op & 0xFF;
-            s->rpt_active = true;
+            s->rpt_active = true; s->rpt_fresh = true;
             s->pc += 1;
             return 0;
         }
@@ -7185,7 +7208,7 @@ static int c54x_exec_one(C54xState *s)
             int rptz_dst = (op >> 0) & 1;
             if (rptz_dst) s->b = 0; else s->a = 0;
             s->rpt_count = op2;
-            s->rpt_active = true;
+            s->rpt_active = true; s->rpt_fresh = true;
             s->pc += 2;
             return 0;
         }
@@ -7282,7 +7305,18 @@ static int c54x_exec_one(C54xState *s)
          * did not move the symptom — reverted to canonical semantics. */
         if (hi8 == 0x7E) {
             addr = resolve_smem(s, op, &ind);
-            uint16_t psrc = s->rpt_active ? s->mvpd_src : (uint16_t)(s->a & 0xFFFF);
+            /* GAP-1/Phase B fix (2026-06-24) : sous RPT, la 1ere iteration part
+             * de A_low (base source), PAS du mvpd_src stale d'un READA precedent.
+             * Sans ca, `RPT #N ; READA *ARx+` copiait depuis la mauvaise zone ROM
+             * -> table de dispatch (0x4380+) remplie de garbage (0xf074) -> bacc
+             * vers la LUT au lieu du vrai handler FB (0xab38). */
+            uint16_t psrc;
+            if (!s->rpt_active || s->rpt_fresh) {
+                psrc = (uint16_t)(s->a & 0xFFFF);
+                s->rpt_fresh = false;
+            } else {
+                psrc = s->mvpd_src;
+            }
             uint16_t v = prog_read(s, psrc);
             data_write(s, addr, v);
             s->mvpd_src = psrc + 1;
@@ -7982,7 +8016,7 @@ static int c54x_exec_one(C54xState *s)
                 addr = resolve_smem(s, op, &ind);
                 uint16_t val = data_read(s, addr);
                 s->brc = val;
-                s->rpt_active = (val != 0);
+                s->rpt_active = (val != 0); s->rpt_fresh = (val != 0);
                 return consumed + s->lk_used;
             }
             if (op8 == 0x48 || op8 == 0x49) {
@@ -9140,7 +9174,7 @@ ba_handler:
             } else {
                 /* RPT Smem */
                 s->rpt_count = data_read(s, addr);
-                s->rpt_active = true;
+                s->rpt_active = true; s->rpt_fresh = true;
                 s->pc += consumed;
                 return 0;
             }
@@ -11625,6 +11659,76 @@ int c54x_run(C54xState *s, int n_insns)
                         s_b3d1, s->ar[0], s->ar[3], s->bk, (s->st0 & 0x1FF),
                         s->st1, (unsigned long long)(s->a & 0xFFFFFFFFFFULL),
                         s->data[ea], s->sp, s->insn_count);
+            }
+        }
+
+        /* === SONDE DETECTOR-TRACE (Phase B, 2026-06-23) ===================
+         * Trace instruction-par-instruction du detecteur FB / correlateur dans
+         * [0xf074..0xf0c0]. La region 0xf070-0xf0b0 EST une table sigmoide en
+         * XPC=0 (dump ROM) ; l'execution reelle est dans une AUTRE banque XPC.
+         * exec_op = prog_fetch(s->pc) respecte la banque -> on voit le VRAI
+         * opcode. On logge PC + XPC (= quelle banque) + op + A/B/T (le math de
+         * correlation : sample*coeff accumule). Si A/B restent 0 -> le math ne
+         * produit rien (opcode mal emule / sample non lu). Si A/B montent mais
+         * d_fb_det reste 0 -> bug de seuil/decision (croiser avec
+         * CALYPSO_FBDET_SENTINEL=2 qui monitore les writes a 0x08f8).
+         * Env CALYPSO_DETTRACE=1, cap 800. */
+        {
+            static int dettr_on = -1;
+            if (dettr_on < 0) dettr_on = getenv("CALYPSO_DETTRACE") ? 1 : 0;
+            if (dettr_on && exec_pc >= 0xf074 && exec_pc <= 0xf0c0) {
+                static unsigned dettr_n = 0;
+                if (dettr_n < 800) {
+                    dettr_n++;
+                    fprintf(stderr, "[c54x] DETTRACE #%u PC=0x%04x XPC=%u op=0x%04x "
+                            "A=0x%010llx B=0x%010llx T=0x%04x AR2=%04x AR3=%04x "
+                            "AR5=%04x insn=%u\n",
+                            dettr_n, exec_pc, s->xpc, exec_op,
+                            (unsigned long long)(s->a & 0xFFFFFFFFFFULL),
+                            (unsigned long long)(s->b & 0xFFFFFFFFFFULL),
+                            s->t, s->ar[2], s->ar[3], s->ar[5], s->insn_count);
+                    if (dettr_n == 800)
+                        fprintf(stderr, "[c54x] DETTRACE capped at 800\n");
+                }
+            }
+        }
+
+        /* SONDE Phase B BACC-IN : au bacc dispatch (0xb40f) et au LD *AR7,A
+         * (0xb40e) qui le precede, capture A + AR7 + data[AR7] = la source du
+         * pointeur 0xf074. Dit si le slot lu (data[AR7]) vaut deja 0xf074
+         * (pointeur faux) ou si A est corrompu autrement. Cap 40. */
+        if (exec_pc == 0xb40f) {   /* BACC A = dispatch handler */
+            uint16_t handler = (uint16_t)(s->a & 0xFFFF);
+            static uint16_t seen[96]; static unsigned nseen = 0;
+            bool dup = false;
+            for (unsigned i = 0; i < nseen; i++)
+                if (seen[i] == handler) { dup = true; break; }
+            if (!dup && nseen < 96) {
+                seen[nseen++] = handler;
+                fprintf(stderr, "[c54x] BACC-DISP #%u handler=0x%04x AR7=0x%04x %sXPC=%u insn=%u\n",
+                        nseen, handler, s->ar[7],
+                        (handler == 0xab38) ? "(RET/noop) " : "<<REAL>> ",
+                        s->xpc, s->insn_count);
+            }
+        }
+
+        /* SONDE Phase B DISP-ENTRY (trisection 2026-06-24) : trace one-shot
+         * l'entree du dispatcher [0xb400..0xb40f] -> comment AR7 obtient sa
+         * valeur (immediat litteral vs registre d'index/evenement gele), le
+         * reset SP delibere (0xb403), et la pile au bacc. AR3/AR4 inclus (test
+         * "AR7 derive d'un registre gele"). Cap 64. */
+        if (exec_pc >= 0xb400 && exec_pc <= 0xb40f) {
+            static unsigned de = 0;
+            if (de < 64) {
+                de++;
+                fprintf(stderr, "[c54x] DISP-ENTRY PC=0x%04x op=0x%04x A=0x%06llx "
+                        "AR7=%04x AR0=%04x AR2=%04x AR3=%04x AR4=%04x SP=%04x "
+                        "stk[SP-1,SP,SP+1]=%04x,%04x,%04x insn=%u\n",
+                        exec_pc, exec_op,
+                        (unsigned long long)(s->a & 0xFFFFFF),
+                        s->ar[7], s->ar[0], s->ar[2], s->ar[3], s->ar[4], s->sp,
+                        s->data[(uint16_t)(s->sp-1)], s->data[s->sp],
+                        s->data[(uint16_t)(s->sp+1)], s->insn_count);
             }
         }
 
