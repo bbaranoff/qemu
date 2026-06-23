@@ -559,6 +559,28 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
          * dsp_ram-only path which is fine for the sub-word case. */
     }
 
+    /* === CO-RUN-on-WRITE (fix scheduling, symétrique du co-run lecture) — 2026-06-23 ===
+     * Le firmware écrit cmd 2 (COPY_BLOCK) dans BL_CMD_STATUS (ARM 0x0ffe = DSP word
+     * 0x0fff) APRÈS avoir posé BL_ADDR=0x7000 (0x0ffc) et BL_SIZE=0 (0x0ffa). Mais
+     * il ne RELIT plus 0x0ffe ensuite → le co-run-lecture ne fire pas → le c54x ne
+     * tourne plus assez pour repoller → ne consomme JAMAIS cmd 2 (PC 0xb429 vu 1 seule
+     * fois, le passage garbage du boot). On force la ROM à avancer ICI, juste après le
+     * write de la commande : elle repolle 0xb424 (cmpm #2 → match), lit les VRAIS
+     * addr=0x7000/len=0 → bc bneq faux (len=0) → bacc 0x7000 → SORT du bootloader → L1.
+     * Gaté revival (SHUNT=0), seulement sur écriture d'une commande (2=COPY_BLOCK,
+     * 4=COPY_MODE), data[0x0fff] déjà à jour ci-dessus. */
+    if (offset == 0x0FFE && dsp_real_rom_mode() && s->dsp && s->dsp->running
+        && ((value & 0xFFFF) == 2 || (value & 0xFFFF) == 4)) {
+        static unsigned cmw = 0;
+        if (cmw < 40) { cmw++;
+            fprintf(stderr, "[trx] CMD-CORUN #%u cmd=0x%04x addr(0x0ffe)=0x%04x "
+                    "len(0x0ffd)=0x%04x fn=%u — running ROM to consume\n",
+                    cmw, (unsigned)(value & 0xFFFF),
+                    (unsigned)s->dsp->data[0x0ffe], (unsigned)s->dsp->data[0x0ffd], s->fn);
+        }
+        c54x_run(s->dsp, 4096);
+    }
+
     /* Debug: log task-related writes to write pages (d_task_d/u/md/ra) */
     if ((offset == 0x0000 || offset == 0x0004 || offset == 0x0008 ||
          offset == 0x000E || offset == 0x0028 || offset == 0x002C ||
@@ -830,12 +852,26 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
              * Skip if dsp-blob fixture is active: another reset would
              * re-run the PROM→DARAM auto-copy and overwrite the loaded
              * blob plus the PC override. */
-            if (s->dsp && !s->dsp->blob_loaded) {
+            if (s->dsp && !s->dsp->blob_loaded && !dsp_real_rom_mode()) {
                 c54x_reset(s->dsp);
                 s->dsp->running = true;
                 s->dsp_init_done = false;
                 s->dsp_ram[0x01A8/2] = 0;
                 TRX_LOG("C54x DSP reset — boot via TDMA ticks");
+            } else if (s->dsp && dsp_real_rom_mode()) {
+                /* === FIX collision COPY_BLOCK(2) ≡ DL_STATUS_READY(2) — 2026-06-23 ===
+                 * En revival, la valeur 2 écrite ici N'EST PAS « le DSP dit READY » :
+                 * c'est la commande bootloader BL_CMD_STATUS=2 (COPY_BLOCK) du firmware
+                 * (dsp_bl_start_at). La vraie ROM est en plein bootloader ; le co-run
+                 * (calypso_dsp_write/read) vient de lui faire consommer cmd 2 → bacc
+                 * 0x7000 → L1. Un c54x_reset ICI EFFACERAIT ce bacc (observé :
+                 * HIGHVEC-ENTRY #2 prev_PC=0xb424 juste après que le c54x lit api_ram=2).
+                 * Donc en revival : NE PAS reset — laisser la ROM bacc dans L1. */
+                static unsigned norst = 0;
+                if (norst < 10) { norst++;
+                    fprintf(stderr, "[trx] DL_STATUS=2 revival = bootloader COPY_BLOCK cmd, "
+                            "NOT resetting c54x (let it bacc) fn=%u\n", s->fn);
+                }
             } else if (s->dsp) {
                 TRX_LOG("DSP_DL_STATUS_READY received but dsp-blob mode "
                         "active — skipping reset (PC=0x%04x preserved)",
