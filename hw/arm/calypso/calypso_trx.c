@@ -20,6 +20,7 @@
 #include "hw/arm/calypso/calypso_twl3025.h"
 #include "hw/arm/calypso/calypso_sim.h"
 #include "hw/arm/calypso/calypso_fbsb.h"
+#include "hw/arm/calypso/calypso_layer1.h"   /* HLE L1 scaffold (CALYPSO_L1=c) */
 #include "chardev/char-fe.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -1564,6 +1565,17 @@ static void calypso_tdma_tick(void *opaque) {
         }
     }
     t_ul = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    /* ── 6.5 calypso_layer1.c — HLE L1 scaffold (CALYPSO_L1=c, default off) ──
+     * Modèle L1 du DSP en C, cadencé ICI : s->fn est posé, l'I/Q de la trame est
+     * déjà en data[0x2a00], et on écrit AVANT l'IRQ qui déclenche l1s_fbdet_resp
+     * côté ARM → résultats lus dans la fenêtre 1ms. Gaté strict → mock (SHUNT) et
+     * revival (vrai c54x, arc LLE/IPTR) intacts. Scaffold intermédiaire, PAS
+     * l'endgame : le revival reste le but faithful, gardé vivant derrière le gate
+     * off. ÉTAPE 0 = read-only (ratio de cohérence FCCH loggé, zéro write). */
+    if (calypso_l1_c_active() && s->dsp && s->dsp->data) {
+        calypso_layer1_tick(s->dsp, s->dsp_ram, s->fn);
+    }
 
     /* ── 7. TPU FRAME IRQ → ARM L1 scheduler ── */
     {
