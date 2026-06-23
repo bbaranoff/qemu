@@ -470,7 +470,8 @@ static uint16_t g_last_intr_fg_dp = 0;      /* DP foreground préempté */
 static uint16_t g_last_ldp_pc  = 0;         /* PC de l'instruction qui a posé DP */
 static uint16_t g_last_ldp_val = 0;         /* valeur DP posée */
 static int      g_last_ldp_kind = 0;        /* 1=LDP#k(5902) 2=LDP#k9(6262) 3=LD Smem,DP(7049) */
-static uint16_t g_prev_pc = 0;              /* PC de l'instruction exécutée juste avant */
+static uint16_t g_prev_pc = 0;
+static uint16_t g_prev_op = 0;  /* opcode insn precedente - bc TC-fiable apres cmpm/bitf (2026-06-23) */              /* PC de l'instruction exécutée juste avant */
 static uint16_t g_last_st0w_pc  = 0;        /* PC du dernier write ST0 entier (POPM ST0/STLM) */
 static uint16_t g_last_st0w_val = 0;        /* valeur ST0 restaurée */
 static uint16_t g_last_st0w_op  = 0;        /* opcode de l'instruction qui écrit ST0 */
@@ -6112,12 +6113,22 @@ static int c54x_exec_one(C54xState *s)
                 int64_t acc_signed = (s->a & 0x8000000000LL)
                                      ? (s->a | ~0xFFFFFFFFFFLL) : s->a;
                 bool take = false;
-                /* For now: cond=0x20 → branch if A != 0; cond=0x30 → A == 0.
-                 * These are heuristics until we confirm the exact cond
-                 * mapping from SPRU172C. Tweak based on observed dispatcher
-                 * behaviour. */
-                if (sub == 0x2)      take = (acc_signed != 0);
-                else /* sub==0x3 */  take = (acc_signed == 0);
+                /* FIX 2026-06-23 (deblocage bacc bootloader) : F820=bc ntc /
+                 * F830=bc tc (SPRU172C cc=0x20 NTC, 0x30 TC). L'ancienne
+                 * heuristique ACC (take=A!=0) gelait le poll @0xb427 (bc ntc
+                 * apres cmpm#2 : doit sortir sur TC=1=data==2 -> bacc 0x7000).
+                 * cmpm ET bitf posent TC correctement ; on l'utilise SEULEMENT
+                 * quand l'instruction precedente est un poseur-de-TC
+                 * (cmpm/bitf = 0x60xx/0x61xx, mask 0xFE00) - sinon heuristique
+                 * ACC heritee pour les sites dispatcher (blanket TC-strict avait
+                 * casse le 2026-05-15, avant le fix cmpm). */
+                if ((g_prev_op & 0xFE00) == 0x6000) {
+                    bool tc = (s->st0 & ST0_TC) != 0;
+                    take = (sub == 0x2) ? !tc : tc;     /* 0x2=NTC, 0x3=TC */
+                } else {
+                    if (sub == 0x2)      take = (acc_signed != 0);
+                    else /* sub==0x3 */  take = (acc_signed == 0);
+                }
                 if (take) { s->pc = op2; return 0; }
                 return consumed + s->lk_used;
             }
@@ -11475,8 +11486,11 @@ int c54x_run(C54xState *s, int n_insns)
         {
             /* DISP-ENTRY : prédécesseur = PC exécuté à l'itération précédente */
             static uint16_t s_last_run_pc = 0;
+            static uint16_t s_last_run_op = 0;
             g_prev_pc = s_last_run_pc;
+            g_prev_op = s_last_run_op;
             s_last_run_pc = s->pc;
+            s_last_run_op = exec_op;
         }
         /* SURGICAL : capture silencieuse du slot LUT lu au 0x834d (LD
          * (DP<<7|0x07)<<1,A). 1 compare/insn, pas de log → ~zéro impact
@@ -12328,8 +12342,8 @@ int c54x_run(C54xState *s, int n_insns)
         if (s->insn_count - g_sp_ledger.last_dump_insn >= 20000000u) {
             g_sp_ledger.last_dump_insn = s->insn_count;
             fprintf(stderr,
-                "[c54x] SP-LEDGER insn=%u SP=0x%04x net_words=%lld pushes=%llu pops=%llu irq=%llu\n",
-                s->insn_count, s->sp, (long long)g_sp_ledger.net_words,
+                "[c54x] SP-LEDGER insn=%u PC=0x%04x SP=0x%04x net_words=%lld pushes=%llu pops=%llu irq=%llu\n",
+                s->insn_count, s->pc, s->sp, (long long)g_sp_ledger.net_words,
                 (unsigned long long)g_sp_ledger.sp_pushes,
                 (unsigned long long)g_sp_ledger.sp_pops,
                 (unsigned long long)g_sp_ledger.irq_entries);
