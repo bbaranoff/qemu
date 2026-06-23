@@ -2426,6 +2426,17 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
                     s->ar[4], s->ar[5], s->ar[6], s->ar[7], s->insn_count);
     }
 
+    /* SONDE GAP-1 : qui ECRIT data[0x43c0] (le pointeur de dispatch lu par le
+     * tremplin 0xb40e/0xb40f bacc), qui vaut 0xf074 (adresse de table = derail) ? */
+    if (addr == 0x43c0) {
+        static unsigned dw = 0;
+        if (dw++ < 60)
+            fprintf(stderr, "[c54x] DISPPTR-WR data[0x43c0] 0x%04x -> 0x%04x PC=0x%04x "
+                    "A=0x%010llx XPC=%u insn=%u\n",
+                    s->data[0x43c0], val, s->pc,
+                    (unsigned long long)(s->a & 0xFFFFFFFFFFULL), s->xpc, s->insn_count);
+    }
+
     /* === NDB-CTL-WR : trace ARM-side writes to NDB control flags in
      * [data[0x08F8]..data[0x0900]] = d_fb_det, d_fb_mode, a_sync_demod[],
      * d_sb_ext, etc. The firmware writes mode flags before scheduling
@@ -7405,6 +7416,49 @@ static int c54x_exec_one(C54xState *s)
             return consumed + s->lk_used;
         }
 
+        /* 0x70xx: MVKD dmad, Smem  —  data[dmad] -> data[Smem].
+         * binutils tic54x-opc.c {mvkd,2,2,2,0x7000,0xFF00,{OP_dmad,OP_Smem}}.
+         * 2-mot base (opcode + dmad) + 1 mot si Smem absolu/long (mode 0xC..0xF,
+         * has_lkaddr). Ordre des operandes = dmad EN PREMIER (pc+1), lk Smem-abs
+         * EN SECOND (pc+2).
+         *
+         * GAP-1 ROOT (tracee 2026-06-23 via sonde AR3-TRIP) : le catch-all
+         * generique (op&0xF800)==0x7000 ci-dessous decodait 0x70xx en STL 1-mot
+         * (+lk), SOUS-CONSOMMANT le mot dmad. A PROM0 0xb3cc (`70f8 4356 00e3`)
+         * le 3e mot 0x00e3 etait alors execute comme `ADD *AR3(lk)` parasite ;
+         * de meme 0xb3d1=0x00db -> `ADD *AR3+0%,A` faisait AR3 += AR0(~=SP) a
+         * chaque tour -> AR3 balayait la memoire -> ecrasait data[0x0c36]
+         * (ptr tache) -> CALA 0 -> POST-BOOTSTUB-RET -> derail/boucle. Le decode
+         * de l'ADD lui-meme etait FIDELE ; le bug etait la LONGUEUR du MVKD amont.
+         * Note : 0x72/0x73 (MVDM/MVMD) restent volontairement non-fixes ici
+         * (revert documente, REVERT_MVMD_KNOWLEDGE.md) ; ce fix 0x70 est le
+         * prerequis « fixer d'abord le setup AR3 amont » mentionne la-bas. */
+        if ((op & 0xFF00) == 0x7000) {
+            uint16_t dmad = prog_fetch(s, s->pc + 1);
+            int mode = (op & 0x80) ? ((op >> 3) & 0x0F) : -1;
+            uint16_t smem_addr;
+            s->lk_used = false;
+            if (mode >= 0xC) {                 /* Smem absolu/long : lk @pc+2 */
+                uint16_t lk = prog_fetch(s, s->pc + 2);
+                int nar = op & 0x07;
+                if (mode == 0xC) {                      /* *ARx(lk), no modify */
+                    smem_addr = (uint16_t)(s->ar[nar] + lk);
+                } else if (mode == 0xD || mode == 0xE) { /* *+ARx(lk)[%] premod */
+                    s->ar[nar] = (uint16_t)(s->ar[nar] + lk);
+                    smem_addr = s->ar[nar];
+                } else {                                 /* 0xF : *(lk) absolu */
+                    smem_addr = lk;
+                }
+                s->st0 = (s->st0 & ~ST0_ARP_MASK) | (nar << ST0_ARP_SHIFT);
+                s->lk_used = true;
+            } else {                           /* direct ou indirect non-abs */
+                smem_addr = resolve_smem(s, op, &ind);  /* +post-modify AR */
+            }
+            data_write(s, smem_addr, data_read(s, dmad));
+            consumed = 2;
+            return consumed + (s->lk_used ? 1 : 0);
+        }
+
         /* LD / ST operations */
         if ((op & 0xF800) == 0x7000) {
             /* 70xx: STL src, Smem */
@@ -11515,6 +11569,63 @@ int c54x_run(C54xState *s, int n_insns)
             g_prev_op = s_last_run_op;
             s_last_run_pc = s->pc;
             s_last_run_op = exec_op;
+        }
+
+        /* SONDE GAP-1 AR3-TRIP (2026-06-23, approche structurée non-decode) :
+         * pince la PREMIERE instruction qui fait sauter AR3 d'un GRAND pas.
+         * A ce point s->ar[3] reflete le resultat de l'instruction qui vient
+         * de tourner = g_prev_pc/g_prev_op. Les post-incr legitimes valent +-1/2 ;
+         * un saut >= 0x800 = chargement/modif suspecte. Flag special si delta==SP
+         * (la signature "AR3 += SP" qu'on a identifiee comme cause du derail).
+         * Cout : 1 sub + 1 cmp / insn, log cape a 80. */
+        {
+            static uint16_t s_prev_ar3 = 0;
+            static unsigned s_ar3trip = 0;
+            uint16_t cur_ar3 = s->ar[3];
+            uint16_t d = (uint16_t)(cur_ar3 - s_prev_ar3);
+            uint16_t mag = (d & 0x8000) ? (uint16_t)(-d) : d;
+            if (mag >= 0x0800 && s_ar3trip < 80) {
+                s_ar3trip++;
+                fprintf(stderr, "[c54x] AR3-TRIP #%u by PC=0x%04x op=0x%04x : "
+                        "AR3 0x%04x -> 0x%04x (d=%+d) SP=0x%04x%s XPC=%u insn=%u\n",
+                        s_ar3trip, g_prev_pc, g_prev_op,
+                        s_prev_ar3, cur_ar3, (int16_t)d, s->sp,
+                        (d == s->sp && s->sp != 0) ? "  <== delta==SP!" : "",
+                        s->xpc, s->insn_count);
+            }
+            s_prev_ar3 = cur_ar3;
+        }
+
+        /* SONDE GAP-1 AR0-TRACE (2026-06-23) : AR0 est l'INDEX du *AR3+0% a
+         * 0xb3d1 (AR3 += AR0). On a etabli qu'AR0 ~= 0x5AC7 (~SP) = corrompu.
+         * Logge CHAQUE changement d'AR0 dans la fenetre init (insn<3000) avec
+         * l'instruction qui l'a pose (g_prev_pc/op) -> nomme le corrupteur. */
+        {
+            static uint16_t s_prev_ar0 = 0xFFFF;
+            static unsigned s_ar0n = 0;
+            if (s->ar[0] != s_prev_ar0 && s->insn_count < 3000 && s_ar0n < 60) {
+                s_ar0n++;
+                fprintf(stderr, "[c54x] AR0-TRACE #%u by PC=0x%04x op=0x%04x : "
+                        "AR0 0x%04x -> 0x%04x BK=0x%04x SP=0x%04x DP=0x%03x insn=%u\n",
+                        s_ar0n, g_prev_pc, g_prev_op, s_prev_ar0, s->ar[0],
+                        s->bk, s->sp, (s->st0 & 0x1FF), s->insn_count);
+            }
+            s_prev_ar0 = s->ar[0];
+        }
+
+        /* Dump one-shot du contexte complet au 1er passage a 0xb3d1
+         * (ADD *AR3+0%,A) : AR0/AR3/BK/DP/ST1/A + data[AR3]. */
+        if (s->pc == 0x3d1 + 0xb000) {
+            static unsigned s_b3d1 = 0;
+            if (s_b3d1 < 6) {
+                s_b3d1++;
+                uint16_t ea = s->ar[3];
+                fprintf(stderr, "[c54x] B3D1-CTX #%u AR0=0x%04x AR3=0x%04x BK=0x%04x "
+                        "DP=0x%03x ST1=0x%04x A=0x%010llx data[AR3]=0x%04x SP=0x%04x insn=%u\n",
+                        s_b3d1, s->ar[0], s->ar[3], s->bk, (s->st0 & 0x1FF),
+                        s->st1, (unsigned long long)(s->a & 0xFFFFFFFFFFULL),
+                        s->data[ea], s->sp, s->insn_count);
+            }
         }
 
         /* SONDE post-bootstub-ret (GAP-1) : prologue @0x7013 (pshm contexte) et

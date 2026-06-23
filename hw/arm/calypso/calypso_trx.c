@@ -1448,8 +1448,9 @@ static void calypso_tdma_tick(void *opaque) {
          * que le TPU l'arme ; c'est le c54x (IMR/INTM dans c54x_interrupt_ex, déjà
          * fidèle SPRU131) qui décide de vectoriser ou juste sortir d'IDLE. Firmware
          * INCHANGÉ. `imr_armed` conservé pour la sonde FRAME-GATE seulement. */
-        bool periodic_armed = tpu_armed;
-        (void)imr_armed;
+        /* TEST 2026-06-23 : revert temporaire du fix imr_armed pour falsifier
+         * l'hypothèse « firer l'IT masquée perturbe le DSP → derail ». */
+        bool periodic_armed = tpu_armed && imr_armed;
         bool force_pulse    = !!(s->tpu_regs[TPU_CTRL/2] & TPU_CTRL_DSP_EN);
         /* GAP-1 ÉTAPE 0 : état du gate au runtime (le verrou circulaire tpu_armed
          * && imr_armed). Montre si l'IT trame est bloquée par imr_armed seul. */
