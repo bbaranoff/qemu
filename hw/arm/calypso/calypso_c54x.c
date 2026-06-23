@@ -1878,14 +1878,21 @@ static uint16_t data_read_locked(C54xState *s, uint16_t addr)
      * If these stay zero / 0x10 forever, ARM never wrote them. */
     if (addr == 0x0ffe || addr == 0x0fff || addr == 0x0ffc || addr == 0x0ffd) {
         static unsigned watch_count;
+        static uint16_t last_vd[4] = { 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF };
+        int widx = (addr == 0x0fff) ? 0 : (addr == 0x0ffe) ? 1 : (addr == 0x0ffd) ? 2 : 3;
+        uint16_t vd = s->data[addr];
         watch_count++;
-        if (watch_count <= 60 || (watch_count % 10000) == 0) {
-            uint16_t vd = s->data[addr];
+        /* LOG-ON-CHANGE (anti-spam) : premiers 60 + tout CHANGEMENT de valeur. Le spin
+         * bootloader 0xb424 lit data[0x0fff]=0x0001 1.36 Md de fois → l'ancien
+         * `%10000` crachait 135k lignes (20 Mo, QEMU ramé, osmocon LOST). On garde le
+         * signal exact (transition IDLE 0x0001 → commande 0x0002/0x0004) sans le bruit. */
+        if (watch_count <= 60 || vd != last_vd[widx]) {
             uint16_t va = s->api_ram ? s->api_ram[addr - C54X_API_BASE] : 0xDEAD;
             fprintf(stderr,
                     "[c54x] WATCH-READ #%u data[0x%04x] data=0x%04x api_ram=0x%04x api_set=%d PC=0x%04x insn=%u\n",
                     watch_count, addr, vd, va, s->api_ram ? 1 : 0, s->pc, s->insn_count);
         }
+        last_vd[widx] = vd;
     }
     /* Wait-loop diagnostic: 0x3dd0 was found to absorb ~99.5 % of DARAM
      * reads after the first ~500k reads — the DSP is stuck polling it.

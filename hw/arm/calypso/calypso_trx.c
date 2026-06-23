@@ -178,6 +178,32 @@ static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
     CalypsoTRX *s = opaque;
     if (offset >= CALYPSO_DSP_SIZE) return 0;
 
+    /* === CO-RUN (fix scheduling, mech 2) — 2026-06-23 ===
+     * Le firmware spin sur BL_CMD_STATUS (0x0ffe) dans dsp_bl_wait_ready
+     * (while readw(0x0ffe) != IDLE=1). Ce spin tight côté ARM AFFAME le tick QEMU
+     * qui exécute c54x_run → la ROM n'avance pas → n'écrit jamais son IDLE @0xb419 →
+     * le firmware spin éternel (le read-fake ne fire qu'UNE fois, dsp_booted latch).
+     * On fait avancer la ROM ICI, à chaque lecture de la cellule : elle atteint
+     * 0xb419 (write IDLE=1) puis spin en la lisant → le firmware lit un VRAI IDLE →
+     * sort de TOUS ses wait_ready → atteint dsp_bl_start_at (write cmd 2 @82be68) →
+     * la ROM lit cmd 2 @0xb424 → BACC vers L1. Gaté revival (SHUNT=0), fake gardé. */
+    if (offset == 0x0ffe && dsp_real_rom_mode()
+        && s->dsp && s->dsp->running) {
+        c54x_run(s->dsp, 1024);
+    }
+
+    /* === BL-READ (diag GAP-0) : l'ARM lit BL_CMD_STATUS (0x0ffe) en boucle dans
+     * dsp_bl_wait_ready (while readw(0x0ffe) != IDLE). Voir la valeur réellement
+     * lue (cell, APRÈS le co-run) + l'état du fake → tracer si le firmware sort du
+     * spin (lit IDLE=1) et continue vers dsp_bl_start_at. Capé. Gaté revival. */
+    if (offset == 0x0ffe && dsp_real_rom_mode()) {
+        static unsigned blr = 0;
+        if (blr < 120) { blr++;
+            fprintf(stderr, "[trx] BL-READ #%u BL_CMD_STATUS(0x0ffe) cell=0x%04x booted=%d fn=%u\n",
+                    blr, (unsigned)s->dsp_ram[offset/2], s->dsp_booted, s->fn);
+        }
+    }
+
     /* === Hypothesis #4 probe : ARM reads R_PAGE_X (= DSP responses) ===
      * ARM lit a_pm via R_PAGE_X. R_PAGE_0 = 0x0050, R_PAGE_1 = 0x0078.
      * Si firmware lit toujours R_PAGE_0 (jamais R_PAGE_1) → r_page jamais
@@ -353,12 +379,13 @@ static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
         }
     }
     /* DSP boot handshake: firmware polls DL_STATUS until it reads BOOT.
-     * FAKE INCONDITIONNEL (fault understood, 2026-06-23) : le c54x ne BACC jamais
-     * hors de son bootloader (le BACC = GAP-0, dépend du re-arm cmd #2 côté glue,
-     * pas d'un fix bootloader DSP). Sans ce fake, le firmware pend dans
-     * dsp_bl_wait_ready. Le fake est LOAD-BEARING tant que GAP-0 n'est pas résolu —
-     * le re-gater (revival) prouvé prématuré : le c54x-autorité ne démarre même pas
-     * la ROM. Diff de revival prêt à re-dégainer QUAND GAP-0 tombe. */
+     * FAKE INCONDITIONNEL. PROUVÉ (2026-06-23) : virer le fake en revival (SHUNT=0)
+     * → le c54x ne tourne PLUS (0 ligne, reproductible) alors que c54x_reset pose
+     * running=true. Mécanisme = le spin tight du firmware `dsp_bl_wait_ready`
+     * (while readw(0x0ffe)!=1) affame le tick QEMU qui exécute c54x_run → la ROM
+     * n'écrit jamais son IDLE → deadlock scheduling. Le fake court-circuite le spin
+     * (le firmware sort tôt) → QEMU schedule le tick → la ROM tourne. Donc le fake est
+     * load-bearing POUR FAIRE TOURNER la ROM, pas juste pour mentir au firmware. */
     if (offset == DSP_DL_STATUS_ADDR && !s->dsp_booted) {
         if (++s->boot_frame > 3) {
             s->dsp_ram[DSP_DL_STATUS_ADDR/2] = DSP_DL_STATUS_BOOT;
@@ -464,8 +491,25 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
         static unsigned hsw = 0;
         if (hsw < 300) {
             hsw++;
-            TRX_LOG("HS-ARM-WR #%u off=0x%04x val=0x%04x fn=%u",
+            /* fprintf, PAS TRX_LOG : TRX_LOG est gaté CALYPSO_DEBUG=TRX → muet
+             * dans le run banc → le "HS-ARM-WR=0" était un ARTEFACT de logging,
+             * pas une preuve d'absence d'écriture. On force l'affichage. */
+            fprintf(stderr, "[trx] HS-ARM-WR #%u off=0x%04x val=0x%04x fn=%u\n",
                     hsw, (unsigned)offset, (unsigned)(value & 0xFFFF), s->fn);
+        }
+    }
+
+    /* === HS-ARM-WR-WIDE : sonde write ÉLARGIE (trancher §2.6) ===
+     * Toute écriture ARM NON-NULLE dans l'API DSP (offset<0x1000). On filtre
+     * value!=0 pour sauter le dsp_api_memset (8192 zéros @82bcd4) et ne capter
+     * que NDB (d_dsp_state=3, etc.) + params + cmd 2. La DERNIÈRE écriture loggée
+     * = jusqu'où le firmware progresse avant de hang. fprintf, capé, gaté revival. */
+    if (dsp_real_rom_mode() && offset < 0x1000 && (value & 0xFFFF) != 0) {
+        static unsigned wide = 0;
+        if (wide < 220) {
+            wide++;
+            fprintf(stderr, "[trx] WR-WIDE #%u off=0x%04x val=0x%04x fn=%u\n",
+                    wide, (unsigned)offset, (unsigned)(value & 0xFFFF), s->fn);
         }
     }
 
@@ -1811,6 +1855,38 @@ C54xState *calypso_trx_get_dsp(void)
     return g_trx ? g_trx->dsp : NULL;
 }
 
+/* DSP hardware reset, driven by the ARM firmware via CNTL_RST (RESET_DSP bit) at
+ * 0xfffffd04 — appelé par calypso_cntl_write (soc). Sur silicium le firmware tient
+ * le DSP en reset (dsp_pre_boot : assert RESET_DSP) puis le release → la ROM boote
+ * FRESH, synchronisée à la timeline firmware. L'ému ignorait ce registre → la ROM
+ * tournait en roue libre depuis le realize, désynchro (GAP-0). Ici : assert →
+ * running=false (tenir) ; release (transition 1→0) → c54x_reset (boot frais, pose
+ * running=true). Gaté revival (SHUNT=0) ; le fake reste en place. */
+void calypso_trx_dsp_hw_reset(int assert_reset)
+{
+    static unsigned hrdbg = 0;
+    if (hrdbg < 12) { hrdbg++;
+        fprintf(stderr, "[trx] HW-RESET-CALL assert=%d g_trx=%p dsp=%p revival=%d\n",
+                assert_reset, (void *)g_trx,
+                (void *)(g_trx ? g_trx->dsp : NULL), dsp_real_rom_mode());
+    }
+    if (!g_trx || !g_trx->dsp || !dsp_real_rom_mode()) return;
+    static int in_reset = 0;
+    if (assert_reset) {
+        if (!in_reset) {
+            g_trx->dsp->running = false;
+            in_reset = 1;
+            TRX_LOG("DSP HW reset ASSERTED (firmware CNTL_RST RESET_DSP=1) — c54x held");
+        }
+    } else {
+        if (in_reset) {
+            c54x_reset(g_trx->dsp);   /* fresh boot ; c54x_reset pose running=true */
+            in_reset = 0;
+            TRX_LOG("DSP HW reset RELEASED — c54x fresh boot, synced to firmware timeline");
+        }
+    }
+}
+
 /* Per-section ROM bin paths, set by mb.c machine_init BEFORE sysbus_realize
  * so that trx_init can load each section into prog[]/data[] **before**
  * c54x_reset() — the reset's PROM→DARAM auto-copy needs prog[] populated. */
@@ -1849,9 +1925,8 @@ void calypso_trx_init(MemoryRegion *sysmem, qemu_irq *irqs)
 
     memory_region_init_io(&s->dsp_iomem,NULL,&calypso_dsp_ops,s,"calypso.dsp_api",CALYPSO_DSP_SIZE);
     memory_region_add_subregion(sysmem,CALYPSO_DSP_BASE,&s->dsp_iomem);
-    /* Pre-fake the DSP as booted (DL_STATUS=READY, dsp_booted) — INCONDITIONNEL
-     * (fault understood, cf read handler) : load-bearing tant que le c54x ne BACC
-     * pas (GAP-0). */
+    /* Pre-fake DSP booted — INCONDITIONNEL (cf read handler : load-bearing pour faire
+     * tourner la ROM, le spin firmware affame sinon le tick c54x). */
     s->dsp_ram[DSP_DL_STATUS_ADDR/2]=DSP_DL_STATUS_READY; s->dsp_ram[DSP_API_VER_ADDR/2]=DSP_API_VERSION; s->dsp_booted=true;
 
     memory_region_init_io(&s->tpu_iomem,NULL,&calypso_tpu_ops,s,"calypso.tpu",CALYPSO_TPU_SIZE);
