@@ -9,6 +9,23 @@ set -euo pipefail
 
 SESSION="calypso"
 
+# === HARD CLEANUP (2026-06-23) — slate 100% propre, même si un run.sh précédent
+# tourne ENCORE. Les doublons qemu/osmocon ("osmocon hang") venaient d'un run.sh
+# CONCURRENT que l'ancien cleanup (plus bas) ne tuait pas : il flinguait les binaires
+# mais pas l'autre run.sh, qui les relançait aussitôt. On tue ICI, avant toute config,
+# les AUTRES run.sh/start-clean.sh (jamais soi-même : exclusion $$ / $PPID), puis les
+# binaires et sockets stale. (killall dispo dans le container.) ===
+for _opid in $(pgrep -f "qemu-src/(run|start-clean)\.sh" 2>/dev/null || true); do
+    [ "$_opid" = "$$" ] || [ "$_opid" = "${PPID:-0}" ] || kill -9 "$_opid" 2>/dev/null || true
+done
+killall -q -9 qemu-system-arm osmo-bts-trx mobile osmocon osmo-trx-ipc calypso-ipc-device 2>/dev/null || true
+tmux kill-session -t "$SESSION" 2>/dev/null || true
+rm -f /tmp/osmocom_l2 /tmp/osmocom_loader /tmp/qemu-calypso-mon.sock /tmp/qemu_l1ctl_disabled 2>/dev/null || true
+sleep 1
+
+# DSP : c54x (vraie ROM) par défaut. Mock gr-gsm : lancer avec CALYPSO_DSP= (vide).
+: "${CALYPSO_DSP:=c54x}"; export CALYPSO_DSP
+
 # ---- args : --gen-doc / --help -----------------------------------------------
 # --gen-doc : ne (re)lance PAS le pipeline ; suppose qu'il tourne deja dans le
 # container et lance pytest pour produire la doc (report.md condense +

@@ -147,6 +147,31 @@ extern uint16_t g_arm_taskmd5_ea;
 
 uint32_t calypso_trx_get_fn(void) { return g_trx ? g_trx->fn : 0; }
 
+/* Real-ROM mode = CALYPSO_DSP_REG_MODE=c54x : the genuine DSP ROM derives its own
+ * state and must drive the bootloader handshake itself. bin/hybrid (default) inject a
+ * captured register snapshot (mock-ish) and the bridge fakes the handshake. Memoized,
+ * init-order-safe (getenv) — matches calypso_c54x.c reg_mode==0. Only the
+ * execution-affecting handshake fakes gate on this (snapshot-injection additionally
+ * needs a .bin, i.e. reg_init_valid — not conflated here). */
+static bool dsp_real_rom_mode(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        /* The bridge fakes the boot handshake ONLY when NO real DSP ROM services it.
+         * Runtime fact (qemu.log: "[dsp-shunt] active — c54x emulator should be
+         * skipped"): CALYPSO_DSP_SHUNT=1 SKIPS the c54x entirely (gr-gsm does the
+         * demod) → no ROM writes IDLE → the bridge MUST keep faking, else the
+         * firmware's dsp_bl_wait_ready hangs → mobile breaks. SHUNT=0 → the genuine
+         * c54x ROM runs and drives the real handshake → drop the fake. So the right
+         * predicate is SHUNT, NOT CALYPSO_DSP / REG_MODE (both default to c54x even
+         * in the shunt/mock run where the c54x is skipped). getenv → init-order-safe. */
+        const char *sh = getenv("CALYPSO_DSP_SHUNT");
+        bool shunt_on = sh && sh[0] == '1';
+        v = shunt_on ? 0 : 1;
+    }
+    return v != 0;
+}
+
 /* ---- DSP API RAM ---- */
 static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
 {
@@ -327,7 +352,13 @@ static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
             }
         }
     }
-    /* DSP boot handshake: firmware polls DL_STATUS until it reads BOOT */
+    /* DSP boot handshake: firmware polls DL_STATUS until it reads BOOT.
+     * FAKE INCONDITIONNEL (fault understood, 2026-06-23) : le c54x ne BACC jamais
+     * hors de son bootloader (le BACC = GAP-0, dépend du re-arm cmd #2 côté glue,
+     * pas d'un fix bootloader DSP). Sans ce fake, le firmware pend dans
+     * dsp_bl_wait_ready. Le fake est LOAD-BEARING tant que GAP-0 n'est pas résolu —
+     * le re-gater (revival) prouvé prématuré : le c54x-autorité ne démarre même pas
+     * la ROM. Diff de revival prêt à re-dégainer QUAND GAP-0 tombe. */
     if (offset == DSP_DL_STATUS_ADDR && !s->dsp_booted) {
         if (++s->boot_frame > 3) {
             s->dsp_ram[DSP_DL_STATUS_ADDR/2] = DSP_DL_STATUS_BOOT;
@@ -419,6 +450,24 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
 {
     CalypsoTRX *s = opaque;
     if (offset >= CALYPSO_DSP_SIZE) return;
+
+    /* === HS-ARM-WR : boot-handshake write discriminator (reg_mode==c54x) ===
+     * insn 10-11 proved one full command transits end-to-end; the suspect is that
+     * the firmware never RE-ARMS command #2 after the DSP republishes IDLE. This
+     * logs every ARM write into the bootloader mailbox region [0x0FF0,0x0FFF] (cmd
+     * cell DSP 0x0fff = ARM 0x0ffe ; BL_ADDR/SIZE companions just below) so a grep
+     * answers the cheap question: does the ARM emit a write of 2/4 after IDLE, yes
+     * or no? No write → ARM logic bails (read-back/stale-IDLE = Plan-A mech 1).
+     * Write present but DSP never reads it (cross-check WATCH-READ) → scheduling
+     * (Plan-A mech 2). Only fires in real-ROM mode; harmless to the mock path. */
+    if (dsp_real_rom_mode() && offset >= 0x0FF0 && offset <= 0x0FFF) {
+        static unsigned hsw = 0;
+        if (hsw < 300) {
+            hsw++;
+            TRX_LOG("HS-ARM-WR #%u off=0x%04x val=0x%04x fn=%u",
+                    hsw, (unsigned)offset, (unsigned)(value & 0xFFFF), s->fn);
+        }
+    }
 
     /* === Unconditional probe : count ALL writes by offset range ===
      * Gated par CALYPSO_DEBUG=DSP_WRITE_COUNT. Bucket par 0x40-byte zone
@@ -1800,6 +1849,9 @@ void calypso_trx_init(MemoryRegion *sysmem, qemu_irq *irqs)
 
     memory_region_init_io(&s->dsp_iomem,NULL,&calypso_dsp_ops,s,"calypso.dsp_api",CALYPSO_DSP_SIZE);
     memory_region_add_subregion(sysmem,CALYPSO_DSP_BASE,&s->dsp_iomem);
+    /* Pre-fake the DSP as booted (DL_STATUS=READY, dsp_booted) — INCONDITIONNEL
+     * (fault understood, cf read handler) : load-bearing tant que le c54x ne BACC
+     * pas (GAP-0). */
     s->dsp_ram[DSP_DL_STATUS_ADDR/2]=DSP_DL_STATUS_READY; s->dsp_ram[DSP_API_VER_ADDR/2]=DSP_API_VERSION; s->dsp_booted=true;
 
     memory_region_init_io(&s->tpu_iomem,NULL,&calypso_tpu_ops,s,"calypso.tpu",CALYPSO_TPU_SIZE);
@@ -1905,6 +1957,11 @@ void calypso_trx_init(MemoryRegion *sysmem, qemu_irq *irqs)
             if (g_section_registers)
                 c54x_load_registers(s->dsp, g_section_registers);
             c54x_reset(s->dsp);
+            /* running reste false ici : le c54x ne démarre PAS de façon autonome
+             * (running=false = dormant). En revival il ne BACC pas (GAP-0), donc le
+             * laisser spinner n'achète rien et ajoute un writer sur data[0x0fff]
+             * (race avec le fake). Quand GAP-0 tombera, re-dégainer le running=true
+             * realive gaté. */
             calypso_bsp_init(s->dsp);
         }
     }
