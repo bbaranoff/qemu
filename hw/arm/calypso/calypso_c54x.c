@@ -13453,6 +13453,18 @@ void c54x_reset(C54xState *s)
             s->api_ram[addr - C54X_API_BASE] = val;
     }
 
+    /* PROOF/FIX 2026-06-25 : DARAM power-up INDÉFINIE (C54x SPRU131G : le reset
+     * matériel n'initialise QUE les MMR ; la DARAM interne est indéfinie). Le
+     * modèle calloc-zéroïse data[] → le test firmware « DARAM fraîche »
+     * CMPM data[0x3f70],#0 @0xb3e7 voit 0 → BC pris → SAUTE son cold-init
+     * (0xb3ef ST #2,data[0x3f70] + 0xb3f3 CALL 0xa9ea). On modélise l'indéfini
+     * sur le SCRATCH HAUT [0x2800..0x4000) UNIQUEMENT (PAS l'overlay code
+     * 0x80-0x27FF copié ci-dessus, PAS les MMR < 0x60). Env-gated A/B. */
+    if (getenv("CALYPSO_DARAM_UNDEF")) {
+        for (unsigned a = 0x2800; a < 0x4000; a++) s->data[a] = 0xFFFF;
+        C54_LOG("DARAM-UNDEF: scratch [0x2800..0x4000) seedé 0xFFFF (power-up indéfini)");
+    }
+
     /* 2026-05-28 v3 : runtime conditional override (option A).
      *
      * v1 (static override prog[0xFF80] = B 0x7120) intercepted both the
@@ -13593,6 +13605,26 @@ void c54x_interrupt_ex(C54xState *s, int vec, int imr_bit)
     bool unmasked = (s->imr & (1 << imr_bit)) != 0;
     if (frame_force) unmasked = true;   /* VEC28-EXP : ligne frame cablee -> vectorise */
 
+    /* (A) VEC28-BOOTSTRAP one-shot (2026-06-25) : le firmware est coince dans le
+     * cercle d'amorcage — le foreground attend une tache en file (@0x4340 via
+     * 0xaad5) ou etat==2, posees par le scheduler vec28, qui a besoin de l'IT,
+     * qui a besoin de l'enable (RSBX INTM @0xa4d0) que le foreground ne fait
+     * jamais (A==0). On force UNE SEULE vectorisation vec28 quand une tache GSM
+     * est postee ET que le DSP est dans du code PROM legitime (PC>=0x7000, pas
+     * en derail), pour lancer le 1er scheduler. Ensuite go-live arme IMR=0x52fd
+     * via 0xa582 + RSBX INTM -> tout vectorise normalement. Aucun poke d'IMR/
+     * etat/table ; on ne fait que cabler la 1ere IT-frame manquante. */
+    static int g_vec28_bootstrapped = 0;
+    bool frame_force_boot = false;
+    if (frame_force && !g_vec28_bootstrapped && s->pc >= 0x7000 &&
+        !(s->st1 & ST1_INTM) == 0 /* INTM=1 foreground */ ) {
+        g_vec28_bootstrapped = 1;
+        frame_force_boot = true;
+        fprintf(stderr, "[c54x] VEC28-BOOTSTRAP fire : preempt PC=0x%04x SP=0x%04x "
+                "d_dsp_page=0x%04x etat=0x%04x insn=%u\n",
+                s->pc, s->sp, s->data[0x08D4], s->data[0x3f70], s->insn_count);
+    }
+
     /* Per SPRU131: IDLE exits on ANY interrupt (masked or unmasked).
      * - Unmasked: branch to vector, set INTM=1
      * - Masked: just resume after IDLE, IFR bit stays set */
@@ -13621,7 +13653,7 @@ void c54x_interrupt_ex(C54xState *s, int vec, int imr_bit)
         if (!unmasked) {
             s->pc++;  /* resume at instruction after IDLE */
         }
-    } else if (!(s->st1 & ST1_INTM) && unmasked && s->delay_slots == 0) {
+    } else if ((frame_force_boot || !(s->st1 & ST1_INTM)) && unmasked && s->delay_slots == 0) {
         /* Normal (non-IDLE) interrupt servicing.
          * Garde delay_slots==0 (fix 2026-05-30) : faithful C54x — une IT
          * n'est PAS reconnue entre une branche différée (RETD/RCD/CALLD/BD)

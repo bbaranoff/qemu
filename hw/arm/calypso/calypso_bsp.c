@@ -968,9 +968,9 @@ void calypso_bsp_rx_burst(uint8_t tn, uint32_t fn,
     /* Gate INT3 fire : skip si IFR.bit3 déjà set = DSP pas encore servi
      * le précédent. Évite stacking d'IRQs quand DSP traite plus lentement
      * que BSP delivery rate. */
-    if (!getenv("CALYPSO_BSP_INT3_OFF") && bsp.dsp && bsp.dsp->running && !(bsp.dsp->ifr & (1 << 3))) {
+    if (!getenv("CALYPSO_BSP_INT3_OFF") && bsp.dsp && bsp.dsp->running && !(bsp.dsp->ifr & (1 << 12))) {
         g_c54x_int3_src = 2;
-        c54x_interrupt_ex(bsp.dsp, 19, 3);  /* INT3 (frame) — vec 19, IMR bit 3 */
+        c54x_interrupt_ex(bsp.dsp, 28, 12);  /* INT3 (frame) — vec 19, IMR bit 3 */
         if (bsp.dsp->idle) bsp.dsp->idle = false;
     }
 
@@ -1110,9 +1110,9 @@ void calypso_bsp_deliver_buffered(uint32_t current_fn)
             }
         }
         /* Gate INT3 : skip si IFR.bit3 déjà set (cf rx_burst). */
-        if (!getenv("CALYPSO_BSP_INT3_OFF") && bsp.dsp && bsp.dsp->running && !(bsp.dsp->ifr & (1 << 3))) {
+        if (!getenv("CALYPSO_BSP_INT3_OFF") && bsp.dsp && bsp.dsp->running && !(bsp.dsp->ifr & (1 << 12))) {
             g_c54x_int3_src = 2;
-            c54x_interrupt_ex(bsp.dsp, 19, 3);  /* INT3 (frame) */
+            c54x_interrupt_ex(bsp.dsp, 28, 12);  /* INT3 (frame) */
             if (bsp.dsp->idle) bsp.dsp->idle = false;
         }
 

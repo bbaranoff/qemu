@@ -316,42 +316,11 @@ static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
                         tag, (unsigned)offset, (unsigned)val, (unsigned)s->fn);
         }
     }
-    /* CALYPSO_FORCE_TOA=<N> (env gated, rigolo) : force une détection FB
-     * complète vue par l'ARM, sans toucher le DSP. osmocom prim_fbsb.c
-     * n'atteint read_fb_result (lecture TOA dans ndb->a_sync_demod[D_TOA]
-     * @0x01F4) QU'APRÈS que d_fb_det (@0x01F0) = "FOUND". Donc forcer le TOA
-     * seul ne suffit pas : on force tout le bloc résultat FB sur le read ARM.
-     *   0x01F0 d_fb_det = 1 (FOUND)   0x01F4 a_sync_TOA  = N (23 = on-time)
-     *   0x01F8 a_sync_ANGLE = 0 (AFC ne diverge pas)  0x01FA a_sync_SNR = haut */
-    /* Étendu 2026-06-02 : FORCE_TOA force le bloc FB (a_sync_demod @0x01F0-FA,
-     * NDB) ET le bloc SB (a_serv_demod[D_TOA], db_r). Sinon le SB lit du garbage
-     * → l1s_sbdet_resp calcule "SB N bits in the future?!?" → sync rejeté →
-     * BSIC=0, pas de sysinfo. Forcer a_serv_demod[D_TOA]=force_toa (=23) fait
-     * `toa-=23 → 0` → passe le check `toa > bits_delta`. db_r page0=0xFFD00050
-     * (off 0x50) / page1=0xFFD00078 (off 0x78), struct DSP33-36 a_serv_demod
-     * @word8 → D_TOA = off 0x60 (p0) / 0x88 (p1). */
-    if (size == 2) {
-        static int force_toa = -2;  /* -2 = uninit, -1 = off */
-        if (force_toa == -2) {
-            const char *e = getenv("CALYPSO_FORCE_TOA");
-            force_toa = (e && *e) ? (int)strtol(e, NULL, 0) : -1;
-            if (force_toa >= 0)
-                fprintf(stderr, "[calypso-trx] CALYPSO_FORCE_TOA=%d (FB a_sync_demod + SB a_serv_demod[D_TOA] forcés)\n", force_toa);
-        }
-        if (force_toa >= 0) {
-            switch (offset) {
-            /* --- bloc FB (a_sync_demod, NDB @0x01F0) --- */
-            case 0x01F0: val = 1;                       break; /* d_fb_det = FOUND */
-            case 0x01F4: val = (uint16_t)force_toa;      break; /* a_sync_TOA */
-            case 0x01F8: val = 0;                        break; /* a_sync_ANGLE = 0 */
-            case 0x01FA: val = 0x7000;                   break; /* a_sync_SNR high */
-            /* --- bloc SB (a_serv_demod[D_TOA], db_r page 0 et 1) --- */
-            case 0x0060: case 0x0088:
-                val = (uint16_t)force_toa;               break; /* SB TOA → 23 : passe le check "future" */
-            default: break;                                     /* 0x01F2/0x01F6 + reste inchangés */
-            }
-        }
-    }
+    /* FORCE_TOA hack RETIRÉ (2026-06-25, demande user) : l'ARM lit le VRAI
+     * d_fb_det/TOA que le DSP écrit dans la NDB (0x01F0/0x01F4/0x01F8/0x01FA
+     * + SB a_serv_demod 0x0060/0x0088). Plus de FB/SB fabriqué : d_fb_det=0
+     * tant que le scheduler DSP ne tourne pas = ÉTAT RÉEL. */
+
     /* CALYPSO_FORCE_NB=1 (gate NB demod, 2026-06-02) : l1s_nb_resp bail "EMPTY"
      * si db_r->d_task_d==0 (le DSP NB demod ne tourne pas) → jamais de DATA_IND
      * BCCH → pas de SI. Force d_task_d≠0 (word 0 du db_r : page0 off 0x50 /
@@ -925,7 +894,11 @@ static void calypso_dsp_done(void *opaque) {
      * GATED par CALYPSO_DSP_SHUNT : si le shunt est actif, on skip
      * complètement cette DMA — le mock écrit les résultats directement
      * dans NDB/read-page et le c54x est inactif (pas de consommateur). */
-    if (s->dsp && s->dsp_ram[0x01A8/2] != 0 && !calypso_dsp_shunt_active()) {
+    /* Gate sur B_GSM_TASK (bit1=0x0002), PAS != 0 : sinon le garbage de boot
+     * 0xf600 (bit1 clear) declenche une DMA parasite a fn=0 qui injecte
+     * d_dsp_page=0xf600 dans la DARAM DSP avant le boot. 0xf600 & 0x0002 = 0
+     * -> supprimee ; 0x0002/0x0003 (vraie tache GSM) -> passe. */
+    if (s->dsp && (s->dsp_ram[0x01A8/2] & 0x0002) && !calypso_dsp_shunt_active()) {
         uint16_t page = s->dsp_ram[0x01A8/2] & 1;
         uint16_t *wp = page ?
             &s->dsp_ram[DSP_API_W_PAGE1/2] : &s->dsp_ram[DSP_API_W_PAGE0/2];

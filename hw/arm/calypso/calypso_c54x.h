@@ -123,8 +123,8 @@
 /* Calypso DSP firmware enables IMR bits 3 + 7 + upper (observed IMR=0xFF88).
  * Bit 3 = INT3 = vec 19 — this is the external frame-sync line from the TPU,
  * the only "frame" interrupt the firmware actually unmasks. Use it. */
-#define C54X_INT_FRAME_VEC   19  /* INT3 = vec (3+16) */
-#define C54X_INT_FRAME_BIT   3   /* IMR bit 3 */
+#define C54X_INT_FRAME_VEC   28  /* vec28 = IT-frame TPU que le DSP arme (IMR reset 0x3000 bit12/13 + go-live 0x52fd). vec19/bit3 etait FAUX (2026-06-25, confirme osmocom-bb dsp_end_scenario+tpu_dsp_frameirq_enable & DSP ROM vec28@0xf0) */
+#define C54X_INT_FRAME_BIT   12  /* IMR bit 12 (firmware arme bit12/13) */
 #define C54X_NUM_INTS        16
 
 typedef struct C54xState {

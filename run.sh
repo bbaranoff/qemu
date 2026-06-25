@@ -1121,7 +1121,7 @@ IPC_MSOCK_PATH="${IPC_MSOCK_PATH:-/tmp/ipc_sock0}"
 # le mobile campe pour de vrai. Aucun shunt, aucun bridge, aucune injection.
 # Chemins de debug opt-in : CALYPSO_MODE=shunt-ipc (bridge gr-gsm, démod externe),
 # CALYPSO_MODE=shunt (FB/SB cannés). À n'utiliser que pour diag, pas par défaut.
-CALYPSO_MODE="${CALYPSO_MODE:-full-grgsm}"   # defaut full-grgsm (pipeline grgsm decode valide 2026-06-03)
+CALYPSO_MODE="${CALYPSO_MODE:-full}"   # [purge orch 2026-06-25] défaut exec pur (full-grgsm rallumait le shunt+gr-gsm)   # defaut full-grgsm (pipeline grgsm decode valide 2026-06-03)
 # icount OFF par défaut (wall-clock) : plus rapide/fluide pour le full mode DSP.
 : "${CALYPSO_ICOUNT:=off}"; export CALYPSO_ICOUNT
 # IPC TX (uplink) ON par défaut : le device module les bursts UL du mobile
