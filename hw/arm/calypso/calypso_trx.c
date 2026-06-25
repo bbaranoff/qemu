@@ -14,6 +14,7 @@
 #include "hw/arm/calypso/calypso_trx.h"
 #include "hw/arm/calypso/calypso_uart.h"
 #include "hw/arm/calypso/calypso_c54x.h"
+extern int g_c54x_int3_src;  /* diag source INT3 (RO) */
 #include "hw/arm/calypso/calypso_full_pcb.h"  /* api_ram_lock pour MTTCG race fix */
 #include "hw/arm/calypso/calypso_bsp.h"
 #include "hw/arm/calypso/calypso_iota.h"
@@ -907,6 +908,15 @@ static const MemoryRegionOps calypso_dsp_ops = {
 static void calypso_dsp_done(void *opaque) {
     CalypsoTRX *s = opaque;
     s->tpu_regs[TPU_CTRL/2] &= ~TPU_CTRL_EN;
+    /* SONDE DSP-DONE (2026-06-24 diag livraison ordre, RO) : entree + gate. */
+    {
+        static unsigned dde = 0;
+        if (dde++ < 60)
+            fprintf(stderr, "[trx] DSP-DONE-ENTRY #%u d_dsp_page=0x%04x "
+                    "dsp=%d shunt_active=%d fn=%u\n",
+                    dde, (unsigned)s->dsp_ram[0x01A8/2], !!s->dsp,
+                    calypso_dsp_shunt_active(), s->fn);
+    }
 
     /* Hardware DMA: copy API write page → DSP DARAM 0x0586.
      * Triggered by firmware writing TPU_CTRL with EN bit (dsp_end_scenario).
@@ -924,6 +934,11 @@ static void calypso_dsp_done(void *opaque) {
         uint16_t task_d  = wp[DB_W_D_TASK_D];
         uint16_t task_u  = wp[DB_W_D_TASK_U];
         uint16_t task_md = wp[DB_W_D_TASK_MD];
+        { static unsigned ddc = 0; if (ddc++ < 60)
+            fprintf(stderr, "[trx] DSP-DONE-DMA #%u page=%u d_dsp_page=0x%04x "
+                    "task_d=%u task_u=%u task_md=%u -> DARAM 0x0586 fn=%u\n",
+                    ddc, page, (unsigned)s->dsp_ram[0x01A8/2],
+                    task_d, task_u, task_md, s->fn); }
         if (task_d || task_u || task_md) {
             static int dma_task_log = 0;
             if (++dma_task_log <= 50)
@@ -1450,7 +1465,20 @@ static void calypso_tdma_tick(void *opaque) {
          * INCHANGÉ. `imr_armed` conservé pour la sonde FRAME-GATE seulement. */
         /* TEST 2026-06-23 : revert temporaire du fix imr_armed pour falsifier
          * l'hypothèse « firer l'IT masquée perturbe le DSP → derail ». */
-        bool periodic_armed = tpu_armed && imr_armed;
+        /* FIX FIDELE (restaure 2026-06-24) : l'IT trame DSP est une LIGNE INT3
+         * CABLEE pilotee par le TPU, PAS gatee par l'IMR du DSP. Le `&& imr_armed`
+         * (test reverte 2026-06-23, jamais restaure) cree un VERROU CIRCULAIRE
+         * prouve au runtime (tpu_armed=1 imr_armed=0 fire=0 a jamais) : le DSP a
+         * besoin de l'IT pour atteindre son armement IMR (ROM 0x702b OR #0x1d,IMR),
+         * mais l'IT etait gatee sur IMR deja arme. On livre l'IT des que le TPU
+         * l'arme ; c54x_interrupt_ex (deja fidele INTM/IMR/IDLE) decide de
+         * vectoriser, poser IFR, ou sortir d'IDLE. Firmware INCHANGE = on EXECUTE
+         * le DSP, on ne l'orchestre pas. Gated CALYPSO_FRAME_FAITHFUL pour A/B. */
+        static int g_frame_faithful = -1;
+        if (g_frame_faithful < 0)
+            g_frame_faithful = getenv("CALYPSO_FRAME_FAITHFUL") ? 1 : 0;
+        bool periodic_armed = g_frame_faithful ? tpu_armed
+                                               : (tpu_armed && imr_armed);
         bool force_pulse    = !!(s->tpu_regs[TPU_CTRL/2] & TPU_CTRL_DSP_EN);
         /* GAP-1 ÉTAPE 0 : état du gate au runtime (le verrou circulaire tpu_armed
          * && imr_armed). Montre si l'IT trame est bloquée par imr_armed seul. */
@@ -1461,6 +1489,7 @@ static void calypso_tdma_tick(void *opaque) {
                     tpu_armed, imr_armed, (unsigned)s->dsp->imr,
                     force_pulse, (periodic_armed||force_pulse), s->fn); } }
         if (periodic_armed || force_pulse) {
+            g_c54x_int3_src = 1;
             c54x_interrupt_ex(s->dsp, C54X_INT_FRAME_VEC, C54X_INT_FRAME_BIT);
             if (force_pulse)
                 s->tpu_regs[TPU_CTRL/2] &= ~TPU_CTRL_DSP_EN;

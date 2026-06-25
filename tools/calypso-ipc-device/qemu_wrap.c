@@ -162,6 +162,71 @@ struct dl_fifo_entry {
     /* Pre-built TRXDv0 packet, header rewritten at send time with qfn. */
     uint8_t  pkt[TRXD_HDR_LEN + CALYPSO_DL_BURSTLEN * 4];
 };
+
+/* ===== Décimation DL 4 SPS -> 1 SPS (no-debt, 2026-06-24) ====================
+ * Le blob corrélateur TI (ROM) corrèle sur 148 samples @ 1 SPS (fenêtre DARAM
+ * [0x2a00..0x2b27] = 296 mots = 148 paires, lue par AR3/AR5 post-inc). osmo-trx
+ * sort 4 SPS (592 samples/burst). On décime ICI : qemu_wrap = stand-in
+ * ABB/front-end RF, qui livre à la cadence que le DSP ingère (flux RF->DSP
+ * fidèle) ; le BSP reste à 600B (contrat BSP<->DSP figé, diffable bit-à-bit vs
+ * connu-bon pré-2026-06-04). FIR linéaire-phase symétrique N=33 -> N-1=32 ≡ 0
+ * mod 8 -> group delay (N-1)/2 = 16 samples d'entrée = 4 samples de sortie
+ * ENTIER -> biais TOA CONSTANT (soustrait par le corrélateur ; sweepable
+ * CALYPSO_DL_BURST_OFFSET). Cutoff 0.25·(Nyquist 4-SPS) = 0.5·Rsym = Nyquist
+ * 1-SPS, fenêtre Hamming. Plancher physique ASSUMÉ : GMSK BT=0.3 déborde le
+ * Nyquist 1-SPS -> un résidu se replie quel que soit le FIR (inhérent au 1-SPS
+ * imposé par le blob, pas un défaut de filtre). JAMAIS drop 1/4. */
+#define DL_FIR_N      33
+#define DL_FIR_DELAY  ((DL_FIR_N - 1) / 2)   /* 16 samples d'entree */
+static double g_dl_fir[DL_FIR_N];
+static int    g_dl_fir_ready = 0;
+static void dl_fir_init(void)
+{
+    const double fc = 0.25;   /* normalise au Nyquist 4-SPS */
+    double sum = 0.0;
+    for (int k = 0; k < DL_FIR_N; k++) {
+        int    m = k - DL_FIR_DELAY;
+        double sinc = (m == 0) ? fc : sin(M_PI * fc * (double)m) / (M_PI * (double)m);
+        double win  = 0.54 - 0.46 * cos(2.0 * M_PI * (double)k / (double)(DL_FIR_N - 1));
+        g_dl_fir[k] = sinc * win;
+        sum += g_dl_fir[k];
+    }
+    for (int k = 0; k < DL_FIR_N; k++) g_dl_fir[k] /= sum;   /* gain unite DC */
+    g_dl_fir_ready = 1;
+}
+/* in : cs16 I/Q entrelace @ 4 SPS, in_avail samples complexes dispo.
+ * out: cs16 I/Q @ 1 SPS, jusqu'a n_out samples. Retourne le nb produit.
+ * out[j] = somme_k h[k]*in[j*4 + k]  (centre FIR a in[j*4 + DELAY]). */
+static int dl_decimate_4to1(const int16_t *in, int in_avail,
+                            int16_t *out, int n_out)
+{
+    if (!g_dl_fir_ready) dl_fir_init();
+    int produced = 0;
+    for (int j = 0; j < n_out; j++) {
+        int base = j * 4;
+        /* Zero-pad au-dela de in_avail au lieu de break : garantit TOUJOURS
+         * n_out sorties PROPRES. La fenetre burst (592 @ 4 SPS) ne supporte
+         * pleinement que ~140 sorties decimees ; les ~8 de bord etaient avant
+         * laissees STALE (contenu du burst precedent dans fe->pkt) -> queue de
+         * la fenetre correlateur 0x2a00 = garbage -> D_TOA/D_ANGLE=0. Ici on
+         * zero-pad : attenuation lineaire-phase bornee, mais propre. */
+        double accI = 0.0, accQ = 0.0;
+        for (int k = 0; k < DL_FIR_N; k++) {
+            int idx = base + k;
+            double sI = (idx < in_avail) ? (double)in[2 * idx]     : 0.0;
+            double sQ = (idx < in_avail) ? (double)in[2 * idx + 1] : 0.0;
+            accI += g_dl_fir[k] * sI;
+            accQ += g_dl_fir[k] * sQ;
+        }
+        long iI = lround(accI), iQ = lround(accQ);
+        if (iI >  32767) iI =  32767; else if (iI < -32768) iI = -32768;
+        if (iQ >  32767) iQ =  32767; else if (iQ < -32768) iQ = -32768;
+        out[2 * j]     = (int16_t)iI;
+        out[2 * j + 1] = (int16_t)iQ;
+        produced++;
+    }
+    return produced;
+}
 static struct dl_fifo_entry g_dl_fifo[DL_FIFO_SIZE];
 static volatile size_t      g_dl_fifo_head = 0;   /* next pop index */
 static volatile size_t      g_dl_fifo_tail = 0;   /* next push index */
@@ -294,7 +359,7 @@ static void *clk_listener(void *arg)
         e->pkt[3] = (uint8_t)(bfn >>  8);
         e->pkt[4] = (uint8_t)(bfn);
         ssize_t sent = sendto(g_bsp_fd, e->pkt,
-                              TRXD_HDR_LEN + CALYPSO_DL_BURSTLEN * 4, 0,
+                              TRXD_HDR_LEN + CALYPSO_BSP_BURSTLEN * 4, 0,  /* 148 @ 1 SPS = 600B (decime) */
                               (struct sockaddr *)&g_bsp_peer,
                               sizeof(g_bsp_peer));
         bool was_fcch = e->is_fcch;
@@ -1650,13 +1715,41 @@ int32_t uhdwrap_write(void *dev, uint32_t num_chans, bool *underrun)
         fe->pkt[0] = 0;
         fe->pkt[1] = 0; fe->pkt[2] = 0; fe->pkt[3] = 0; fe->pkt[4] = 0;
         fe->pkt[5] = 0; fe->pkt[6] = 0; fe->pkt[7] = 0;
-        memcpy(fe->pkt + TRXD_HDR_LEN, burst_src, payload_len);
+        /* DECIMATION 4 SPS -> 1 SPS (no-debt) : burst_src = 'avail' samples
+         * @ 4 SPS (entree, fenetre CALYPSO_DL_BURSTLEN) ; on produit
+         * CALYPSO_BSP_BURSTLEN (148) samples @ 1 SPS = la fenetre du correlateur
+         * DSP. payload_len reflete la SORTIE -> paquet = 8 + 148*4 = 600B. */
+        /* REVERT phantom (2026-06-24) : on passe 'avail' (=2500 mesure, PAS 592).
+         * Les samples in[592..620] que le dernier output decime EXISTENT vraiment
+         * dans le buffer osmo-trx -> vrais echantillons, pas du stale. Caper a
+         * n_samples=592 zero-paddait a tort 8 samples reels = PHANTOM. Le zero-pad
+         * du decimateur reste comme garde short-read benigne (jamais declenchee
+         * tant que avail >> 620). */
+        int n_out = dl_decimate_4to1(burst_src, avail,
+                                     (int16_t *)(fe->pkt + TRXD_HDR_LEN),
+                                     CALYPSO_BSP_BURSTLEN);
+        payload_len = (size_t)n_out * 4u;
+        (void)payload_len;   /* taille d'envoi figee a 148 samples cote clk_listener */
+        { /* DIAG (confirme le bug) : combien de sorties avaient le contexte FIR
+           * COMPLET avant le fix (base+33<=n_samples) vs combien etaient
+           * stale/zero-paddees au bord. edge>0 => la troncature existait. */
+            static int dlog = 0;
+            if (dlog < 8 || (dlog % 4000) == 0) {
+                int full = 0;
+                for (int j = 0; j < CALYPSO_BSP_BURSTLEN; j++)
+                    if (j * 4 + DL_FIR_N <= n_samples) full++;
+                LOGP(DDEV, LOGL_NOTICE,
+                     "DL-DECIM avail=%d n_samples=%d n_out=%d full_ctx=%d "
+                     "edge_zeropad=%d\n",
+                     avail, n_samples, n_out, full,
+                     CALYPSO_BSP_BURSTLEN - full);
+            }
+            dlog++;
+        }
         if (iq_conj) {
-            /* Conjugaison I/Q (-Q) : le démod gr-gsm a montré rot=-1 (tone FCCH
-             * de signe opposé à la réf du corrélateur DSP). Flip le signe de Q
-             * remet le tone à la bonne fréquence pour le FB-det. */
+            /* Conjugaison I/Q (-Q) sur la SORTIE decimee. */
             int16_t *p = (int16_t *)(fe->pkt + TRXD_HDR_LEN);
-            for (int k = 0; k < n_samples; k++)
+            for (int k = 0; k < n_out; k++)
                 p[2 * k + 1] = (int16_t)(-p[2 * k + 1]);
         }
         g_dl_fifo_tail = tail + 1;

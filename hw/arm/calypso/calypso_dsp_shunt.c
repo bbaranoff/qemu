@@ -46,6 +46,7 @@
 #include "qemu/main-loop.h"
 #include "calypso_dsp_shunt.h"
 #include "calypso_c54x.h"   /* C54xState + c54x_bsp_load/run/interrupt_ex/wake (CALYPSO_DSP=c54x route) */
+extern int g_c54x_int3_src;  /* diag source INT3 (RO) */
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -1038,6 +1039,7 @@ static void shunt_route_to_c54x(uint8_t page_idx)
         c54x_bsp_load(dsp, (const uint16_t *)g_shunt.last_iq, g_shunt.last_iq_n);
 
     /* (c) INT3 FRAME + wake : reveille le DSP s'il etait idle/halt. */
+    g_c54x_int3_src = 3;
     c54x_interrupt_ex(dsp, C54X_INT_FRAME_VEC, C54X_INT_FRAME_BIT);
     c54x_wake(dsp);
 

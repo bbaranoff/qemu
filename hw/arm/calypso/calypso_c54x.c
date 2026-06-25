@@ -2288,6 +2288,48 @@ static void stkw_rec(C54xState *s, uint16_t addr, uint16_t val)
 
 static void data_write(C54xState *s, uint16_t addr, uint16_t val)
 {
+    /* WRITE-WATCH (2026-06-24, RO) : qui ECRIT 0x434f (FIFO write ptr),
+     * 0x434e (FIFO read ptr), 0x3f6d (soft-vector go-live) — avec quel PC.
+     * Tranche empiriquement ECRITURE-ACTIVE (par un chemin) vs residu/defaut :
+     * Garde1 = FIFO init-vive vs jamais-setup ; Garde2 = soft-vector pose
+     * activement vers 0xa4df vs valeur de reset. NE JAMAIS deduire ces valeurs
+     * de la narration quand ce watch peut les LIRE. Cap 80. */
+    if (addr == 0x434f || addr == 0x434e || addr == 0x3f6d) {
+        static unsigned ww = 0;
+        if (ww++ < 80)
+            fprintf(stderr, "[c54x] WRITE-WATCH data[0x%04x] <- 0x%04x PC=0x%04x insn=%u\n",
+                    addr, val, s->pc, s->insn_count);
+    }
+    /* F70-SETBIT1 (2026-06-24, RO) : data[0x3f70] bit1 = le flag qui fait sortir la
+     * wait-loop (test 0xa4d4 -> RET si TC). Log UNIQUEMENT quand bit1 (0x0002) est
+     * ECRIT -> si ca ne fire JAMAIS, le DSP ne pose jamais "frame prete" = racine
+     * confirmee. Writers de 0x0002 : 0x710c/0xa5bd/0xb3ef/0xde9c. Cap 40. */
+    if (addr == 0x3f70 && (val & 0x0002)) {
+        static unsigned f70 = 0;
+        if (f70++ < 40)
+            fprintf(stderr, "[c54x] F70-SETBIT1 data[0x3f70] 0x%04x->0x%04x PC=0x%04x insn=%u\n",
+                    s->data[0x3f70], val, s->pc, s->insn_count);
+    }
+    /* VEC-INSTALL (2026-06-24, RO) : la table de vecteurs runtime vit en DARAM
+     * a 0x0080 (IPTR=1, OVLY). Mesure live : vec19(FRAME)@0xcc et vec21(BRINT0)
+     * @0xd4 sont des stubs RETE(0xf4eb)/NOP a froid, alors que vec17/20/22/24..
+     * portent de vrais handlers (FB 0xf8xx). Question falsifiable (H-A vs H-B) :
+     * le firmware installe-t-il JAMAIS un vrai branch au mot-0 de FRAME/BRINT0,
+     * et a quel PC/insn ? Watch les 8 mots des 2 slots + tout mot-0 de la table
+     * [0x80..0xFC] ou un FB-branch (0xf8xx) est ecrit. Cap 200. */
+    if ((addr >= 0x00cc && addr <= 0x00cf) || (addr >= 0x00d4 && addr <= 0x00d7) ||
+        ((addr >= 0x0080 && addr <= 0x00ff) && ((addr & 3) == 0) &&
+         (val & 0xFF80) == 0xF880)) {
+        static unsigned vi = 0;
+        if (vi++ < 200) {
+            int vec = (addr - 0x0080) / 4;
+            int word = (int)((addr - 0x0080) & 3);
+            fprintf(stderr, "[c54x] VEC-INSTALL vec%d@0x%04x w%d <- 0x%04x %s PC=0x%04x insn=%u\n",
+                    vec, addr, word, val,
+                    (vec==19?"<FRAME":(vec==21?"<BRINT0":"")),
+                    s->pc, s->insn_count);
+        }
+    }
     /* TASKTAB-WR (revival dsp 2026-06-22, RO) : qui sème data[0x4c5b/0x4c5c]
      * (table de tâches lue par LD *(0x4c5c),A puis CALA ; devrait venir du
      * handler FRAME 0xA04C). 0 write = jamais semée → CALA A=0 → boot stub. */
@@ -2449,6 +2491,14 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
                     (unsigned long long)(s->a & 0xFFFFFFFFFFULL), s->xpc, s->insn_count);
     }
 
+    /* SLOT4387-WR (2026-06-24) : qqn reecrit-il le slot dispatch terminal
+     * data[0x4387] avec un vrai handler (!= 0xab38 idle) ? (test H1). Cap 40. */
+    if (addr == 0x4387) {
+        static unsigned s4=0;
+        if (s4++<40)
+            fprintf(stderr, "[c54x] SLOT4387-WR data[0x4387] <- 0x%04x PC=0x%04x insn=%u\n",
+                    val, s->pc, s->insn_count);
+    }
     /* SONDE Phase B SEED-WR : qui ecrit la base de pile data[0x5ac8..0x5acc] =
      * l'adresse de retour que le RET du handler no-op (0xab38) depile ? Si
      * jamais ecrit (que le memset 0x88 en dessous) -> seed retour-scheduler
@@ -3032,6 +3082,19 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
         }
         switch (addr) {
         case MMR_IMR:
+            /* IMR-ARM (2026-06-24, RO, INCONDITIONNEL) : historique COMPLET des
+             * ecritures IMR (old->new), etat bit12=vec28(scheduler)/bit3=vec19/
+             * bit5=vec21. Run a montre IMR=0x52fd (bit12 SET!) efface par 0xb37e
+             * -> on veut QUI ecrit 0x52fd (writer non-STM) + si un re-arm suit. Cap 80. */
+            if ((uint16_t)val != s->imr) {
+                static unsigned ia = 0;
+                if (ia++ < 80)
+                    fprintf(stderr, "[c54x] IMR-ARM 0x%04x -> 0x%04x (b12/vec28=%d "
+                            "b3/vec19=%d b5/vec21=%d) PC=0x%04x op=0x%04x insn=%u\n",
+                            s->imr, (uint16_t)val,
+                            !!(val&(1<<12)), !!(val&(1<<3)), !!(val&(1<<5)),
+                            s->pc, s->prog[s->pc], s->insn_count);
+            }
             if (val != s->imr) {
                 static unsigned imr_log = 0;
                 /* Always log transitions TO zero (mask-everything) — that
@@ -7445,7 +7508,26 @@ static int c54x_exec_one(C54xState *s)
         if ((op & 0xFF00) == 0x7400) {        /* PORTR PA, Smem */
             addr = resolve_smem(s, op, &ind);
             uint16_t pa = prog_fetch(s, s->pc + 1 + (s->lk_used ? 1 : 0));
-            (void)pa; (void)addr;             /* lecture port externe : non modélisée (TODO I/Q bsp_buf) */
+            /* PA=0xF430 (ou 0x0034 legacy) = port RX BSP : livre l'echantillon
+             * I/Q suivant depuis bsp_buf (rempli par DMA radio ; bsp_pos reset
+             * par rafale). Le handler dead-code 0x8F (~8530) etait la ref
+             * ISA-fausse ("relocaliser PORTR vers 0x74 un jour") : c'est fait ici.
+             * Sans ca, notre length-fix no-op shadow-ait la vraie lecture I/Q ->
+             * l'AFC/correlateur ne recevait AUCUN echantillon -> jamais de
+             * convergence. GATED CALYPSO_FIX_PORTR. */
+            static int fix_portr = -1;
+            if (fix_portr < 0) fix_portr = getenv("CALYPSO_FIX_PORTR") ? 1 : 0;
+            if (fix_portr && (pa == 0xF430 || pa == 0x0034)) {
+                uint16_t iq = (s->bsp_pos < s->bsp_len) ? s->bsp_buf[s->bsp_pos++] : 0;
+                data_write(s, addr, iq);
+                static unsigned pr_n = 0;
+                if (pr_n++ < 50)
+                    fprintf(stderr, "[c54x] PORTR-IQ #%u PA=0x%04x -> data[0x%04x]"
+                            "=0x%04x pos=%d/%d PC=0x%04x insn=%u\n",
+                            pr_n, pa, addr, iq, s->bsp_pos, s->bsp_len, s->pc,
+                            s->insn_count);
+            }
+            (void)pa; (void)addr;
             consumed = 2;
             return consumed + s->lk_used;
         }
@@ -7491,6 +7573,77 @@ static int c54x_exec_one(C54xState *s)
             data_write(s, smem_addr, data_read(s, dmad));
             consumed = 2;
             return consumed + (s->lk_used ? 1 : 0);
+        }
+
+        /* 0x71xx: MVDK Smem, dmad  —  data[Smem] -> data[dmad].  MIROIR de MVKD.
+         * binutils tic54x-opc.c {mvdk,2,2,2,0x7100,0xFF00,{OP_Smem,OP_dmad}}.
+         * Encodage IDENTIQUE a MVKD 0x70 (Smem dans l'octet bas de l'opcode,
+         * dmad@pc+1, lk Smem-abs@pc+2) ; SEULE la direction du move est inversee :
+         * MVKD fait data[Smem]=data[dmad] ; MVDK fait data[dmad]=data[Smem].
+         *
+         * FINDING 2026-06-24 (recon workflow, desasm verifie adversarialement sur
+         * le vrai dump /opt/GSM/calypso_dsp.txt) : a PROM0 0xb3db-0xb3e3 TROIS MVDK
+         * 3-mots `71f8 4356 00e3` / `71f8 4357 00db` / `71f8 4355 00d3` RESTAURENT
+         * data[0x4356/4357/4355] (sauves par les 3 MVKD symetriques @0xb3cc avant
+         * les 3 CALL). Le catch-all `(op&0xF800)==0x7000` les decodait en STL 1-mot
+         * -> SOUS-CONSOMMAIT le mot dmad -> les operandes 00e3/00db/00d3 executees
+         * en ADD parasites (dont 0x00db = `ADD *AR3+0%%,A`, l'instr GAP-1) chaque
+         * trame -> corruption AR3/A + restore rate. MEME CLASSE que le fix MVKD 0x70.
+         * 0x71 est data<->data (PAS MMR) -> ORTHOGONAL au revert 0x72/0x73
+         * (REVERT_MVMD_KNOWLEDGE.md, qui concerne la corruption MMR via STL). */
+        if ((op & 0xFF00) == 0x7100) {
+            uint16_t dmad = prog_fetch(s, s->pc + 1);
+            int mode = (op & 0x80) ? ((op >> 3) & 0x0F) : -1;
+            uint16_t smem_addr;
+            s->lk_used = false;
+            if (mode >= 0xC) {                 /* Smem absolu/long : lk @pc+2 */
+                uint16_t lk = prog_fetch(s, s->pc + 2);
+                int nar = op & 0x07;
+                if (mode == 0xC) {                      /* *ARx(lk), no modify */
+                    smem_addr = (uint16_t)(s->ar[nar] + lk);
+                } else if (mode == 0xD || mode == 0xE) { /* *+ARx(lk)[%] premod */
+                    s->ar[nar] = (uint16_t)(s->ar[nar] + lk);
+                    smem_addr = s->ar[nar];
+                } else {                                 /* 0xF : *(lk) absolu */
+                    smem_addr = lk;
+                }
+                s->st0 = (s->st0 & ~ST0_ARP_MASK) | (nar << ST0_ARP_SHIFT);
+                s->lk_used = true;
+            } else {                           /* direct ou indirect non-abs */
+                smem_addr = resolve_smem(s, op, &ind);  /* +post-modify AR */
+            }
+            data_write(s, dmad, data_read(s, smem_addr));   /* MVDK : dmad <- Smem */
+            consumed = 2;
+            return consumed + (s->lk_used ? 1 : 0);
+        }
+
+        /* 0x72 MVDM dmad,MMR (MMR<-data[dmad]) / 0x73 MVMD MMR,dmad (data[dmad]<-MMR).
+         * 2-mot (opcode + dmad ; MMR = octet bas, mappee a data 0x00-0x1f que
+         * data_read/data_write routent vers les registres). GATED CALYPSO_FIX_MVDM
+         * car REVERT_MVMD_KNOWLEDGE.md documente une regression (deadlock 0xee38,
+         * AR3 hors buffer I/Q) quand on fixe AVANT le setup AR3 amont. Ce setup =
+         * MVKD 0x70 (GAP-1) + MVDK 0x71 = MAINTENANT FAITS -> critere de
+         * re-application atteint. Debloque la sous-routine go-live 0xaad5
+         * (7211 434f MVDM data[0x434f]->AR1 ; 7210 434e ; 7310 434e MVMD AR0->
+         * data[0x434e]) dont le mis-decode (catch-all STL 1-mot) fige A=0 -> garde
+         * BC 0xa4cd (AEQ, A==0) jamais relachee -> RSBX INTM 0xa51b jamais atteint. */
+        {
+            static int fix_mvdm = -1;
+            if (fix_mvdm < 0) fix_mvdm = getenv("CALYPSO_FIX_MVDM") ? 1 : 0;
+            if (fix_mvdm && (op & 0xFF00) == 0x7200) {       /* MVDM dmad, MMR */
+                uint16_t dmad = prog_fetch(s, s->pc + 1);
+                uint16_t mmr  = op & 0x00FF;
+                data_write(s, mmr, data_read(s, dmad));
+                consumed = 2;
+                return consumed;
+            }
+            if (fix_mvdm && (op & 0xFF00) == 0x7300) {       /* MVMD MMR, dmad */
+                uint16_t dmad = prog_fetch(s, s->pc + 1);
+                uint16_t mmr  = op & 0x00FF;
+                data_write(s, dmad, data_read(s, mmr));
+                consumed = 2;
+                return consumed;
+            }
         }
 
         /* LD / ST operations */
@@ -11717,21 +11870,232 @@ int c54x_run(C54xState *s, int n_insns)
          * valeur (immediat litteral vs registre d'index/evenement gele), le
          * reset SP delibere (0xb403), et la pile au bacc. AR3/AR4 inclus (test
          * "AR7 derive d'un registre gele"). Cap 64. */
-        if (exec_pc >= 0xb400 && exec_pc <= 0xb40f) {
+        /* SONDE Phase B LOOPTRACE (2026-06-24, élargie depuis DISP-ENTRY) :
+         * la maladie n'est PAS l'idle bénin -> POST-BOOTSTUB-RET tourne 640M de
+         * fois (storm PC=0) dès le 1er dispatch (insn 4398). On veut la boucle
+         * principale ENTIÈRE [0xb3c0..0xb410] (= prologue lecture d_dsp_page @0xb3cc
+         * + dispatcher @0xb400) AVEC le caller (g_prev_pc) -> voir comment 0xb401
+         * est atteint la 1ère fois, si word[0]=0x2900 @0xb400 est exécuté ou sauté,
+         * et pourquoi data[SP] (seed de retour) est vide quand l'idle-RET dépile
+         * -> PC=0. AR1 inclus (la copie READA arme AR1=0x4387). Cap 300. */
+        if (exec_pc >= 0xb3a0 && exec_pc <= 0xb410) {
             static unsigned de = 0;
-            if (de < 64) {
+            if (de < 300) {
                 de++;
-                fprintf(stderr, "[c54x] DISP-ENTRY PC=0x%04x op=0x%04x A=0x%06llx "
-                        "AR7=%04x AR0=%04x AR2=%04x AR3=%04x AR4=%04x SP=%04x "
+                fprintf(stderr, "[c54x] LOOPTRACE #%u from=0x%04x PC=0x%04x op=0x%04x "
+                        "A=0x%06llx AR1=%04x AR7=%04x SP=%04x "
                         "stk[SP-1,SP,SP+1]=%04x,%04x,%04x insn=%u\n",
-                        exec_pc, exec_op,
+                        de, g_prev_pc, exec_pc, exec_op,
                         (unsigned long long)(s->a & 0xFFFFFF),
-                        s->ar[7], s->ar[0], s->ar[2], s->ar[3], s->ar[4], s->sp,
+                        s->ar[1], s->ar[7], s->sp,
                         s->data[(uint16_t)(s->sp-1)], s->data[s->sp],
                         s->data[(uint16_t)(s->sp+1)], s->insn_count);
             }
         }
 
+        /* === EXPERIENCE SEED-5AC8 (2026-06-24) : le chainon go-live ===========
+         * MECANISME VERIFIE sur le vrai dump : la frame body seme le soft-vector
+         * data[0x3f6d]=0xa4df @0xb405 (continuation GO-LIVE). Le trampoline
+         * 0x71f4 = `LD *(0x3f6d),A ; BACC A` honore ce vecteur -> 0xa4df ->
+         * 0xa4ca/0xa500 -> 0xa51b RSBX INTM (1er enable IT du run) -> 0xa51c lit
+         * d_dsp_page. MAIS le terminal 0xb40f BACC data[0x4387]=0xab38=RET depile
+         * mem[0x5ac8]=0 (jamais seme : init entre par branche, RPT-fill s'arrete
+         * a 0x5ac7) -> PC=0 -> storm, au lieu d'atteindre 0x71f4.
+         * TEST FALSIFIABLE (gated CALYPSO_SEED5AC8=1) : forcer mem[0x5ac8]=0x71f4
+         * au site du BACC terminal -> le RET (0xab38) doit alors atterrir sur le
+         * trampoline -> go-live. Succes = GOLIVE-WATCH voit 0xa51b + INTM-CLEAR. */
+        {
+            static int seed_on = -1;
+            if (seed_on < 0) seed_on = getenv("CALYPSO_SEED5AC8") ? 1 : 0;
+            if (seed_on && exec_pc == 0xb40f) {
+                static unsigned sd = 0;
+                if (sd < 8)
+                    fprintf(stderr, "[c54x] SEED-5AC8 #%u : mem[0x5ac8] 0x%04x->0x71f4 "
+                            "(data[0x3f6d]=0x%04x data[0x4387]=0x%04x) SP=0x%04x insn=%u\n",
+                            ++sd, s->data[0x5ac8], s->data[0x3f6d], s->data[0x4387],
+                            s->sp, s->insn_count);
+                s->data[0x5ac8] = 0x71f4;
+            }
+        }
+        /* GOLIVE-WATCH (ungated) : le firmware atteint-il enfin la routine go-live
+         * (0xa4c9..0xa520) ou le trampoline 0x71f4 ? logge PC/op/INTM/IMR +
+         * soft-vector data[0x3f6d]. Cap 120. */
+        if ((exec_pc >= 0xa4c9 && exec_pc <= 0xa520) || exec_pc == 0x71f4 || exec_pc == 0x71f6) {
+            static unsigned gw = 0;
+            if (gw++ < 120)
+                fprintf(stderr, "[c54x] GOLIVE-WATCH #%u PC=0x%04x op=0x%04x INTM=%d "
+                        "IMR=0x%04x data[0x3f6d]=0x%04x A=0x%06llx insn=%u\n",
+                        gw, exec_pc, exec_op, (s->st1 & ST1_INTM) ? 1 : 0, s->imr,
+                        s->data[0x3f6d], (unsigned long long)(s->a & 0xFFFFFF), s->insn_count);
+        }
+        /* RUNTIME-DYN (2026-06-24, RO) : dynamique de l'automate qui garde le
+         * scheduler 0xa51c (qui ne tourne jamais, data[0x3fb0]=0). Trois faits :
+         *  (1) IMR-DYN : le DSP execute-t-il ses sites d'armement IMR, et qui efface ?
+         *  (2) WAIT-TEST : le flag 0x3f70 bit1 (sortie wait-loop) est-il jamais set au test ?
+         *  (3) DE97-BR : le super-loop atteint-il la branche set-bit1 (0xde9c) ? */
+        if (exec_pc == 0x76fc || exec_pc == 0xa509 || exec_pc == 0xb37e) {
+            static unsigned id = 0;
+            if (id++ < 40)
+                fprintf(stderr, "[c54x] IMR-DYN PC=0x%04x IMR_before=0x%04x writes=0x%04x "
+                        "INTM=%d insn=%u\n", exec_pc, s->imr,
+                        s->prog[(uint16_t)(exec_pc + 1)],
+                        (s->st1 & ST1_INTM) ? 1 : 0, s->insn_count);
+        }
+        if (exec_pc == 0xa4d4) {
+            static unsigned wt = 0; static uint16_t last = 0xffff;
+            uint16_t fl = s->data[0x3f70];
+            if ((fl & 0x0002) || fl != last) {
+                if (wt++ < 60)
+                    fprintf(stderr, "[c54x] WAIT-TEST PC=0xa4d4 data[0x3f70]=0x%04x bit1=%d "
+                            "insn=%u\n", fl, !!(fl & 2), s->insn_count);
+                last = fl;
+            }
+        }
+        if (exec_pc == 0xde97 || exec_pc == 0xde9c || exec_pc == 0xdddb || exec_pc == 0xde8b) {
+            static unsigned db = 0;
+            if (db++ < 50)
+                fprintf(stderr, "[c54x] DE-BR PC=0x%04x data[0x3f70]=0x%04x A=0x%06llx TC=%d "
+                        "insn=%u\n", exec_pc, s->data[0x3f70],
+                        (unsigned long long)(s->a & 0xFFFFFF),
+                        (s->st0 & ST0_TC) ? 1 : 0, s->insn_count);
+        }
+        /* HANDLER-PATH (2026-06-25, RO) : apres VEC28-FORCE, le handler vec28
+         * tourne mais n'atteint pas le dispatch 0xa51c. Trace le chemin exact :
+         * 0xf0(vecteur) -> 0x7234(handler) -> 0x013b(prologue) -> 0xa4e4(sched) ->
+         * 0xa4ff(CALL 0xb522) -> 0xa501/0xa507 -> 0xa51c(dispatch) / 0xa509(arm IMR).
+         * Voir OU la chaine devie. Cap 120. */
+        switch (exec_pc) {
+        case 0x00f0: case 0x7234: case 0x013b: case 0xa4e4: case 0xa4ff:
+        case 0xb522: case 0xa501: case 0xa507: case 0xa51c: case 0xa509:
+        case 0xa582: {
+            static unsigned hp = 0;
+            if (hp++ < 120)
+                fprintf(stderr, "[c54x] HANDLER-PATH PC=0x%04x A=0x%06llx SP=0x%04x "
+                        "INTM=%d d[0x435b]=0x%04x d[0x3f70]=0x%04x insn=%u\n",
+                        exec_pc, (unsigned long long)(s->a & 0xFFFFFF), s->sp,
+                        (s->st1 & ST1_INTM) ? 1 : 0, s->data[0x435b],
+                        s->data[0x3f70], s->insn_count);
+            break;
+        }
+        default: break;
+        }
+        /* ENTRY-A4CA (2026-06-24, RO) : COMMENT le DSP entre dans la boucle
+         * d'attente 0xa4ca — le caller exact (exec_pc precedent hors region
+         * 0xa4ca..0xa4e2) + l'etat. Tranche : entree via go-live 0xa500 (normal,
+         * INTM deja cleared) vs branche/soft-vector directe (anormal = pas passe
+         * par le go-live, INTM encore set). Cap 20. */
+        {
+            static uint16_t prev_pc = 0;
+            if (exec_pc == 0xa4ca && (prev_pc < 0xa4ca || prev_pc > 0xa4e2)) {
+                static unsigned ea = 0;
+                if (ea++ < 20)
+                    fprintf(stderr, "[c54x] ENTRY-A4CA #%u FROM PC=0x%04x INTM=%d "
+                            "IMR=0x%04x data[0x3f6d]=0x%04x d[434e]=%04x d[434f]=%04x "
+                            "insn=%u\n",
+                            ea, prev_pc, (s->st1 & ST1_INTM) ? 1 : 0, s->imr,
+                            s->data[0x3f6d], s->data[0x434e], s->data[0x434f],
+                            s->insn_count);
+            }
+            prev_pc = exec_pc;
+        }
+        /* B19D-WATCH (2026-06-24, RO) : la dispatch commande ARM 0xb19d -> go-live
+         * 0xa500 est-elle JAMAIS atteinte ? 0xa500 est deja sous GOLIVE-WATCH
+         * (jamais vu > 0xa4e2) ; ici on regarde l'amont 0xb19d. Si jamais hit ->
+         * le DSP ne traite pas d_dsp_page, coince dans la mauvaise boucle en
+         * amont du go-live. Cap 30. */
+        if (exec_pc >= 0xb19d && exec_pc <= 0xb1b0) {
+            static unsigned bw = 0;
+            if (bw++ < 30)
+                fprintf(stderr, "[c54x] B19D-WATCH #%u PC=0x%04x op=0x%04x INTM=%d "
+                        "A=0x%06llx data[0x08d4]=0x%04x insn=%u\n",
+                        bw, exec_pc, exec_op, (s->st1 & ST1_INTM) ? 1 : 0,
+                        (unsigned long long)(s->a & 0xFFFFFF),
+                        s->data[0x08d4], s->insn_count);
+        }
+        /* AAD5-TRACE (2026-06-24) : la boucle go-live/AFC 0xa4ca ne relache jamais
+         * (BC 0xa4cd = AEQ A==0). A vient de CALL 0xaad5. On trace 0xaad5-0xaae6
+         * (le poseur de A) instruction par instruction + AR0/AR1/A/TC + les mots
+         * compteurs data[0x434e]/data[0x434f] et les flags candidats
+         * data[0x3f70]/data[0x3f92]/data[0x435b] : voit-on un compteur qui
+         * n'avance pas (bug decode/data) ou une attente d'IT (IMR=0 -> jamais) ?
+         * Logge aussi le verdict au gate 0xa4cd. Cap 100. */
+        if (exec_pc >= 0xaad5 && exec_pc <= 0xaae6) {
+            static unsigned at = 0;
+            if (at++ < 100)
+                fprintf(stderr, "[c54x] AAD5 #%u PC=0x%04x op=0x%04x A=0x%06llx "
+                        "AR0=%04x AR1=%04x BK=%04x TC=%d d[434e]=%04x d[434f]=%04x "
+                        "insn=%u\n",
+                        at, exec_pc, exec_op, (unsigned long long)(s->a & 0xFFFFFF),
+                        s->ar[0], s->ar[1], s->bk, (s->st0 & ST0_TC) ? 1 : 0,
+                        s->data[0x434e], s->data[0x434f], s->insn_count);
+        }
+        if (exec_pc == 0xa4cd) {     /* le gate BC AEQ : pourquoi A==0 ? */
+            static unsigned gt = 0;
+            if (gt++ < 30)
+                fprintf(stderr, "[c54x] AFC-GATE #%u @0xa4cd A=0x%06llx (==0?%d) TC=%d "
+                        "d[3f70]=%04x d[3f92]=%04x d[435b]=%04x d[3fde]=%04x insn=%u\n",
+                        gt, (unsigned long long)(s->a & 0xFFFFFF),
+                        ((s->a & 0xFFFFFFFFFFULL) == 0), (s->st0 & ST0_TC) ? 1 : 0,
+                        s->data[0x3f70], s->data[0x3f92], s->data[0x435b],
+                        s->data[0x3fde], s->insn_count);
+        }
+
+        /* INTM-CLEAR (ungated) : 1ere transition INTM 1->0 du run = RSBX INTM
+         * enfin execute = interruptions globalement armees. LE signal de victoire. */
+        {
+            static int prev_intm = -1;
+            int now_intm = (s->st1 & ST1_INTM) ? 1 : 0;
+            if (prev_intm == 1 && now_intm == 0) {
+                static unsigned ic = 0;
+                if (ic++ < 10)
+                    fprintf(stderr, "[c54x] *** INTM-CLEAR #%u : INTM 1->0 @PC=0x%04x "
+                            "IMR=0x%04x insn=%u — interruptions ARMEES ! ***\n",
+                            ic, exec_pc, s->imr, s->insn_count);
+            }
+            prev_intm = now_intm;
+        }
+
+        /* === SONDES MVDK-FIX VALIDATION + OBSERVATION (2026-06-24) ===
+         * MVDESYNC : apres le fix MVDK 0x71, les mots-operandes ne doivent PLUS
+         * etre executes comme instructions. Fire si PC atterrit sur un mot
+         * operande MVKD (0xb3ce/d1/d4) ou MVDK (0xb3dd/e0/e3) = mis-decode
+         * residuel. SILENCE attendu = fix OK. Cap 40. */
+        if (exec_pc==0xb3ce||exec_pc==0xb3d1||exec_pc==0xb3d4||
+            exec_pc==0xb3dd||exec_pc==0xb3e0||exec_pc==0xb3e3) {
+            static unsigned md=0;
+            if (md++<40)
+                fprintf(stderr, "[c54x] MVDESYNC #%u PC=0x%04x op=0x%04x "
+                        "(mot-operande execute = mis-decode!) from=0x%04x insn=%u\n",
+                        md, exec_pc, exec_op, g_prev_pc, s->insn_count);
+        }
+        /* Valeurs des 2 slots CALA (le 3e = BACC 0xb40f deja a BACC-DISP). */
+        if (exec_pc==0xb3a5) {
+            static unsigned p5=0;
+            if (p5++<30)
+                fprintf(stderr, "[c54x] CALA-SLOT1 @0xb3a5 data[0x0c36]=0x%04x "
+                        "A=0x%06llx SP=0x%04x insn=%u\n",
+                        s->data[0x0c36], (unsigned long long)(s->a & 0xFFFFFF),
+                        s->sp, s->insn_count);
+        }
+        if (exec_pc==0xb3e6) {
+            static unsigned p6=0;
+            if (p6++<30)
+                fprintf(stderr, "[c54x] CALA-SLOT2 @0xb3e6 A=0x%06llx "
+                        "data[0x3f6b]=0x%04x SP=0x%04x insn=%u\n",
+                        (unsigned long long)(s->a & 0xFFFFFF), s->data[0x3f6b],
+                        s->sp, s->insn_count);
+        }
+        /* FINDING-2 unblock : l'init programme-t-il enfin IPTR=0x140 (base
+         * vecteurs 0xa000 -> INT3 @0xa04c, le vrai handler trame) ? one-shot. */
+        {
+            static int seen140=0;
+            uint16_t iptr_now=(s->pmst >> PMST_IPTR_SHIFT) & 0x1FF;
+            if (iptr_now==0x140 && !seen140) {
+                seen140=1;
+                fprintf(stderr, "[c54x] *** IPTR=0x140 REACHED *** PMST=0x%04x "
+                        "PC=0x%04x insn=%u\n", s->pmst, exec_pc, s->insn_count);
+            }
+        }
         /* SONDE post-bootstub-ret (GAP-1) : prologue @0x7013 (pshm contexte) et
          * epilogue @0x7020 (popm ar1/st0/st1/pmst; ret). Si l'epilogue depile un
          * contexte/retPC stale (pas de prologue/IT correspondant) -> desync pile
@@ -12568,6 +12932,31 @@ int c54x_run(C54xState *s, int n_insns)
         s->pc &= 0xFFFF;  /* C54x has 16-bit PC (23-bit with XPC, but wrap at 16-bit) */
         /* consumed == 0 means PC was set by branch */
 
+        /* === BRANCH-TRACE (2026-06-24, sonde amont event-starvation) ==========
+         * consumed==0 <=> PC pose par une branche/call/ret PRISE (sinon s->pc +=
+         * consumed sequentiel, ligne ci-dessus). On logge CHAQUE transfert de
+         * controle PRIS dans la fenetre boot/init [insn<6000], filtre du storm
+         * PC=0 (exec_pc!=0 && tgt!=0), avec site + opcode de branche + CIBLE +
+         * etat des conditions (TC, ACC=0?, A, ARx, IMR, INTM). BUT : voir QUEL
+         * branchement conditionnel detourne le firmware de l'install-vecteurs/
+         * enable-IRQ vers la garde idle = le mur amont. Discrimine les 2 cas du
+         * pari : (a) un BC/BANZ PRIS dont la cible court-circuite la pose IPTR
+         * (=jamais atteint) vs (b) le code atteint la pose sans effet (=bug MMR).
+         * Cap 700. */
+        if (consumed == 0 && exec_pc != 0 && s->pc != 0 && s->insn_count < 6000) {
+            static unsigned bt = 0;
+            if (bt++ < 700) {
+                uint64_t aa = s->a & 0xFFFFFFFFFFULL;
+                fprintf(stderr, "[c54x] BRANCH-TRACE #%u site=0x%04x op=0x%04x -> "
+                        "tgt=0x%04x TC=%d Az=%d A=0x%010llx AR1=%04x AR3=%04x "
+                        "AR5=%04x SP=%04x IMR=%04x INTM=%d insn=%u\n",
+                        bt, exec_pc, exec_op, s->pc,
+                        (s->st0 & ST0_TC) ? 1 : 0, (aa == 0) ? 1 : 0,
+                        (unsigned long long)aa, s->ar[1], s->ar[3], s->ar[5],
+                        s->sp, s->imr, (s->st1 & ST1_INTM) ? 1 : 0, s->insn_count);
+            }
+        }
+
         /* Delayed-branch slot countdown.
          * RCD (and later CALLD/RETD/BD/CCD if extended) sets delayed_pc and
          * delay_slots = 2. The two instructions following the RCD execute
@@ -13117,11 +13506,60 @@ void c54x_reset(C54xState *s)
 
 }
 
+int g_c54x_int3_src = 0;   /* 1=trx 2=bsp 3=shunt — diag source INT3 (RO) */
+
 void c54x_interrupt_ex(C54xState *s, int vec, int imr_bit)
 {
     if (vec < 0 || vec >= 32) return;
     if (imr_bit < 0 || imr_bit >= 16) return;
+    /* VEC28-EXP (2026-06-25, gated CALYPSO_DSP_FRAME_VEC28) : l'IT frame du modele
+     * tape sur vec19/bit3 = stub RETE. Le VRAI scheduler per-frame est vec28/bit12
+     * (0x7234 -> CALL 0xa4e4 -> LD d_dsp_page 0xa51c -> correlateur -> d_fb_det),
+     * arme dans l'IMR voulu du DSP (0x52fd, bit12=1, machine-verifie). On (a) remappe
+     * l'IT frame vers vec28/bit12, et (b) la force a VECTORISER (pas wake-only) quand
+     * une tache GSM est postee (d_dsp_page bit1 = B_GSM_TASK) : la 1ere vectorisation
+     * atteint go-live qui ARME IMR=0x52fd via 0xa582 -> ensuite tout vectorise seul.
+     * Garde d_dsp_page : seulement APRES que l'ARM a poste (boot DSP fini) -> pas de
+     * derail boot. Fidele : on corrige le mapping ligne-frame-TPU -> vecteur DSP +
+     * une ligne cablee vectorise ; aucun poke d'IMR/table/d_fb_det. */
+    bool frame_force = false;
+    {
+        static int g_v28 = -1;
+        if (g_v28 < 0) g_v28 = getenv("CALYPSO_DSP_FRAME_VEC28") ? 1 : 0;
+        if (g_v28 && vec == C54X_INT_FRAME_VEC && imr_bit == C54X_INT_FRAME_BIT) {
+            vec = 28; imr_bit = 12;
+            if (s->data[0x08D4] & 0x0002) {   /* B_GSM_TASK pending */
+                frame_force = true;
+                static unsigned fvlog = 0;
+                if (fvlog++ < 30)
+                    fprintf(stderr, "[c54x] VEC28-FORCE frame->vec28 d_dsp_page=0x%04x "
+                            "IMR=0x%04x idle=%d insn=%u\n", s->data[0x08D4], s->imr,
+                            s->idle, s->insn_count);
+            }
+        }
+    }
     s->ifr |= (1 << imr_bit);
+
+    /* SONDE INT3-RATE (2026-06-24 diag sur-delivrance) : chaque dispatch INT3
+     * (vec 19 = FRAME) avec le delta insn depuis le precedent. delta ~130 =
+     * sur-delivrance (BSP per-rafale) qui noie le DSP ; ~256000 = per trame
+     * (correct). Cap 80. */
+    if (vec == 19) {
+        static uint64_t last_i3 = 0;
+        static unsigned i3n = 0;
+        bool post_fb = s->insn_count > 160000u;   /* ~fn 1206 : ordre FB livre */
+        if (i3n < 40 || (post_fb && i3n < 100)) {
+            i3n++;
+            uint16_t real_page = s->api_ram ? s->api_ram[0x08D4 - 0x0800]
+                                            : s->data[0x08D4];
+            fprintf(stderr, "[c54x] INT3-RATE #%u src=%d insn=%u delta=%lld idle=%d "
+                    "REAL_page(08D4)=0x%04x daram584=0x%04x task_md(058a)=0x%04x\n",
+                    i3n, g_c54x_int3_src, s->insn_count,
+                    (long long)((uint64_t)s->insn_count - last_i3), s->idle,
+                    real_page, s->data[0x0584], s->data[0x058a]);
+        }
+        last_i3 = s->insn_count;
+    }
 
     /* EXPÉRIENCE WIRE585F RETIRÉE 2026-05-30 : forcer data[0x585f] bit7 au frame-IRQ
      * a prouvé (mem=0x0180 TC=1) que le mécanisme est sain MAIS que 0x585f n'est
@@ -13129,6 +13567,7 @@ void c54x_interrupt_ex(C54xState *s, int vec, int imr_bit)
      * Whack-a-mole démontré, pas supposé. cf [[feedback_debug_gate_heisenbug]]. */
 
     bool unmasked = (s->imr & (1 << imr_bit)) != 0;
+    if (frame_force) unmasked = true;   /* VEC28-EXP : ligne frame cablee -> vectorise */
 
     /* Per SPRU131: IDLE exits on ANY interrupt (masked or unmasked).
      * - Unmasked: branch to vector, set INTM=1
