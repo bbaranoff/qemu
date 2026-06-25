@@ -11967,7 +11967,8 @@ int c54x_run(C54xState *s, int n_insns)
         switch (exec_pc) {
         case 0x00f0: case 0x7234: case 0x013b: case 0xa4e4: case 0xa4ff:
         case 0xb522: case 0xa501: case 0xa507: case 0xa51c: case 0xa509:
-        case 0xa582: {
+        case 0xa582: case 0x011e: case 0xa4c7: case 0xa4ca:
+        case 0x703d: case 0xa9ea: case 0xb3ec: {
             static unsigned hp = 0;
             if (hp++ < 120)
                 fprintf(stderr, "[c54x] HANDLER-PATH PC=0x%04x A=0x%06llx SP=0x%04x "
@@ -12117,6 +12118,27 @@ int c54x_run(C54xState *s, int n_insns)
                         s->data[(uint16_t)(s->sp+4)], s->insn_count);
         }
 
+        /* GOLIVE-REDIRECT (2026-06-25, gated CALYPSO_DSP_GOLIVE_BOOT) : EXPÉRIENCE (B)
+         * preuve-de-racine. Au point où le DSP exécuterait la wait-loop à 0xa4df,
+         * redirige le FLUX (PC) vers 0xa4c7 (l'arme IMR go-live), UNE fois. Le DSP
+         * exécute ensuite 0xa4c7(ORM #0x3000,IMR)->0xa4ca->... EN FOREGROUND (il pose
+         * son propre contexte). PAS une vectorisation (pas de saut ISR sur contexte
+         * non posé) = équivalent « et si le soft-vector pointait 0xa4c7 ». TEST, pas fix. */
+        {
+            static int g_golive = -1;
+            if (g_golive < 0) g_golive = getenv("CALYPSO_DSP_GOLIVE_BOOT") ? 1 : 0;
+            if (g_golive) {
+                static int gdone = 0;
+                if (!gdone && s->pc == 0xb3ff) {
+                    gdone = 1;
+                    fprintf(stderr, "[c54x] GOLIVE-REDIRECT pc 0xb3ff(wait) -> 0xb3ec(go-live "
+                            "path: set flags + CALL 0xa9ea + BACC 0x703d -> contexte + IMR) "
+                            "IMR=0x%04x SP=0x%04x insn=%u\n",
+                            s->imr, s->sp, s->insn_count);
+                    s->pc = 0xb3ec;
+                }
+            }
+        }
         /* SONDE GAP-1 DERAIL-ZERO : entrée dans la zone 0x0000-0x0008 = le CALA
          * vers un pointeur de fonction NUL (slot dispatcher SARAM = 0). Logge le
          * site du CALA (g_prev_pc), les accumulateurs (le 0), et les 4 mots ROM
@@ -13364,17 +13386,17 @@ void c54x_reset(C54xState *s)
             s->bk   = r[0x19];
             s->pmst = r[0x1d];
             if (reg_mode == 1) {
-                /* FIX 2026-05-31 : bin ne doit PLUS avaler le garbage RPTB du
-                 * snapshot. BRC/RSA/REA = restes d'une boucle RPTB capturée
-                 * mi-vol → invalides au reset → RPTB fantôme au boot → wedge
-                 * précoce 0x010b. Avec clean (=0), bin CONVERGE avec c54x
-                 * (progresse à 0xf17c, INTM=0). IFR aussi forcé 0 (cohérent).
-                 * Prouvé : c54x (RPTB propre) progresse, bin (garbage) wedge. */
-                s->ifr   = 0x0000;
-                s->ar[0] = r[0x10];   /* 0x5aad (silicium) */
-                s->brc   = 0x0000;
-                s->rsa   = 0x0000;
-                s->rea   = 0x0000;
+                /* BIN PUR (2026-06-25) : .bin VERBATIM, AUCUN hardcode forcé.
+                 * Avant : IFR/BRC/RSA/REA forcés 0 (anti-drift) = hardcodes
+                 * résiduels qui jetaient l'état silicium réel (IFR=0x0008 INT3
+                 * pending notamment). Le snapshot EST l'état silicium → on le
+                 * respecte intégralement. rptb_active=false (posé plus bas) =>
+                 * BRC/RSA/REA non consultés tant qu'un RPTB ne les recharge pas. */
+                s->ifr   = r[0x01];
+                s->ar[0] = r[0x10];
+                s->brc   = r[0x1a];
+                s->rsa   = r[0x1b];
+                s->rea   = r[0x1c];
             } else { /* reg_mode == 2 : hybrid → registres opérationnels du bin,
                       * MAIS champs critiques forcés aux valeurs datasheet pures
                       * (cf audit anti-drift) pour un reset propre. */
@@ -13528,7 +13550,9 @@ void c54x_interrupt_ex(C54xState *s, int vec, int imr_bit)
         if (g_v28 < 0) g_v28 = getenv("CALYPSO_DSP_FRAME_VEC28") ? 1 : 0;
         if (g_v28 && vec == C54X_INT_FRAME_VEC && imr_bit == C54X_INT_FRAME_BIT) {
             vec = 28; imr_bit = 12;
-            if (s->data[0x08D4] & 0x0002) {   /* B_GSM_TASK pending */
+            static int g_noforce = -1;
+            if (g_noforce < 0) g_noforce = getenv("CALYPSO_DSP_GOLIVE_BOOT") ? 1 : 0;
+            if ((s->data[0x08D4] & 0x0002) && !g_noforce) {   /* B_GSM_TASK pending, hors mode golive */
                 frame_force = true;
                 static unsigned fvlog = 0;
                 if (fvlog++ < 30)
