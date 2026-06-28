@@ -147,12 +147,14 @@ void calypso_fbsb_dump(const CalypsoFbsb *s, const char *tag)
         "SB_SEARCH",  "SB_FOUND",
         "DONE", "FAIL",
     };
+    /* NOTE: les vraies valeurs FB (toa/pm/ang/snr) sont écrites dans les
+     * cellules DSP a_sync_demod par le BSP (real DSP path) ; le synth host est
+     * mort. On ne logge donc PLUS s->last_* (toujours 0, trompeur). */
     fprintf(stderr,
             "[fbsb] %s state=%s fb0_att=%u fb1_att=%u sb_att=%u "
-            "fb0_ret=%u afc_ret=%u last(snr=%u toa=%d ang=%d pm=%u)\n",
+            "fb0_ret=%u afc_ret=%u\n",
             tag ? tag : "", names[s->state],
             s->fb0_attempt, s->fb1_attempt, s->sb_attempt,
-            s->fb0_retries, s->afc_retries,
-            s->last_snr, s->last_toa, s->last_angle, s->last_pm);
+            s->fb0_retries, s->afc_retries);
     fflush(stderr);
 }

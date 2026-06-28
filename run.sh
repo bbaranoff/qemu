@@ -2098,7 +2098,7 @@ fi
 # feed_iq) ; grgsm_shm_decode.py lit le ring -> demod (theta) + decode BCCH ->
 # ecrit le SI dans la zone sortie -> shunt_poll_si_shm -> feed_si -> a_cd -> le
 # mobile (osmocon) campe sur la VRAIE SI decodee. mmap = fix shmat conteneur.
-if [ "$CALYPSO_MODE" = "full-grgsm" ]; then
+if [ "$CALYPSO_MODE" = "full-grgsm" ] || [ "$CALYPSO_MODE" = "full" ]; then
     # RECORD drainer : iq_record.fifo (ecrit NON-BLOQUANT par qemu, frame par
     # frame) -> /tmp/record.cfile (ring 128MB) HORS du hot-path qemu => PLUS
     # d underrun (c est le fwrite du ring DANS qemu qui les causait). si_bridge

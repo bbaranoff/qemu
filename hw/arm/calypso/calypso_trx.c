@@ -373,10 +373,34 @@ static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
                  * commandé via dsp_load_rx_task) → passe le check
                  * d_burst_d != burst_id. db_w d_burst_d : p0 DSP word 0x801,
                  * p1 0x815 (db_w p0=0xFFD00000 off0x02, p1=0xFFD00028 off0x2A). */
-                if (s->dsp && s->dsp->data)
-                    val = s->dsp->data[(offset == 0x0052) ? 0x801 : 0x815];
-                else
-                    val = s->dsp_ram[(offset == 0x0052) ? 0x01 : 0x15];
+                /* d_burst_d : le firmware (l1s_nb_resp) attend 0,1,2,3 sur les
+                 * 4 bursts consécutifs d'un bloc et copie a_cd->DATA_IND au
+                 * burst 3. L'écho db_w (0x801/0x815) était décalé d'un cran
+                 * (double-buffer : db_w porte la commande du burst SUIVANT) ->
+                 * "BURST ID X!=Y" -> jamais de DATA_IND. On dérive donc d_burst_d
+                 * du FN : un bloc = 4 frames consécutives (fn..fn+3) ; un saut de
+                 * FN = nouveau bloc -> reset à 0. (Vérifié sur la sonde : blocs =
+                 * 1281,1282,1283,1284 puis gros saut.) Donne exactement 0,1,2,3. */
+                static uint32_t bd_last_fn = 0xFFFFFFFFu;
+                static uint8_t  bd_cnt = 0;
+                if (s->fn != bd_last_fn) {
+                    uint8_t prev = bd_cnt;
+                    bd_cnt = (s->fn == bd_last_fn + 1) ? (uint8_t)((bd_cnt + 1) & 3)
+                                                       : 0;
+                    bd_last_fn = s->fn;
+                    /* SONDE PARTITION (2) : le firmware atteint-il le burst 3 ?
+                     * Si oui (compteur croît régulièrement) -> DATA_IND émis ->
+                     * mur aval (contenu/FN). Si non -> reset avant burst 3 ->
+                     * mur timing. On logge la transition ->3 avec le FN. */
+                    if (bd_cnt == 3 && prev != 3) {
+                        static unsigned n3 = 0;
+                        if (n3++ < 60 || (n3 % 200) == 0)
+                            fprintf(stderr, "[nb3] reached burst3 #%u fn=%u fn%%51=%u "
+                                    "off=0x%04x\n", n3, (unsigned)s->fn,
+                                    (unsigned)(s->fn % 51), (unsigned)offset);
+                    }
+                }
+                val = bd_cnt;
             }
         }
     }
@@ -1276,6 +1300,119 @@ static void calypso_cpu_idle_park(void)
 }
 
 /* ---- TDMA ---- */
+/* === NB -> DATA_IND : real BCCH SI from GSMTAP 4730 into a_cd (real DSP path)
+ * ===========================================================================
+ * Listens for grgsm-decoded System Information (RR, BCCH) on UDP GSMTAP 4730
+ * and presents the 23-byte L2 block in the DSP a_cd cells (dsp word 0x09D0+),
+ * which the ARM reads via API RAM 0x03A0+ when it runs task=24 (ALLC/CCCH).
+ * Pairs with CALYPSO_FORCE_NB (supplies d_task_d/d_burst_d so prim_rx_nb does
+ * not bail "EMPTY"). Same injection philosophy as the FB d_fb_det wiring: the
+ * real DSP CCCH demod does not produce a_cd, so the real decoded SI is placed
+ * in its own cells. Opt-in via CALYPSO_NB_DATAIND=1. The 23B SI source is the
+ * genuine grgsm decode of the BTS I/Q (si_bridge -> GSMTAP 4730). */
+#define NBDI_GSMTAP_HDR  16
+#define NBDI_ACD_WORD    0x09D0   /* a_cd[0] in DSP data space (-> ARM 0x03A0) */
+static int     g_nbdi      = -1;  /* -1 uninit, 0 off, 1 on */
+static int     g_nbdi_fd   = -1;
+static uint8_t g_nbdi_si[6][23];  /* latest SI per type: SI1,SI2,SI3,SI4,2bis,2ter */
+static bool    g_nbdi_have[6];
+static int     g_nbdi_rr;          /* round-robin cursor over available SI types */
+
+static int nbdi_slot_for_mt(uint8_t mt)
+{
+    switch (mt) {
+    case 0x19: return 0;  /* SI1    */
+    case 0x1a: return 1;  /* SI2    */
+    case 0x1b: return 2;  /* SI3    */
+    case 0x1c: return 3;  /* SI4    */
+    case 0x1d: return 4;  /* SI2bis */
+    case 0x1e: return 5;  /* SI2ter */
+    default:   return -1;
+    }
+}
+
+static void nbdi_open(void)
+{
+    const char *e = getenv("CALYPSO_NB_DATAIND");
+    g_nbdi = (e && *e == '1') ? 1 : 0;
+    if (!g_nbdi)
+        return;
+    const char *pe = getenv("CALYPSO_SHUNT_GSMTAP_PORT");
+    int port = (pe && *pe) ? atoi(pe) : 4730;
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) { g_nbdi = 0; return; }
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(port);
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+        fprintf(stderr, "[nb-di] bind(:%d) failed (port busy?) — NB->DATA_IND off\n", port);
+        close(fd); g_nbdi = 0; return;
+    }
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+    g_nbdi_fd = fd;
+    fprintf(stderr, "[nb-di] GSMTAP SI listener on :%d -> a_cd (real DSP path)\n", port);
+}
+
+static void nbdi_poll_and_present(CalypsoTRX *s)
+{
+    if (g_nbdi < 0)
+        nbdi_open();
+    if (g_nbdi != 1 || g_nbdi_fd < 0 || !s || !s->dsp || !s->dsp->data)
+        return;
+
+    /* Drain all pending GSMTAP datagrams; latch SI blocks by type. */
+    uint8_t buf[256];
+    for (;;) {
+        ssize_t n = recvfrom(g_nbdi_fd, buf, sizeof(buf), 0, NULL, NULL);
+        if (n <= 0)
+            break;
+        if (n < NBDI_GSMTAP_HDR + 3)
+            continue;
+        const uint8_t *l2 = buf + NBDI_GSMTAP_HDR;
+        int l2len = (int)n - NBDI_GSMTAP_HDR;
+        if (l2[1] != 0x06)                 /* RR protocol discriminator only */
+            continue;
+        int slot = nbdi_slot_for_mt(l2[2]);
+        if (slot < 0)                      /* SI types only (ignore AGCH/PCH) */
+            continue;
+        int cl = l2len < 23 ? l2len : 23;
+        memcpy(g_nbdi_si[slot], l2, cl);
+        for (int i = cl; i < 23; i++)
+            g_nbdi_si[slot][i] = 0x2b;     /* L2 fill */
+        g_nbdi_have[slot] = true;
+    }
+
+    /* Pick the next available SI type (round-robin so the mobile collects the
+     * full SI set across BCCH blocks) and present it in a_cd. */
+    int slot = -1;
+    for (int k = 0; k < 6; k++) {
+        int c = (g_nbdi_rr + 1 + k) % 6;
+        if (g_nbdi_have[c]) { slot = c; break; }
+    }
+    if (slot < 0)
+        return;
+    g_nbdi_rr = slot;
+
+    const uint8_t *m = g_nbdi_si[slot];
+    uint16_t *d = s->dsp->data;
+    d[NBDI_ACD_WORD + 0] = 0x0000;         /* a_cd[0] FIRE bits -> CRC pass */
+    d[NBDI_ACD_WORD + 1] = 0x0000;         /* a_cd[1] */
+    d[NBDI_ACD_WORD + 2] = 0x0000;         /* a_cd[2] num_biterr */
+    for (int k = 0; k < 12; k++) {         /* a_cd[3..14] = 23 bytes (12 words) */
+        uint8_t lo = m[2 * k];
+        uint8_t hi = (2 * k + 1 < 23) ? m[2 * k + 1] : 0x2b;
+        d[NBDI_ACD_WORD + 3 + k] = (uint16_t)(lo | (hi << 8));
+    }
+    static unsigned nlog = 0;
+    if (nlog++ < 40 || (nlog % 200) == 0)
+        fprintf(stderr, "[nb-di] present SI mt=0x%02x slot=%d #%u -> a_cd[3..]\n",
+                m[2], slot, nlog);
+}
+
 static void calypso_frame_irq_lower(void *o){
     /* Frame IRQ lower counter — log thinned 1/1000 pour drift detection. */
     static uint64_t firq_lower_n = 0;
@@ -1290,6 +1427,9 @@ static void calypso_frame_irq_lower(void *o){
     /* DSP shunt service hook (no-op si shunt off). Servir APRÈS le lower
      * pour que le mock écrive ses résultats entre deux ticks ARM. */
     calypso_dsp_shunt_on_frame_tick();
+
+    /* NB -> DATA_IND : present real grgsm SI in a_cd (opt-in). */
+    nbdi_poll_and_present((CalypsoTRX *)o);
 
     /* Per-frame work for this tick is done — park the vCPU if the guest is
      * back in its idle super-loop, so the host core sleeps until the next
