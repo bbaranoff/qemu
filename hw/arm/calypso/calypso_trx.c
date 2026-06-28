@@ -22,6 +22,7 @@ extern int g_c54x_int3_src;  /* diag source INT3 (RO) */
 #include "hw/arm/calypso/calypso_sim.h"
 #include "hw/arm/calypso/calypso_fbsb.h"
 #include "hw/arm/calypso/calypso_layer1.h"   /* HLE L1 scaffold (CALYPSO_L1=c) */
+#include "calypso_orch.h"
 #include "chardev/char-fe.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -363,7 +364,7 @@ static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
         static int force_nb = -1;
         if (force_nb < 0) {
             const char *e = getenv("CALYPSO_FORCE_NB");
-            force_nb = (e && *e == '1') ? 1 : 0;
+            force_nb = (calypso_orch() && !(e && e[0] == '0')) ? 1 : 0;
         }
         if (force_nb) {
             if ((offset == 0x0050 || offset == 0x0078) && val == 0) {
@@ -546,6 +547,25 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
             wide++;
             fprintf(stderr, "[trx] WR-WIDE #%u off=0x%04x val=0x%04x fn=%u\n",
                     wide, (unsigned)offset, (unsigned)(value & 0xFFFF), s->fn);
+        }
+    }
+
+    /* === HS-ARM-GATE : read-only capture of the foreground go-live gating cells ===
+     * The wait-loop at PROM 0xa4d4 exits only when data[0x3f70] bit1 is set by
+     * one of the FOREGROUND setters (0xde9c/0xa5bd/0xb3ef/0x710c), which are
+     * gated by CMPM/BC tests on the CONTROL cells data[0x098a] / data[0x098c].
+     * Those DSP words map to ARM API offsets 0x0314 / 0x0318 (dsp_word =
+     * offset/2 + 0x0800). This PINS whether the ARM osmocom/TI L1 DSP bring-up
+     * ever writes those cells. READ-ONLY instrumentation: no DSP/ARM state is
+     * poked here — the existing mirror below performs the genuine transport. */
+    if (dsp_real_rom_mode() && (offset == 0x0314 || offset == 0x0318)) {
+        static unsigned gate = 0;
+        if (gate < 256) {
+            gate++;
+            fprintf(stderr,
+                "[trx] HS-ARM-GATE #%u off=0x%04x dsp_word=0x%04x val=0x%04x fn=%u\n",
+                gate, (unsigned)offset, (unsigned)(offset/2 + 0x0800),
+                (unsigned)(value & 0xFFFF), s->fn);
         }
     }
 
@@ -1311,7 +1331,7 @@ static void calypso_cpu_idle_park(void)
  * in its own cells. Opt-in via CALYPSO_NB_DATAIND=1. The 23B SI source is the
  * genuine grgsm decode of the BTS I/Q (si_bridge -> GSMTAP 4730). */
 #define NBDI_GSMTAP_HDR  16
-#define NBDI_ACD_WORD    0x09D0   /* a_cd[0] in DSP data space (-> ARM 0x03A0) */
+#define NBDI_ACD_WORD    0x09D2   /* a_cd[0] in DSP data space (firmware: &a_cd=0xFFD003A4 -> data[0x3A4/2+0x800]=0x09D2; a_cd[3]/L2 byte0 -> 0x09D5/ARM 0x03A4) */
 static int     g_nbdi      = -1;  /* -1 uninit, 0 off, 1 on */
 static int     g_nbdi_fd   = -1;
 static uint8_t g_nbdi_si[6][23];  /* latest SI per type: SI1,SI2,SI3,SI4,2bis,2ter */
@@ -1334,7 +1354,7 @@ static int nbdi_slot_for_mt(uint8_t mt)
 static void nbdi_open(void)
 {
     const char *e = getenv("CALYPSO_NB_DATAIND");
-    g_nbdi = (e && *e == '1') ? 1 : 0;
+    g_nbdi = (calypso_orch() && !(e && e[0] == '0')) ? 1 : 0;
     if (!g_nbdi)
         return;
     const char *pe = getenv("CALYPSO_SHUNT_GSMTAP_PORT");
@@ -1355,6 +1375,22 @@ static void nbdi_open(void)
     fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
     g_nbdi_fd = fd;
     fprintf(stderr, "[nb-di] GSMTAP SI listener on :%d -> a_cd (real DSP path)\n", port);
+}
+
+/* Read l1s.current_time.fn (firmware L1 FN) from ARM RAM. This is the clock the
+ * firmware schedules its BCCH-Norm block on and reads a_cd at burst 3 (fn%51==5);
+ * nbdi must select the SI type and gate the a_cd write on THIS, not s->fn. Default
+ * addr 0x836508, env override CALYPSO_L1S_FN_ADDR — identical to the shunt. */
+static uint32_t nbdi_l1s_fn(void)
+{
+    static uint32_t addr = 0;
+    if (!addr) {
+        const char *e = getenv("CALYPSO_L1S_FN_ADDR");
+        addr = (e && *e) ? (uint32_t)strtoul(e, NULL, 0) : 0x836508;
+    }
+    uint32_t v = 0;
+    cpu_physical_memory_read(addr, &v, sizeof(v));
+    return le32_to_cpu(v);
 }
 
 static void nbdi_poll_and_present(CalypsoTRX *s)
@@ -1386,16 +1422,31 @@ static void nbdi_poll_and_present(CalypsoTRX *s)
         g_nbdi_have[slot] = true;
     }
 
-    /* Pick the next available SI type (round-robin so the mobile collects the
-     * full SI set across BCCH blocks) and present it in a_cd. */
-    int slot = -1;
-    for (int k = 0; k < 6; k++) {
-        int c = (g_nbdi_rr + 1 + k) % 6;
-        if (g_nbdi_have[c]) { slot = c; break; }
+    /* Gate the a_cd write to the firmware's BCCH-Norm quad and pick the SI type
+     * by the GSM 05.02 6.3.1.3 TC schedule, keyed off the FIRMWARE L1 FN — the
+     * same clock the firmware arms BCCH_NORM (fn%51 in {2,3,4,5}) and reads a_cd
+     * at burst 3 (fn%51==5). TC=(fn/51)%8 is CONSTANT across the 4-burst block,
+     * so the chosen SI is stable across the block (no torn block, no RR). */
+    uint32_t fn_fw = nbdi_l1s_fn();
+    uint32_t pos = fn_fw % 51u;
+    if (pos < 2u || pos > 5u)        /* only the BCCH-Norm quad (fn%51 in {2,3,4,5}) */
+        return;
+    unsigned tc = (unsigned)((fn_fw / 51u) % 8u);
+    /* TC0->SI1 TC1->SI2 TC2->SI3 TC3->SI4 TC4->SI2ter TC5->SI2bis TC6->SI3 TC7->SI4 */
+    static const int tc_slot[8] = { 0, 1, 2, 3, 5, 4, 2, 3 };
+    int slot = tc_slot[tc];
+    if (!g_nbdi_have[slot]) {          /* fall back to SI3, then any available type */
+        if (g_nbdi_have[2]) {
+            slot = 2;
+        } else {
+            slot = -1;
+            for (int k = 0; k < 6; k++)
+                if (g_nbdi_have[k]) { slot = k; break; }
+        }
     }
     if (slot < 0)
         return;
-    g_nbdi_rr = slot;
+    g_nbdi_rr = slot;                  /* retained only for the present-SI log line */
 
     const uint8_t *m = g_nbdi_si[slot];
     uint16_t *d = s->dsp->data;
@@ -1411,6 +1462,105 @@ static void nbdi_poll_and_present(CalypsoTRX *s)
     if (nlog++ < 40 || (nlog % 200) == 0)
         fprintf(stderr, "[nb-di] present SI mt=0x%02x slot=%d #%u -> a_cd[3..]\n",
                 m[2], slot, nlog);
+}
+
+/* === SB sync: real BSIC+FN from grgsm (UDP 4731) -> a_sch (real DSP path) ===
+ * ORCH-only. grgsm decodes the real SCH burst and sends "SCH1"+int32{bsic,fn,toa}
+ * on UDP 4731. We encode the 25-bit SCH word (inverse of the firmware's
+ * l1s_decode_sb) and write the DSP a_sch cells, so the mobile syncs to the REAL
+ * BTS frame number instead of SB=0x00000000 -> BSIC=0/FN=52 -> BCCH window
+ * misaligned -> sync timeout. a_sch is PAGED (p0/p1) -> write both. */
+#define SBI_SCH_PORT 4731
+static int      g_sbi      = -1;   /* -1 uninit, 0 off, 1 on */
+static int      g_sbi_fd   = -1;
+static int      g_sbi_bsic = -1;
+static uint32_t g_sbi_fn   = 0;
+
+static void sbi_open(void)
+{
+    g_sbi = calypso_orch() ? 1 : 0;
+    if (!g_sbi)
+        return;
+    const char *pe = getenv("CALYPSO_SHUNT_SCH_PORT");
+    int port = (pe && *pe) ? atoi(pe) : SBI_SCH_PORT;
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) { g_sbi = 0; return; }
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(port);
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+        fprintf(stderr, "[sb-sync] bind(:%d) failed (busy?) — SB sync off\n", port);
+        close(fd); g_sbi = 0; return;
+    }
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+    g_sbi_fd = fd;
+    fprintf(stderr, "[sb-sync] SCH listener on :%d -> a_sch (real BSIC/FN)\n", port);
+}
+
+/* Encode the 25-bit SCH word from BSIC + GSM frame number (exact inverse of the
+ * firmware l1s_decode_sb in prim_fbsb.c). */
+static uint32_t sbi_encode(int bsic, uint32_t fn)
+{
+    uint32_t t1 = fn / 1326u;          /* 1326 = 51*26 */
+    uint32_t t2 = fn % 26u;
+    uint32_t t3 = fn % 51u;
+    uint32_t t3p = (t3 >= 1u) ? ((t3 - 1u) / 10u) : 0u;
+    uint32_t sb = 0;
+    sb |= ((uint32_t)(bsic & 0x3f)) << 2;   /* BSIC -> sb[7:2]   */
+    sb |= (t1 & 1u) << 23;                  /* t1[0]  -> sb[23]  */
+    sb |= (t1 & 0x1feu) << 7;               /* t1[8:1]-> sb[15:8]*/
+    sb |= (t1 >> 9) & 3u;                    /* t1[10:9]->sb[1:0] */
+    sb |= (t2 & 0x1fu) << 18;               /* t2     -> sb[22:18]*/
+    sb |= (t3p & 1u) << 24;                  /* t3p[0] -> sb[24]  */
+    sb |= ((t3p >> 1) & 3u) << 16;           /* t3p[2:1]->sb[17:16]*/
+    return sb;
+}
+
+static void sbi_poll_and_present(CalypsoTRX *s)
+{
+    if (g_sbi < 0)
+        sbi_open();
+    if (g_sbi != 1 || g_sbi_fd < 0 || !s || !s->dsp || !s->dsp->data)
+        return;
+
+    uint8_t buf[64];
+    for (;;) {
+        ssize_t n = recvfrom(g_sbi_fd, buf, sizeof(buf), 0, NULL, NULL);
+        if (n <= 0)
+            break;
+        if (n >= 16 && buf[0]=='S' && buf[1]=='C' && buf[2]=='H' && buf[3]=='1') {
+            int32_t bsic, fn, toa;
+            memcpy(&bsic, buf + 4, 4);
+            memcpy(&fn,   buf + 8, 4);
+            memcpy(&toa,  buf + 12, 4);
+            (void)toa;
+            g_sbi_bsic = (int)bsic;
+            g_sbi_fn   = (uint32_t)fn;
+        }
+    }
+    if (g_sbi_bsic < 0)
+        return;
+
+    uint32_t sb = sbi_encode(g_sbi_bsic, g_sbi_fn);
+    uint16_t *d = s->dsp->data;
+    /* a_sch[0] CRC (bit8=0 => OK): p0 0x0837 / p1 0x084B */
+    d[0x0837] = 0x0000; d[0x084B] = 0x0000;
+    /* a_sch[3] = sb[15:0] : p0 0x083A / p1 0x084E */
+    d[0x083A] = (uint16_t)(sb & 0xFFFF); d[0x084E] = (uint16_t)(sb & 0xFFFF);
+    /* a_sch[4] = sb[24:16] : p0 0x083B / p1 0x084F */
+    d[0x083B] = (uint16_t)(sb >> 16); d[0x084F] = (uint16_t)(sb >> 16);
+    /* a_serv_demod[D_TOA] on-time (23) so the SB passes the "future" check:
+     * p0 0x0830 / p1 0x0844 */
+    d[0x0830] = (uint16_t)23; d[0x0844] = (uint16_t)23;
+
+    static unsigned nlog = 0;
+    if (nlog++ < 40 || (nlog % 200) == 0)
+        fprintf(stderr, "[sb-sync] a_sch <- bsic=%d fn=%u sb=0x%08x #%u\n",
+                g_sbi_bsic, g_sbi_fn, (unsigned)sb, nlog);
 }
 
 static void calypso_frame_irq_lower(void *o){
@@ -1430,6 +1580,9 @@ static void calypso_frame_irq_lower(void *o){
 
     /* NB -> DATA_IND : present real grgsm SI in a_cd (opt-in). */
     nbdi_poll_and_present((CalypsoTRX *)o);
+
+    /* SB sync : present real grgsm BSIC/FN in a_sch (ORCH). */
+    sbi_poll_and_present((CalypsoTRX *)o);
 
     /* Per-frame work for this tick is done — park the vCPU if the guest is
      * back in its idle super-loop, so the host core sleeps until the next

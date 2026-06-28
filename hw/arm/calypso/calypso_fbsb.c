@@ -13,6 +13,7 @@
  */
 #include "calypso_fbsb.h"
 #include "calypso_full_pcb.h"   /* DARAM lock helpers — cf gap #3 */
+#include "calypso_orch.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -46,6 +47,7 @@ static int fbsb_synth_enabled(void)
 void calypso_fbsb_publish_fb_found(CalypsoFbsb *s, int16_t toa, uint16_t pm,
                                    int16_t ang, uint16_t snr)
 {
+    if (!calypso_orch()) return;   /* exe: real DSP writes the NDB */
     if (!s || !s->ndb) return;
 
     calypso_pcb_daram_lock_acquire();
@@ -108,7 +110,7 @@ void calypso_fbsb_on_dsp_task_change(CalypsoFbsb *s, uint16_t d_task_md,
         /* Rien n'écrit les cellules sync/demod sur le chemin stub →
          * l'ARM relit un TOA périmé. On republie la détection synthétique
          * (CALL_FLOW.md étape 4) si activé. */
-        if (fbsb_synth_enabled()) {
+        if (calypso_orch() && fbsb_synth_enabled()) {
             int16_t toa, ang;
             uint16_t pm, snr;
             /* Wire the REAL host-measured FB detection (BSP FCCH correlator)

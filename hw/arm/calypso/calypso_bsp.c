@@ -28,6 +28,7 @@
 #include <fcntl.h>
 #include "qemu/timer.h"
 #include "hw/arm/calypso/calypso_bsp.h"
+#include "calypso_orch.h"
 #include "hw/arm/calypso/calypso_c54x.h"
 extern int g_c54x_int3_src;  /* diag source INT3 (RO) */
 #include "hw/arm/calypso/calypso_iota.h"
@@ -1211,7 +1212,7 @@ void calypso_bsp_deliver_buffered(uint32_t current_fn)
                  *   ang = 0 (residual ~0 for clean carrier-aligned IQ)
                  *   snr proportional to coherence, > AFC_SNR_THRESHOLD(2560) locked
                  * Runs EVERY burst (NOT gated by the log cap). */
-                if (bsp.dsp) {
+                if (calypso_orch() && bsp.dsp) {   /* ORCH only: exe = real DSP owns d_fb_det */
                     calypso_pcb_daram_lock_acquire();
                     if (same_sign >= 8 && nmax >= 64) {
                         bsp.dsp->data[0x08FA] = (uint16_t)23;
