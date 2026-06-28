@@ -1196,7 +1196,7 @@ static void calypso_dsp_shunt_feed_agch(const uint8_t *l2, int len)
     {
         static int reqref_rw = -1, reqref_perra = -1, rr_adj = -99999;
         if (reqref_rw < 0)    { const char *e = getenv("CALYPSO_REQREF_REWRITE"); reqref_rw = (e && *e == '1') ? 1 : 0; }  /* defaut OFF : ancien rewrite GLOBAL (50% multi-RACH) */
-        if (reqref_perra < 0) { const char *e = getenv("CALYPSO_REQREF_PERRA");   reqref_perra = (e && *e == '1') ? 1 : 0; } /* [purge orch 2026-06-25] defaut OFF : le REQREF rewrite FABRIQUE le req-ref IMM ASSIGN = orchestration. Off sauf CALYPSO_REQREF_PERRA=1 explicite. */
+        if (reqref_perra < 0) { const char *e = getenv("CALYPSO_REQREF_PERRA");   reqref_perra = (e && *e == '0') ? 0 : 1; } /* defaut ON : req-ref PER-RA (FN exact du RACH_CONF keye par ra) */
         if (rr_adj == -99999) { const char *e = getenv("CALYPSO_REQREF_ADJ");     rr_adj = e ? atoi(e) : 0; }
         if ((reqref_perra || reqref_rw) && n >= 10 && g_shunt.agch_buf[2] == 0x3f) {
             uint8_t ra = g_shunt.agch_buf[7];
