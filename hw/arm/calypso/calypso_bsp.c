@@ -1211,7 +1211,18 @@ void calypso_bsp_deliver_buffered(uint32_t current_fn)
                  *   ang = 0 (residual ~0 for clean carrier-aligned IQ)
                  *   snr proportional to coherence, > AFC_SNR_THRESHOLD(2560) locked
                  * Runs EVERY burst (NOT gated by the log cap). */
-                if (bsp.dsp) {
+                /* ORCH-GATE (2026-06-29) : ce poke host-side de a_sync_demod
+                 * (d_fb_det/TOA/PM/SNR) est une INJECTION — il ment au firmware « FB
+                 * trouvé » avant tout vrai search, et polluait TOUTE mesure FB en EXE.
+                 * Réservé à l'ORCH (injection assumée). EXE (CALYPSO_ORCH unset) : NE
+                 * PAS poker → le vrai DSP écrit a_sync lui-même. Cf
+                 * calypso-no-inject-l1-measurements. */
+                static int orch_poke = -1;
+                if (orch_poke < 0) {
+                    const char *e = getenv("CALYPSO_ORCH");
+                    orch_poke = (e && e[0] && e[0] != '0') ? 1 : 0;
+                }
+                if (orch_poke && bsp.dsp) {
                     calypso_pcb_daram_lock_acquire();
                     if (same_sign >= 8 && nmax >= 64) {
                         bsp.dsp->data[0x08FA] = (uint16_t)23;

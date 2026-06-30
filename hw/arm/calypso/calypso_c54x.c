@@ -1895,6 +1895,21 @@ static uint16_t data_read_locked(C54xState *s, uint16_t addr)
         }
         last_vd[widx] = vd;
     }
+    /* GOLIVE-MIRROR (2026-06-29): prove/kill the ARM<->DSP mailbox-mirror gap.
+     * Go-live (0xa671) reads 0x0c36/0x0c37/0x08de from api_ram[] while the ARM
+     * mirror (calypso_trx.c) writes only data[]+dsp_ram[]. Log BOTH views so one
+     * rerun shows whether the ARM task block reaches the array the DSP reads. */
+    if (addr == 0x0c36 || addr == 0x0c37 || addr == 0x08de) {
+        static unsigned gm_count;
+        if (gm_count < 80) {
+            uint16_t va = s->api_ram ? s->api_ram[addr - C54X_API_BASE] : 0xDEAD;
+            fprintf(stderr,
+                    "[c54x] GOLIVE-MIRROR data[0x%04x] data=0x%04x api_ram=0x%04x PC=0x%04x insn=%u\n",
+                    addr, s->data[addr], va, s->pc, s->insn_count);
+            gm_count++;
+        }
+    }
+
     /* Wait-loop diagnostic: 0x3dd0 was found to absorb ~99.5 % of DARAM
      * reads after the first ~500k reads — the DSP is stuck polling it.
      * Log the first PCs and then sample once per million reads so we can
@@ -4149,6 +4164,30 @@ static int c54x_exec_one(C54xState *s)
      * de ST0 à l'entrée dispatcher 0x8341. Si FB lock + AFC converge → le bit
      * est load-bearing, la chasse au DP périmé est justifiée. Sinon → faute DSP
      * plus profonde DERRIÈRE le dispatcher, et chasser 0x3125 est prématuré. */
+    /* A6GATE (2026-06-29, dernière brique de la chaîne d'impossibilité) : le
+     * segment 0xa671->0xa6cf est un handshake périphérique (PORTR/PORTW PA=0x0003
+     * /0xf900, NON modélisés) qui gate l'enable RSBX INTM @0xa6cf. On logge la
+     * valeur du 1er gate data[0x3fde] (0xa673 BC AEQ), le résultat PORTR -> T
+     * (data[0x000e]) à 0xa675, les cellules de contrôle 0x3fdb/0x3fdd, et SI le
+     * RSBX INTM @0xa6cf est atteint. Tranche warm-residue vs peripheral-garbage —
+     * mais dans les deux cas confirme : le snapshot ne porte pas le contexte cold.
+     * CALYPSO_DEBUG=A6GATE. */
+    if (calypso_debug_enabled("A6GATE") &&
+        (s->pc == 0xa671 || s->pc == 0xa675 || s->pc == 0xa67b ||
+         s->pc == 0xa6ae || s->pc == 0xa6b8 || s->pc == 0xa6cf || s->pc == 0xa6d0 || s->pc == 0xa6d1)) {
+        static unsigned a6n = 0;
+        if (a6n++ < 200)
+            fprintf(stderr, "[c54x] A6GATE PC=0x%04x op=0x%04x ST1=0x%04x %s d[3fde]=0x%04x d[3fdb]=0x%04x "
+                    "d[3fdd]=0x%04x T(d[000e])=0x%04x A=0x%06llx INTM=%d IMR=0x%04x insn=%u\n",
+                    s->pc, prog_fetch(s, s->pc), s->st1,
+                    s->pc == 0xa6cf ? "<<RSBX-INTM-REACHED(enable!)>>" :
+                    s->pc == 0xa6b8 ? "<<IDLE-2-dead>>" :
+                    s->pc == 0xa675 ? "<<PORTR PA=0x0003>>" :
+                    s->pc == 0xa671 ? "<<1er-gate>>" : "",
+                    s->data[0x3fde], s->data[0x3fdb], s->data[0x3fdd], s->data[0x000e],
+                    (unsigned long long)(s->a & 0xFFFFFF),
+                    (s->st1 & ST1_INTM) ? 1 : 0, s->imr, s->insn_count);
+    }
     if (s->pc == 0x8341) {
         static int inited = 0, force_dp = -1, force_from = -1;
         if (!inited) {
@@ -5503,7 +5542,7 @@ static int c54x_exec_one(C54xState *s)
                 return consumed + s->lk_used;
             }
 
-            if ((op & 0xFCE0) == 0xF4A0) {
+            if ((op & 0xFCE0) == 0xF4A0 && (op & 0xF0) != 0xB0) {  /* SFTL — exclure RSBX/SSBX 0x_Bx (2026-06-29: le mask 0xFCE0 avalait f6bb/f7bb=RSBX/SSBX INTM -> INTM gele) */
                 /* SFTL src,shift,dst — logical shift accumulator */
                 int src = (op >> 8) & 1, dst = (op >> 9) & 1;
                 int shift = op & 0x1F; if (shift > 15) shift -= 32;
@@ -5767,7 +5806,7 @@ static int c54x_exec_one(C54xState *s)
                     if (dst) s->b = sext40(sv); else s->a = sext40(sv);
                     return consumed + s->lk_used;
                 }
-                if ((op & 0xFCE0) == 0xF4A0) {
+                if ((op & 0xFCE0) == 0xF4A0 && (op & 0xF0) != 0xB0) {  /* SFTL — exclure RSBX/SSBX 0x_Bx (2026-06-29: le mask 0xFCE0 avalait f6bb/f7bb=RSBX/SSBX INTM -> INTM gele) */
                     /* SFTL src,shift,dst — logical shift accumulator */
                     int src = (op >> 8) & 1, dst = (op >> 9) & 1;
                     int shift = op & 0x1F; if (shift > 15) shift -= 32;
@@ -6548,7 +6587,15 @@ static int c54x_exec_one(C54xState *s)
                  * Per tic54x-opc.c: RSBX 0xF4B0 mask 0xFDF0 covers F6Bx. */
                 int bit = op & 0x0F;
                 rsbx_intm_check(s, op);  /* probe candidat 1 doc §7 */
+                uint16_t st1_before = s->st1;
                 s->st1 &= ~(1 << bit);
+                if (calypso_debug_enabled("A6GATE") && s->pc == 0xa6cf) {
+                    static unsigned rf = 0;
+                    if (rf++ < 10)
+                        fprintf(stderr, "[c54x] RSBX-FIRE @0xa6cf op=0x%04x bit=%d "
+                                "ST1 0x%04x->0x%04x insn=%u\n",
+                                op, bit, st1_before, s->st1, s->insn_count);
+                }
                 return consumed + s->lk_used;
             }
             /* Delayed branches/calls/returns from PROM (per tic54x-opc.c).
