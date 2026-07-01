@@ -12,7 +12,7 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 #include "calypso_fbsb.h"
-#include "calypso_full_pcb.h"   /* DARAM lock helpers — cf gap #3 */
+#include "hw/arm/calypso/calypso_full_pcb.h"   /* DARAM lock helpers — cf gap #3 */
 #include "calypso_orch.h"
 #include <stdio.h>
 #include <stdlib.h>

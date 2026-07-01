@@ -35,7 +35,7 @@ extern int g_c54x_int3_src;  /* diag source INT3 (RO) */
 #include "hw/arm/calypso/calypso_twl3025.h"
 #include "hw/arm/calypso/calypso_trx.h"
 #include "calypso_tint0.h"  /* GSM_HYPERFRAME */
-#include "calypso_full_pcb.h"  /* DARAM lock helpers — voir pcb.h gap #3 */
+#include "hw/arm/calypso/calypso_full_pcb.h"  /* DARAM lock helpers — voir pcb.h gap #3 */
 #include "calypso_dsp_shunt.h"
 
 /* calypso_trx_get_fn now provided by calypso_trx.h (included above). */
