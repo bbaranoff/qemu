@@ -31,6 +31,7 @@ static int      a2d_enai;         /* whether to clear INTM (enable interrupts)  
 static int      a2d_noredir;      /* if set, arm only; do not redirect PC        */
 static int      a2d_hs_set;       /* hold data[0x098a]/[0x098c] each step        */
 static uint16_t a2d_hs;           /* value held into the go-live handshake cells */
+static uint16_t a2d_hsv[5];       /* per-cell 0x098a..0x098e (HS_A..HS_E)         */
 
 static volatile int a2d_pending;  /* ARM requested orchestration, awaiting DSP   */
 static unsigned     a2d_done;     /* drives applied so far                       */
@@ -66,8 +67,16 @@ static void a2d_resolve(void)
     a2d_enai = getenv("CALYPSO_ARM2DSP_ENAI") ? 1 : 0;
     a2d_noredir = getenv("CALYPSO_ARM2DSP_NOREDIR") ? 1 : 0;
     const char *hs = getenv("CALYPSO_ARM2DSP_HS");
-    a2d_hs_set = (hs && *hs) ? 1 : 0;
-    a2d_hs = a2d_hs_set ? (uint16_t)strtoul(hs, NULL, 0) : 0;
+    a2d_hs = (hs && *hs) ? (uint16_t)strtoul(hs, NULL, 0) : 0;
+    a2d_hsv[0] = a2d_env_u16("CALYPSO_ARM2DSP_HS_A", a2d_hs);
+    a2d_hsv[1] = a2d_env_u16("CALYPSO_ARM2DSP_HS_B", a2d_hs);
+    a2d_hsv[2] = a2d_env_u16("CALYPSO_ARM2DSP_HS_C", a2d_hs);
+    a2d_hsv[3] = a2d_env_u16("CALYPSO_ARM2DSP_HS_D", a2d_hs);
+    a2d_hsv[4] = a2d_env_u16("CALYPSO_ARM2DSP_HS_E", a2d_hs);
+    a2d_hs_set = ((hs && *hs) ||
+                  getenv("CALYPSO_ARM2DSP_HS_A") || getenv("CALYPSO_ARM2DSP_HS_B") ||
+                  getenv("CALYPSO_ARM2DSP_HS_C") || getenv("CALYPSO_ARM2DSP_HS_D") ||
+                  getenv("CALYPSO_ARM2DSP_HS_E")) ? 1 : 0;
     if (a2d_on) {
         fprintf(stderr,
                 "[arm2dsp] enabled: trigger=d_dsp_page(0x01A8) bit1 ; "
@@ -104,18 +113,18 @@ void calypso_arm2dsp_on_dsp_step(C54xState *s, uint16_t exec_pc)
         /* real ARM->DSP go-live handshake asserted : the 5-cell state machine
          * at 0xdde0-0xde9f reads data[0x098a..0x098e] to pick the dispatch that
          * routes to the 0x3f70 bit1 setter (0xde9c). Hold all five. */
-        s->data[0x098a] = a2d_hs;
-        s->data[0x098b] = a2d_hs;
-        s->data[0x098c] = a2d_hs;
-        s->data[0x098d] = a2d_hs;
-        s->data[0x098e] = a2d_hs;
+        s->data[0x098a] = a2d_hsv[0];
+        s->data[0x098b] = a2d_hsv[1];
+        s->data[0x098c] = a2d_hsv[2];
+        s->data[0x098d] = a2d_hsv[3];
+        s->data[0x098e] = a2d_hsv[4];
         /* the DSP reads the API region (0x0800+) from api_ram, NOT data[] */
         if (s->api_ram) {
-            s->api_ram[0x098a - 0x0800] = a2d_hs;
-            s->api_ram[0x098b - 0x0800] = a2d_hs;
-            s->api_ram[0x098c - 0x0800] = a2d_hs;
-            s->api_ram[0x098d - 0x0800] = a2d_hs;
-            s->api_ram[0x098e - 0x0800] = a2d_hs;
+            s->api_ram[0x098a - 0x0800] = a2d_hsv[0];
+            s->api_ram[0x098b - 0x0800] = a2d_hsv[1];
+            s->api_ram[0x098c - 0x0800] = a2d_hsv[2];
+            s->api_ram[0x098d - 0x0800] = a2d_hsv[3];
+            s->api_ram[0x098e - 0x0800] = a2d_hsv[4];
         }
     }
     /* Sustained interrupt window: once armed, keep INTM cleared each pass
