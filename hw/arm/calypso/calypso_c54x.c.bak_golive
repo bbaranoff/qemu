@@ -8,7 +8,6 @@
  */
 
 #include "calypso_c54x.h"
-#include "calypso_arm2dsp.h"
 #include "hw/arm/calypso/calypso_full_pcb.h"  /* daram_lock, api_ram_lock */
 #include <stdio.h>
 #include <stdlib.h>
@@ -11945,36 +11944,11 @@ int c54x_run(C54xState *s, int n_insns)
         if (exec_pc == 0xa4d4) {
             static unsigned wt = 0; static uint16_t last = 0xffff;
             uint16_t fl = s->data[0x3f70];
-            /* FORCE-GOLIVE (etape1, gated CALYPSO_FORCE_GOLIVE) : release the
-             * go-live wait-loop by setting data[0x3f70] bit1 at the 0xa4d4 test
-             * (normally gated on control cells 0x098a/0x098c which the ARM leaves 0). */
-            { static int fg = -1; if (fg < 0) { const char *e = getenv("CALYPSO_FORCE_GOLIVE"); fg = (e && atoi(e) > 0) ? 1 : 0; }
-              if (fg && !(fl & 0x0002)) { s->data[0x3f70] = (uint16_t)(fl | 0x0002); fl = s->data[0x3f70];
-                static unsigned fgc = 0; if (fgc++ < 8) fprintf(stderr, "[c54x] FORCE-GOLIVE 0x3f70 |= bit1 -> 0x%04x insn=%u\n", fl, s->insn_count); } }
             if ((fl & 0x0002) || fl != last) {
                 if (wt++ < 60)
                     fprintf(stderr, "[c54x] WAIT-TEST PC=0xa4d4 data[0x3f70]=0x%04x bit1=%d "
                             "insn=%u\n", fl, !!(fl & 2), s->insn_count);
                 last = fl;
-            }
-        }
-        calypso_arm2dsp_on_dsp_step(s, exec_pc);
-
-        /* FORCE-098 (etape A faithful, gated CALYPSO_FORCE_098=<hexval>) : juste AVANT
-         * les lectures LD *(0x098c)/(0x098a) des setters (0xde86 chemin GO ; 0xde94 ;
-         * 0xb3e4), pose data[0x098a]/[0x098c] = valeur non nulle cote DSP. Teste si le
-         * DSP prend alors la branche GO (0xddf5) puis setter bit1 puis go-live. */
-        {
-            static int f98 = -1; static uint16_t f98v = 0;
-            if (f98 < 0) { const char *e = getenv("CALYPSO_FORCE_098");
-                f98v = (e && *e) ? (uint16_t)strtoul(e, NULL, 0) : 0; f98 = f98v ? 1 : 0; }
-            if (f98 && (exec_pc == 0xde86 || exec_pc == 0xde94 || exec_pc == 0xb3e4 ||
-                        exec_pc == 0xa5bd)) {
-                s->data[0x098a] = f98v; s->data[0x098c] = f98v;
-                static unsigned f9c = 0;
-                if (f9c++ < 12)
-                    fprintf(stderr, "[c54x] FORCE-098 @0x%04x data[098a/c]=0x%04x insn=%u\n",
-                            exec_pc, f98v, s->insn_count);
             }
         }
         if (exec_pc == 0xde97 || exec_pc == 0xde9c || exec_pc == 0xdddb || exec_pc == 0xde8b) {
