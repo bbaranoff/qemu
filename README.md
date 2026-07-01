@@ -1,71 +1,87 @@
-# qemu-calypso — overlay du fork QEMU Calypso
+# qemu-src — le fork Calypso QEMU (arbre de build & run)
 
-`qemu-calypso` est **l'overlay** qui contient *tout ce qui diffère* de QEMU
-upstream pour l'émulation du baseband **TI Calypso** (ARM7 + DSP TMS320C54x).
-Appliqué sur un QEMU genuine, il produit le fork :
+Arbre de travail **autoritaire** du fork QEMU pour l'émulation du baseband
+**TI Calypso** (ARM7 + DSP TMS320C54x). C'est ici qu'on **build** et qu'on
+**lance** le pipeline.
 
 ```
-QEMU (genuine 9.2.x)  +  qemu-calypso (cet overlay)  =  qemu  (le fork)
+QEMU (genuine 9.2.4)  +  sous-système Calypso  =  ce fork (qemu-src)
 ```
 
-## Fabriquer le fork
+> L'**overlay** qui isole le delta vs QEMU upstream (et sait le ré-appliquer sur
+> un genuine via `make-fork.sh`) vit dans `../qemu-calypso`. `qemu-src` est le
+> résultat matérialisé, directement compilable — pas un overlay.
+
+## Build
+
+Le répertoire `build/` est déjà configuré (produit `qemu-system-arm`) :
 
 ```sh
-./make-fork.sh [GENUINE_DIR] [OUT_DIR]
-# défauts : GENUINE_DIR=/opt/GSM/QEMU (v9.2.4)  OUT_DIR=/opt/GSM/qemu-fork
+cd build && ninja qemu-system-arm
 ```
 
-`make-fork.sh` copie le genuine puis applique cet overlay par-dessus (en
-préservant la structure). Build ensuite :
+Reconfiguration depuis zéro si besoin :
 
 ```sh
-cd <OUT_DIR> && mkdir -p build && cd build \
-  && ../configure --target-list=arm-softmmu && ninja qemu-system-arm
+mkdir -p build && cd build && ../configure --target-list=arm-softmmu && ninja qemu-system-arm
 ```
 
-## Contenu (le delta vs genuine QEMU)
+## Lancer le pipeline
 
-**Arbre QEMU modifié / ajouté** — ce qui rend `qemu-system-arm` conscient du Calypso :
+```sh
+./start-clean.sh          # alias racine -> bash_scripts/start-clean.sh
+                          # source calypso.env puis exec bash_scripts/run.sh
+```
+
+Chemin DSP réel (défauts dans `run.sh`) : `CALYPSO_DSP=c54x`,
+`CALYPSO_DSP_REG_MODE=c54x`, `CALYPSO_DSP_SHUNT=0`. Log runtime : `/root/qemu.log`.
+Les scripts sont relocatables (`ROOT` détecté depuis `bash_scripts/`).
+
+## Structure
+
+**Arbre QEMU + sous-système Calypso** :
 
 | Chemin | Rôle |
 |---|---|
 | `hw/arm/calypso/` | Le sous-système : DSP c54x, TPU/TDMA, BSP, API-RAM, machine. |
 | `include/hw/arm/calypso/` | Headers publics du sous-système. |
-| `hw/arm/{meson.build,Kconfig}` | Enregistrement de la machine `calypso` (`subdir('calypso')`, `config CALYPSO`). |
-| `hw/{char,intc,ssi,timer}/meson.build` | Enregistrement des périphériques Calypso. |
+| `hw/arm/{meson.build,Kconfig}` · `hw/{char,intc,ssi,timer}/meson.build` | Enregistrement machine `calypso` + périphériques. |
 | `configs/devices/arm-softmmu/default.mak` | Active la machine dans le build arm-softmmu. |
-| `tests/`, `tools/`, `scripts/`, `subprojects/` | Ajouts intégrés à l'arbre QEMU. |
+| `build/` | Répertoire de build (ninja) — produit `qemu-system-arm`. |
+| (le reste) | QEMU 9.2.4 upstream, inchangé. |
 
-**Glue projet (runtime / dev)** — hors source QEMU, sert à lancer et déboguer :
+**Glue projet (runtime / dev)** :
 
 | Chemin | Rôle |
 |---|---|
-| `calypso.env` | Variables d'environnement du pipeline (sourcé par `start-clean.sh`). |
-| `bash_scripts/` | Lancement : `run.sh`, `start-clean.sh`, runners GSM. |
-| `python_scripts/`, `gdb_scripts/`, `opt-gsm-scripts/`, `diag/` | Outils de décodage / GDB / sniff / diag. |
+| `calypso.env` | Env du pipeline (sourcé par `start-clean.sh`). |
+| `start-clean.sh` · `bash_scripts/` | Lancement (`run.sh`, `start-clean.sh`, runners GSM). |
+| `python_scripts/`, `gdb_scripts/`, `opt-gsm-scripts/`, `diag/` | Décodage / GDB / sniff / diag. |
+| `scripts/` | Outils build DSP (`make_dsp_bin_L1.py`, `populate-si.sh`, …) + scripts QEMU. |
 | `dsp_blobs/`, `calypso_dsp.txt` | ROM DSP (dump réel) + blobs chargés par la machine. |
-| `cfgs/`, `patches/` | Configs et patch externe (osmo-bts skew). |
-| `doc/project/` | Docs projet (flux, threading, statut). |
-
-## Lancer le pipeline
-
-```sh
-./bash_scripts/start-clean.sh        # source calypso.env puis exec run.sh
-```
-
-Chemin DSP réel (défauts confirmés dans `run.sh`) : `CALYPSO_DSP=c54x`,
-`CALYPSO_DSP_REG_MODE=c54x`, `CALYPSO_DSP_SHUNT=0`. Log runtime : `/root/qemu.log`.
+| `cfgs/`, `patches/` | Configs (osmo-trx-ipc, mobile) + patch externe (osmo-bts skew). |
 
 ## Documentation
 
-- **Sous-système Calypso** (le cœur technique) : [`doc/doc_master.md`](doc/doc_master.md)
-  — index maître (README, schematics, corrélateur, décodeur, rapports, sessions archivées).
-- **Projet** (flux, threading, statut) : [`doc/project/`](doc/project/) (`CLAUDE.md`, `ARCHITECTURE.md`, `*_FLOW.md`, …).
+Toute la doc est centralisée dans **[`doc/`](doc/)** :
 
-## État courant (résumé)
+- **Index maître** : [`doc/doc_master.md`](doc/doc_master.md) — README sous-système,
+  schematics, corrélateur, décodeur, rapports, sessions archivées.
+- **Projet** (flux e2e, threading, statut) : [`doc/project/`](doc/project/)
+  (`CLAUDE.md`, `ARCHITECTURE.md`, `*_FLOW.md`, …).
 
-Objectif : réveiller le vrai DSP c54x pour qu'il écrive `d_fb_det != 0` (détection
-FB/FCCH), **sans hack** (règle #1 : on répare le câblage de l'émulateur, jamais
-l'état interne du DSP). Blocker terminal : les interruptions DSP restent masquées
-(`IMR=0x0000` tout le run, jamais ré-armé) → le handshake go-live ARM→DSP n'aboutit
-pas. Détail + leviers : `doc/doc_master.md`.
+## État courant
+
+Objectif : réveiller le vrai DSP c54x pour qu'il écrive lui-même `d_fb_det != 0`
+(détection FB/FCCH), **sans hack** (règle #1 : on répare le câblage de l'émulateur,
+jamais l'état interne du DSP).
+
+**Blocker terminal** : les interruptions DSP restent masquées (`IMR=0x0000` tout le
+run, jamais ré-armé) → le DSP déraille (`POST-BOOTSTUB-RET`) au lieu de tourner le
+corrélateur → `d_fb_det=0`, `FB0_SEARCH fb0_ret=0`, `NO_CELL_FOUND`. Cause en amont
+= le **handshake go-live ARM→DSP** n'aboutit pas (l'ARM n'assert jamais l'enable ;
+`api_write_cb` non câblé). Détail + leviers : [`doc/doc_master.md`](doc/doc_master.md).
+
+> Note infra : la machine tourne headless (`-serial pty`) et **doit** être lancée
+> avec `-display none` (sinon échec fatal `could not read keymap file: 'en-us'`) —
+> déjà posé dans `bash_scripts/run.sh`.
