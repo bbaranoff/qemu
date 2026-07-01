@@ -109,6 +109,14 @@ void calypso_arm2dsp_on_dsp_step(C54xState *s, uint16_t exec_pc)
         s->data[0x098c] = a2d_hs;
         s->data[0x098d] = a2d_hs;
         s->data[0x098e] = a2d_hs;
+        /* the DSP reads the API region (0x0800+) from api_ram, NOT data[] */
+        if (s->api_ram) {
+            s->api_ram[0x098a - 0x0800] = a2d_hs;
+            s->api_ram[0x098b - 0x0800] = a2d_hs;
+            s->api_ram[0x098c - 0x0800] = a2d_hs;
+            s->api_ram[0x098d - 0x0800] = a2d_hs;
+            s->api_ram[0x098e - 0x0800] = a2d_hs;
+        }
     }
     /* Sustained interrupt window: once armed, keep INTM cleared each pass
      * through the wait-loop PC so the armed frame IT (INT3) can actually be
