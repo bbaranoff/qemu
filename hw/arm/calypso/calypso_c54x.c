@@ -4050,8 +4050,41 @@ static bool c54x_cond_true(C54xState *s, uint8_t cc)
     return true;
 }
 
+/* Faithful per-instruction interrupt LEVEL check (gated CALYPSO_C54X_IRQ_LEVEL).
+ * The base model services interrupts only at the c54x_interrupt_ex call edge: an
+ * IFR bit latched while INTM=1 is never taken later. Real C54x re-checks pending
+ * unmasked interrupts at each instruction boundary. This restores that, so an
+ * armed frame IT (INT3/bit3) fires once INTM drops -> native frame ISR runs. */
+static bool c54x_irq_level_check(C54xState *s)
+{
+    static int en = -1;
+    if (en < 0) en = getenv("CALYPSO_C54X_IRQ_LEVEL") ? 1 : 0;
+    if (!en) return false;
+    if ((s->st1 & ST1_INTM) || s->delay_slots != 0) return false;
+    uint16_t pend = (uint16_t)(s->ifr & s->imr);
+    if (!pend) return false;
+    int b = __builtin_ctz(pend);          /* lowest set bit = highest priority */
+    int vec = b + 16;                     /* C54x: maskable IMR bit b -> vector b+16 */
+    s->ifr &= ~(1u << b);
+    s->sp--; data_write(s, s->sp, (uint16_t)s->pc);
+    s->sp--; data_write(s, s->sp, s->xpc);
+    s->st1 |= ST1_INTM;
+    s->xpc = 0;
+    uint16_t iptr = (s->pmst >> PMST_IPTR_SHIFT) & 0x1FF;
+    s->pc = (uint16_t)((iptr * 0x80) + vec * 4);
+    static unsigned lvln = 0;
+    if (lvln++ < 60)
+        fprintf(stderr, "[c54x] IRQ-LEVEL take bit=%d vec=%d -> PC=0x%04x "
+                "IPTR=0x%03x IMR=0x%04x IFR=0x%04x insn=%u\n",
+                b, vec, s->pc, iptr, s->imr, s->ifr, s->insn_count);
+    return true;
+}
+
 static int c54x_exec_one(C54xState *s)
 {
+    if (c54x_irq_level_check(s)) {
+        return 1;   /* per-instruction IRQ vectoring consumed this step */
+    }
     uint16_t op = prog_fetch(s, s->pc);
     uint16_t op2;
     bool ind;
@@ -11975,6 +12008,23 @@ int c54x_run(C54xState *s, int n_insns)
                 if (f9c++ < 12)
                     fprintf(stderr, "[c54x] FORCE-098 @0x%04x data[098a/c]=0x%04x insn=%u\n",
                             exec_pc, f98v, s->insn_count);
+            }
+        }
+        /* SM-TRACE (gated CALYPSO_SM_TRACE) : trace instruction-par-instruction
+         * l'etat-machine handshake 0xdde0-0xde9f (route reclear 0xde8b vs setter
+         * 0xde9c). Montre PC/op/A/TC + les 5 cellules 0x098a..0x098e a chaque
+         * pas, pour voir OU le flot devie du chemin de9c et quelles valeurs le
+         * routeraient. Cap 400. */
+        if (exec_pc >= 0xdde0 && exec_pc <= 0xde9f) {
+            static int smt = -1; static unsigned smn = 0;
+            if (smt < 0) smt = getenv("CALYPSO_SM_TRACE") ? 1 : 0;
+            if (smt && smn < 400) {
+                smn++;
+                fprintf(stderr, "[c54x] SM-TRACE PC=0x%04x op=0x%04x A=0x%04x TC=%d 098[a=%04x b=%04x c=%04x d=%04x e=%04x] insn=%u\n",
+                        exec_pc, exec_op, (unsigned)(s->a & 0xFFFF),
+                        (s->st0 & ST0_TC) ? 1 : 0,
+                        s->data[0x098a], s->data[0x098b], s->data[0x098c],
+                        s->data[0x098d], s->data[0x098e], s->insn_count);
             }
         }
         if (exec_pc == 0xde97 || exec_pc == 0xde9c || exec_pc == 0xdddb || exec_pc == 0xde8b) {

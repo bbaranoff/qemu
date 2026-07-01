@@ -29,6 +29,8 @@ static int      a2d_imr_set;      /* whether to OR bits into IMR at drive       
 static uint16_t a2d_imr;          /* IMR bits to arm (e.g. 0x08 = INT3 frame)    */
 static int      a2d_enai;         /* whether to clear INTM (enable interrupts)   */
 static int      a2d_noredir;      /* if set, arm only; do not redirect PC        */
+static int      a2d_hs_set;       /* hold data[0x098a]/[0x098c] each step        */
+static uint16_t a2d_hs;           /* value held into the go-live handshake cells */
 
 static volatile int a2d_pending;  /* ARM requested orchestration, awaiting DSP   */
 static unsigned     a2d_done;     /* drives applied so far                       */
@@ -63,6 +65,9 @@ static void a2d_resolve(void)
     a2d_imr = a2d_imr_set ? (uint16_t)strtoul(im, NULL, 0) : 0;
     a2d_enai = getenv("CALYPSO_ARM2DSP_ENAI") ? 1 : 0;
     a2d_noredir = getenv("CALYPSO_ARM2DSP_NOREDIR") ? 1 : 0;
+    const char *hs = getenv("CALYPSO_ARM2DSP_HS");
+    a2d_hs_set = (hs && *hs) ? 1 : 0;
+    a2d_hs = a2d_hs_set ? (uint16_t)strtoul(hs, NULL, 0) : 0;
     if (a2d_on) {
         fprintf(stderr,
                 "[arm2dsp] enabled: trigger=d_dsp_page(0x01A8) bit1 ; "
@@ -94,6 +99,16 @@ void calypso_arm2dsp_on_dsp_step(C54xState *s, uint16_t exec_pc)
     a2d_resolve();
     if (!a2d_on) {
         return;
+    }
+    if (a2d_hs_set) {
+        /* real ARM->DSP go-live handshake asserted : the 5-cell state machine
+         * at 0xdde0-0xde9f reads data[0x098a..0x098e] to pick the dispatch that
+         * routes to the 0x3f70 bit1 setter (0xde9c). Hold all five. */
+        s->data[0x098a] = a2d_hs;
+        s->data[0x098b] = a2d_hs;
+        s->data[0x098c] = a2d_hs;
+        s->data[0x098d] = a2d_hs;
+        s->data[0x098e] = a2d_hs;
     }
     /* Sustained interrupt window: once armed, keep INTM cleared each pass
      * through the wait-loop PC so the armed frame IT (INT3) can actually be
