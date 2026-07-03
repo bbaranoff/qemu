@@ -4,6 +4,7 @@ _Généré par workflow multi-agents (11 agents), session 2026-07-03. Couvre les
 ---
 
 ## Architecture globale
+
 ```mermaid
 flowchart LR
 
@@ -101,7 +102,7 @@ Arm2DspBridge -->|"pokes C54xState fields directly, sets task-ready bit"| C54xCo
 C54xCore -->|"lock/unlock calypso_pcb_daram_lock around DARAM access"| CalypsoFullPcb
 C54xCore -->|"~300 calypso_debug_enabled gated probes"| CalypsoDebug
 
-CalypsoTrx -->|"bsp_init once at realize; tx_rach_burst/tx_burst/send_ul UL path"| BspDelivery
+CalypsoTrx -->|"bsp_init once at realize, tx_rach_burst/tx_burst/send_ul UL path"| BspDelivery
 BspDelivery -->|"calypso_trx_get_fn FN alignment"| CalypsoTrx
 BspDelivery -->|"c54x_bsp_load / dsp->data DARAM burst write"| C54xCore
 BspDelivery -->|"c54x_interrupt_ex INT3 vec19/IMR3, BRINT0 vec21/IMR5"| C54xCore
@@ -140,7 +141,7 @@ EnvConfig -->|"CALYPSO_SIM_CFG env/mobile.cfg IMSI+Ki override"| SimModel
 
 CalypsoTrx -->|"TPU-RAM MOVE decode TSP_CTRL2 WR bit dev=0"| IotaModel
 IotaModel -->|"IOTA_DBG macro"| CalypsoDebug
-BspDelivery -.->|"stale comment only; real gate is bsp_take_for_fn/BSP_FN_MATCH_WINDOW, DEAD ref"| IotaModel
+BspDelivery -.->|"stale comment only, real gate is bsp_take_for_fn/BSP_FN_MATCH_WINDOW, DEAD ref"| IotaModel
 
 Tint0Model -.->|"calypso_tint0_do_tick defined but unreachable, tint0_start never called"| CalypsoTrx
 BspDelivery -->|"include for GSM_HYPERFRAME constant only"| Tint0Model
@@ -288,14 +289,14 @@ IpcBridgeTool -->|"named FIFO writes /tmp/iq_*.fifo"| LocalAnalysisTools
 | Twl3025Model | CalypsoTrx | direct call: calypso_twl3025_get_afc_hz | Read immediately after a DAC write, purely to log the resulting Hz offset. |
 | EnvConfig | SimModel | file read at init (CALYPSO_SIM_CFG) | calypso_sim_new() parses the osmocom-bb layer23 mobile.cfg to override default IMSI/Ki so the emulated SIM matches whatever `mobile` binary (MobileClient) the harness runs. |
 
-## Overview
+### Overview
 
 The system is a two-CPU emulated baseband: an ARM946 (`ArmCore`) running unmodified osmocom-bb firmware, and a modeled TMS320C54x DSP (`C54xCore`) running the real Calypso ROM, glued together by `CalypsoTrx`'s MMIO handlers and a lightweight one-instruction-granularity `Arm2DspBridge`. `CalypsoSoc`/`CalypsoMb` assemble the ARM-side peripheral fabric (INTH interrupt arbiter, timers, two UARTs, SPI/I2C stubs) and, at realize time, hand `CalypsoTrx` the DSP API-RAM/TPU/TSP/SIM MMIO windows and a 32-line IRQ array; `CalypsoTrx`'s own `calypso_tdma_tick()` QEMUTimer (not the nominally-present but dead `calypso_tint0.c`) is the actual per-TDMA-frame master clock driving `c54x_run`, UART polling, and burst delivery. Downlink RF samples reach the DSP either through the "real" path — `BspDelivery` (`calypso_bsp.c`) receiving TRXDv0 bursts over UDP 6702 from the external `IpcBridgeTool` (calypso-ipc-device) and DMA'ing them into DSP DARAM with AFC phase correction from `Twl3025Model` — or through `DspShunt`, an env-gated (`CALYPSO_DSP_SHUNT=1`) fake-DSP that intercepts the ARM's task-post write via an MMIO overlay and either synthesizes FB/SB/SI results directly into shared NDB memory or, when `CALYPSO_DSP=c54x`, replays the buffered burst into the real DSP itself, competing with `CalypsoTrx`'s own driving of `c54x_run`. Auxiliary chip models (`SimModel` for the SIM card, `IotaModel` and `Tint0Model`, both largely dead/unwired) and `FbsbOracle`/`CalypsoLayer1` (host-side stand-ins for real DSP burst detection) round out the peripheral set, all optionally traced through the single shared `CalypsoDebug` env-var-gated probe mechanism and serialized against each other via `CalypsoFullPcb`'s mutexes (which, despite its name, is not a wiring hub — several of its exported IRQ-raise and "invoker" functions are unreferenced dead code). Console/control traffic flows from firmware through `CalypsoUartModem`, split by `SercommGate` into a stub-answered DLCI4 (TRXC) channel and everything else, which is re-injected for firmware's own sercomm driver; L1CTL/DLCI5 traffic is additionally tapped by `L1ctlSocket`, which in production is a decoy (`L1CTL_SOCK` pointed at a disabled path) because the real `/tmp/osmocom_l2` socket to `MobileClient` is created by external `osmocon`. The whole emulated radio, in turn, presents itself to the outside world as a UHD-like device to `OsmoTrxIpc` (osmo-trx-ipc/osmo-bts-trx) via AF_UNIX control sockets and POSIX shared-memory sample rings, with `IpcBridgeTool` acting as the single host-side integration point tying together the QEMU UDP/shm sideband files (`calypso_rach`, `calypso_sdcch_ul`, `calypso_kc`) and, optionally, external gr-gsm relay/decoder processes and local FIFO analysis tools. Several APIs across the codebase (IOTA BDLENA gating, `calypso_bsp_rx_burst`, PCB IRQ helpers, `fw_console.c`, `sercomm_gate_init`, various "invoker" functions) are fully wired at the header/declaration level but have zero live call sites, representing intended-but-superseded or not-yet-activated control paths.
----
 
-## Chemins critiques (chaînes détaillées)
+## Chemins critiques
 
-### Chaîne interruption / go-live (frame IT → IMR → corrélateur → d_fb_det)
+### Chaine interruption / go-live
+
 ```mermaid
 sequenceDiagram
     autonumber
@@ -323,41 +324,47 @@ sequenceDiagram
     IFR->>IMR: check IMR bit3  - imr_bit before vectoring
     Note over IMR: IMR = 0x0000 for the ENTIRE run.<br/>Cleared once at boot: '0xb37e STM 0x0000,IMR'  - insn~1047,<br/>confirmed legitimate/intentional init  - Addendum 19  -  NOT a decoder bug.<br/>Never re-armed naturally  =>  IT stays masked, DSP never vectors on its own.
 
-    rect rgb - 255,230,230
+    rect rgb(255,230,230)
     Note over IDLE,ARM7: BREAK POINT 1  -  dispatch stuck on no-op stub<br/>Idle-scheduler slot 'data[0x4387]'  - read via 'BACC A @0xb40f' is the ONLY<br/>live path to the IMR-arm code. Jump table @0xaae7-0xab37 has 2 entries<br/>pointing at '0xa4c7', but the slot rewrites its own current value every<br/>pass  =>  always resolves to stub '0xab38'  - RET no-op, never '0xa4c7'.<br/> - Addenda 15/20/21  -  "boucle fermée auto-référentielle"
     IDLE->>IDLE: data[0x4387] resolves -> 0xab38  - self-referential stub
     IDLE-->>ARM7:  - never routes here  -  0 hits on 0xa4c7 all session
     end
 
-    rect rgb - 255,230,230
+    rect rgb(255,230,230)
     Note over ARM7: BREAK POINT 2  -  armor instruction never executed<br/>'0xa4c7: ORM 0x3000,IMR'   - would set bit12=vec28 + bit13<br/>Immediately preceded by '0xa4c6 RET' of a separate routine  =>  0xa4c7 is a<br/>jump TARGET, not fallthrough. 0 hits on 0xa4c7 across every run this<br/>session. 3 words later, '0xa4ca SSBX INTM'  - start of the visible<br/>"wait-loop" entry has 130 hits  -  execution reaches the loop by a<br/>DIRECT path that skips the ORM entirely.
-    Note over ARM7: Falsification test  - Addendum 22, diagnostic-only, reverted:<br/>force-redirect PC 0xa4ca -> 0xa4c7 once, let ROM execute its real ORM.<br/>Result: IMR 0x0000 -> 0x3000  - bit12=1  -  CONFIRMED the instruction<br/>itself is correct and sufficient; only its liveness  - Break 1 is broken.
+    Note over ARM7: Falsification test Addendum 22 diagnostic-only reverted. Force-redirect PC to 0xa4c7 once and let ROM execute its real ORM instruction.
+    Note over ARM7: Result confirmed. IMR goes from 0x0000 to 0x3000 bit12 set. The ORM instruction itself is correct and sufficient, only its liveness Break Point 1 is broken.
     end
 
-    alt IMR successfully armed - bit12/vec28  -  only reproduced via diagnostic poke, never naturally
-        ARM7->>IMR: IMR |= 0x3000  - bit12 + bit13
-        IFR->>VEC: IFR bit - remapped=1 & IMR bit=1 -> take interrupt
-        Note over VEC: Requires CALYPSO_DSP_FRAME_VEC28 remap  - bit3->vec28 to matter;<br/>without it IMR=0x3000 has no bit3 - vec19 set -> still no vector  - Addendum 22
-        VEC->>ISR: IPTR=0x001 -> vector 28 -> PC=0x00f0   - confirmed correct, NOT the 0x1ff/0xffcc garbage stub
-        ISR->>ISR: 0x00f0 branches -> 0x7234   - fires, 301x observed
-        ISR->>ISR: 0x7234 -> CALL 0x013b
-        Note over ISR: '0x013b' = shared prologue subroutine  - STM ST1=0x6900; STM ST0=0; ANDM...,<br/>copied from PROM0[0x713b], called from MULTIPLE normal-flow sites<br/> - 0x7092/0x70a1/0x70b8 without issue  -  it is NOT ISR-specific,<br/>NOT itself buggy in isolation  - Addendum 22
+    rect rgb(230,240,255)
+    Note over ARM7,VEC: DIAGNOSTIC-ONLY condition  - CALYPSO_POKE_A4C7_ONCE + CALYPSO_DSP_FRAME_VEC28,<br/>Addendum 22: IMR successfully armed to 0x3000. This branch is NEVER<br/>reached naturally, every real run stays on the IMR=0x0000 path below.
+    ARM7->>IMR: IMR is-ORed with 0x3000  - bit12 + bit13 - diagnostic poke only
+    IFR->>VEC: IFR bit remapped=1 and IMR bit=1 -> take interrupt
+    Note over VEC: Requires CALYPSO_DSP_FRAME_VEC28 remap  - bit3->vec28 to matter,<br/>without it IMR=0x3000 has no bit3 - vec19 set -> still no vector  - Addendum 22
+    VEC->>ISR: IPTR=0x001 -> vector 28 -> PC=0x00f0   - confirmed correct, NOT the 0x1ff/0xffcc garbage stub
+    ISR->>ISR: 0x00f0 branches -> 0x7234   - fires, 301x observed
+    ISR->>ISR: 0x7234 -> CALL 0x013b
+    Note over ISR: 0x013b = shared prologue subroutine  - STM ST1=0x6900, STM ST0=0, ANDM...,<br/>copied from PROM0 0x713b, called from MULTIPLE normal-flow sites<br/> - 0x7092/0x70a1/0x70b8 without issue  -  it is NOT ISR-specific,<br/>NOT itself buggy in isolation  - Addendum 22
+    end
 
-        rect rgb - 255,230,230
-        Note over ISR,DISP: BREAK POINT 3  -  post-0x013b derail in ISR context only<br/>'0x7234' and '0x013b' each fire exactly ONCE, then PC storms to<br/>0x0000  - "POST-BOOTSTUB-RET", 6300+ occurrences, starting at<br/>insn=4470  - 32 instructions after the poke at insn=4438.<br/>'0xa4e4'  - dispatch -> DMA burst + set AR3 -> correlator is<br/>NEVER reached. Reproducible regardless of trigger mechanism<br/> - same derail seen via earlier IMR pokes, Addenda 7-8, and via the<br/>faithful ORM instruction, Addendum 22. Root cause isolated to:<br/>the CALL 0x013b return continuation specific to ISR entry context<br/> - pushed PC/XPC from c54x_interrupt_ex  -  untraced beyond this point.
-        ISR--xDISP: derail: PC -> 0x0000  - storm, 0xa4e4 never executed
-        end
-    else IMR stays 0x0000 - actual state, every real run
-        Note over IFR,VEC: No vectoring occurs at all. DSP stays in idle loops<br/>71xx/a4ca/b3xx/b4xx. 'd[0x3f70]' toggles 0x0000<->0x0001 only<br/> - dismiss path via SM 0xdde0, itself gated by d_background_enable/state<br/>= d[0x098a..0x098e], deliberately zeroed by real firmware  -  Addendum 11/18, a RED HERRING
+    rect rgb(255,230,230)
+    Note over ISR,DISP: BREAK POINT 3  -  post-0x013b derail in ISR context only<br/>0x7234 and 0x013b each fire exactly ONCE, then PC storms to<br/>0x0000  - POST-BOOTSTUB-RET, 6300+ occurrences, starting at<br/>insn=4470  - 32 instructions after the poke at insn=4438.<br/>0xa4e4  - dispatch -> DMA burst + set AR3 -> correlator is<br/>NEVER reached. Reproducible regardless of trigger mechanism<br/> - same derail seen via earlier IMR pokes, Addenda 7-8, and via the<br/>faithful ORM instruction, Addendum 22. Root cause isolated to:<br/>the CALL 0x013b return continuation specific to ISR entry context<br/> - pushed PC/XPC from c54x_interrupt_ex  -  untraced beyond this point.
+    ISR--xDISP: derail: PC -> 0x0000  - storm, 0xa4e4 never executed
+    end
+
+    rect rgb(255,240,200)
+    Note over IFR,VEC: ACTUAL state, every real run  - IMR stays 0x0000, no diagnostic poke.<br/>No vectoring occurs at all. DSP stays in idle loops<br/>71xx/a4ca/b3xx/b4xx. d[0x3f70] toggles 0x0000 to 0x0001 only<br/> - dismiss path via SM 0xdde0, itself gated by d_background_enable/state<br/>= d[0x098a..0x098e], deliberately zeroed by real firmware  -  Addendum 11/18, a RED HERRING
     end
 
     DISP-->>COR:  - intended DMA burst into correlator page + AR3=burst pointer
     COR-->>NDB:  - intended MAC over I/Q -> peak detect -> write d_fb_det
-    Note over NDB: Observed: d_fb_det  - data[0x08f8] = 0x0000 for the entire run.<br/>FBSB_CONF = FAIL. Every real run stops at Break 1  - never reaches<br/>Break 2/3 without diagnostic force.
+    Note over NDB: Observed: d_fb_det  - data[0x08f8] = 0x0000 for the entire run.<br/>FBSB_CONF = FAIL. Every real run stops at Break 1.
 ```
 
 Three independent, confirmed break points gate this chain, and all downstream of them is proven-good: (1) the idle-scheduler dispatch slot `data[0x4387]` (read via `BACC @0xb40f`) never resolves to the IMR-arm entry point `0xa4c7`, permanently self-resolving to the no-op stub `0xab38` (Addenda 15/20/21); (2) as a direct consequence, `0xa4c7: ORM #0x3000,IMR` — verified correct and sufficient when force-executed (IMR 0x0000→0x3000, Addendum 22) — has zero natural hits across every run this session; (3) even when IMR/vectoring is forced to fire faithfully, the shared prologue `CALL 0x013b` (itself fine in normal, non-ISR call sites) returns into a derailed continuation unique to ISR-entry context, storming to `PC=0x0000` before ever reaching the real dispatch/correlator code at `0xa4e4` (Addendum 22). Everything upstream (BSP burst delivery, FCCH signal quality, INT3/BRINT0 raising, IFR latching) and the vector-table mechanics themselves (IPTR routing to `0x00f0`→`0x7234`) are independently confirmed sound — the wall is entirely inside three narrow, now-precisely-located DSP-ROM-internal control-flow gaps. Statement-of-record source: `/opt/GSM/qemu-calypso/doc/project/STATUS_2026-07-01.md`, Addenda 15/19/20/21/22.
-### Chaîne de commande FB (mobile → ARM → API-RAM → DSP → réponse)
+
+### Chaine de commande FB
+
 ```mermaid
 sequenceDiagram
     autonumber
@@ -372,7 +379,7 @@ sequenceDiagram
     participant IPC as calypso-ipc-device/qemu_wrap.c<br/> - external bridge
     participant BSP as calypso_bsp.c<br/>BspDelivery
 
-    rect rgb - 200,255,200
+    rect rgb(200,255,200)
     Note over Mobile,L1S: CONFIRMED WORKING  -  real command path
     Mobile->>L1S: L1CTL FBSB_REQ  - ARFCN, flags=FB
     L1S->>ARMFW: inject sercomm-framed bytes into modem UART RX FIFO<br/> - calypso_uart_receive
@@ -385,7 +392,7 @@ sequenceDiagram
         TRX->>TRX: calypso_layer1_on_task_write -  latches g_l1_task_md<br/> - HLE stand-in, gated CALYPSO_L1=c
         TRX->>TRX: calypso_fbsb_on_dsp_task_change - <br/> - g_fbsb state tracker
     and PARALLEL real downlink I/Q delivery - independent of ARM command
-        rect rgb - 200,255,200
+        rect rgb(200,255,200)
         Note over IPC,BSP: CONFIRMED WORKING  -  real I/Q genuinely delivered
         IPC->>BSP: UDP :6702 TRXDv0 DL burst  - 8B hdr + 148 IQ samples
         BSP->>BSP: bsp_take_for_fn -  FN-window match,<br/>calypso_twl3025_apply_phase -  AFC rotation
@@ -395,7 +402,7 @@ sequenceDiagram
         end
     end
 
-    rect rgb - 255,200,200
+    rect rgb(255,200,200)
     Note over BRIDGE,ROM: BROKEN  -  go-live blocker  - see ARM-DSP bridge diagram
     BRIDGE->>DSP: calypso_arm2dsp_on_dsp_step -  per executed instruction:<br/>intended to set DSP task-ready bit in s->data[]/api_ram[]
     DSP->>DSP: DISP-POLL loop  - C54x dispatcher ROM checks task-ready bit
@@ -405,14 +412,14 @@ sequenceDiagram
     end
 
     opt CALYPSO_ORCH=1 synthetic fallback - host-side, not real DSP
-        rect rgb - 255,235,180
+        rect rgb(255,235,180)
         Note over HOSTFB: PARTIAL/SYNTHETIC  -  bypasses DSP entirely
         HOSTFB->>DSP: calypso_bsp.c own FCCH correlator writes<br/>dsp->data[0x08F8..0x08FD] directly under calypso_orch -  gate
         Note over HOSTFB,DSP: This is a host-computed stand-in result,<br/>NOT the ARM-commanded DSP ROM's own output
         end
     end
 
-    rect rgb - 255,200,200
+    rect rgb(255,200,200)
     Note over ARMFW,TRX: BROKEN  - when ORCH fallback absent  -  poll never sees a real result
     loop up to 12 TDMA frames
         ARMFW->>TRX: read d_task_md busy bit / d_fb_det  - l1s_fbdet_resp poll
@@ -421,17 +428,18 @@ sequenceDiagram
     ARMFW->>ARMFW: l1s_fbdet_resp times out or reads stale value
     end
 
-    rect rgb - 255,200,200
+    rect rgb(255,200,200)
     Note over ARMFW,Mobile: BROKEN/UNVERIFIED  -  FBSB_CONF does not reflect genuine DSP FB detection
     ARMFW->>L1S: L1CTL FBSB_CONF  - result derived from stale d_fb_det,<br/>or from CALYPSO_ORCH synthetic write if enabled
     L1S->>Mobile: forward FBSB_CONF
     end
 ```
 
-**Caption.** The ARM-side half of this flow is genuinely working this session: the mobile's FBSB_REQ reaches osmocom-bb firmware over the L1CTL/sercomm path, and `prim_fbsb.c`'s `l1s_fbdet_cmd()` performs a real MMIO write of `d_task_md=FB_DSP_TASK` into the API-RAM window (`calypso_trx.c`), which fans out correctly to `calypso_arm2dsp.c`, the layer1 HLE latch, and the FBSB tracker. In parallel, and fully independently, `calypso-ipc-device/qemu_wrap.c` genuinely delivers real downlink I/Q over UDP 6702 into `calypso_bsp.c`, which DMAs it into the DSP's DARAM at 0x2a00 and raises INT3/BRINT0 — so both "halves" of the intended pipeline (command in, samples in) are confirmed present in the DSP's address space at the same time. What's broken is the middle: the C54x dispatcher's go-live handshake (`calypso_arm2dsp_on_dsp_step` setting the task-ready bit) never actually causes the DSP ROM's ready-made FB correlator to run against that DARAM data, so `d_fb_det` (NDB 0x08F8-0x08FD) is never populated by genuine DSP computation. Unless the `CALYPSO_ORCH` host-side synthetic fallback in `calypso_bsp.c` is enabled to fabricate a result directly, ARM firmware's up-to-12-frame poll of `l1s_fbdet_resp` sees stale/zero data, and any `FBSB_CONF` sent back to the mobile does not reflect a real FCCH detection by the emulated DSP.
+Caption The ARM-side half of this flow is genuinely working this session: the mobile's FBSB_REQ reaches osmocom-bb firmware over the L1CTL/sercomm path, and `prim_fbsb.c`'s `l1s_fbdet_cmd()` performs a real MMIO write of `d_task_md=FB_DSP_TASK` into the API-RAM window (`calypso_trx.c`), which fans out correctly to `calypso_arm2dsp.c`, the layer1 HLE latch, and the FBSB tracker. In parallel, and fully independently, `calypso-ipc-device/qemu_wrap.c` genuinely delivers real downlink I/Q over UDP 6702 into `calypso_bsp.c`, which DMAs it into the DSP's DARAM at 0x2a00 and raises INT3/BRINT0 — so both "halves" of the intended pipeline (command in, samples in) are confirmed present in the DSP's address space at the same time. What's broken is the middle: the C54x dispatcher's go-live handshake (`calypso_arm2dsp_on_dsp_step` setting the task-ready bit) never actually causes the DSP ROM's ready-made FB correlator to run against that DARAM data, so `d_fb_det` (NDB 0x08F8-0x08FD) is never populated by genuine DSP computation. Unless the `CALYPSO_ORCH` host-side synthetic fallback in `calypso_bsp.c` is enabled to fabricate a result directly, ARM firmware's up-to-12-frame poll of `l1s_fbdet_resp` sees stale/zero data, and any `FBSB_CONF` sent back to the mobile does not reflect a real FCCH detection by the emulated DSP.
+
 ---
 
-## Détail par module
+## Detail par module
 
 ### C54x DSP Core (calypso_c54x.c/.h)
 **Fichiers** : `hw/arm/calypso/calypso_c54x.c, hw/arm/calypso/calypso_c54x.h`
