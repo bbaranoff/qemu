@@ -271,6 +271,12 @@ int c54x_run(C54xState *s, int n_insns);
 /* Send interrupt: vec = vector number (for PC), imr_bit = bit in IMR/IFR */
 void c54x_interrupt_ex(C54xState *s, int vec, int imr_bit);
 
+/* T1 : compteurs ISR (définis dans calypso_c54x.c), exposés via `info dsp_irq`. */
+extern uint64_t g_c54x_irq_ex_called;
+extern uint64_t g_c54x_isr_entered;
+extern uint64_t g_c54x_rete_executed;
+extern uint64_t g_c54x_pending_irq_gated;
+
 /* Wake from IDLE */
 void c54x_wake(C54xState *s);
 

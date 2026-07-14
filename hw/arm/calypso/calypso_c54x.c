@@ -2924,6 +2924,18 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
         }
     }
 
+    /* SONDE GATE-SET (T3b, 2026-07-14) : toute écriture NON-NULLE de la gate
+     * go-live 0x098a-0x098e = le SET attendu (le self-clear @0xdde8/24588x le
+     * présuppose — on ne reclear pas une cellule que rien n'écrit). Dédiée, au
+     * data_write_locked (chemin exhaustif : y capte les 75719 clears) -> ne peut
+     * manquer aucun chemin standard. H1 = ne fire JAMAIS (setter dans l'île non
+     * entrée). H2 = fire puis re-clearée (race set/clear). Always-on, cheap. */
+    if (addr >= 0x098a && addr <= 0x098e && val != 0) {
+        fprintf(stderr, "[c54x] GATE-SET !!! data[0x%04x] <- 0x%04x (was 0x%04x) "
+                "PC=0x%04x insn=%u\n",
+                addr, val, s->data[addr], s->pc, (unsigned)s->insn_count);
+    }
+
     /* WATCH-WR-ADDR (générique, gated CALYPSO_DEBUG=WATCH-WR + env
      * CALYPSO_WATCH_WR_ADDR=0xNNNN) : log tout write vers une adresse data
      * arbitraire — pour tracer qui écrit (ou jamais) une cellule pointeur-
@@ -5116,6 +5128,7 @@ static int c54x_exec_one(C54xState *s)
         /* F4EB = RETE (return from interrupt). Pop PC, pop XPC iff APTS=1.
          * Symmetric with c54x_interrupt_ex push order. */
         if (op == 0xF4EB) {
+            g_c54x_rete_executed++;   /* T1 */
             uint16_t prev_xpc = s->xpc;
             /* IT return : pop XPC (top, poussé en 2e par l'entrée IT) PUIS PC.
              * Inconditionnel (APTS == AVIS). Miroir entrée-IT / FRETED. */
@@ -13907,11 +13920,20 @@ void c54x_reset(C54xState *s)
 
 int g_c54x_int3_src = 0;   /* 1=trx 2=bsp 3=shunt — diag source INT3 (RO) */
 
+/* T1 (2026-07-14) : compteurs ISR exposés via `info dsp_irq`
+ * (monitor_register_hmp dans calypso_mb.c). Pure observation, aucun effet de
+ * flux -> shunt-safe. Instrument de T4 (fidélité push/pop IT). */
+uint64_t g_c54x_irq_ex_called     = 0;  /* appels c54x_interrupt_ex (IRQ générée) */
+uint64_t g_c54x_isr_entered       = 0;  /* IT réellement vectorisée (unmasked) */
+uint64_t g_c54x_rete_executed     = 0;  /* RETE exécuté (retour d'IT) */
+uint64_t g_c54x_pending_irq_gated = 0;  /* IRQ latchée IFR mais masquée IMR/INTM */
+
 
 void c54x_interrupt_ex(C54xState *s, int vec, int imr_bit)
 {
     if (vec < 0 || vec >= 32) return;
     if (imr_bit < 0 || imr_bit >= 16) return;
+    g_c54x_irq_ex_called++;   /* T1 */
     /* VEC28-EXP (2026-06-25, gated CALYPSO_DSP_FRAME_VEC28) : l'IT frame du modele
      * tape sur vec19/bit3 = stub RETE. Le VRAI scheduler per-frame est vec28/bit12
      * (0x7234 -> CALL 0xa4e4 -> LD d_dsp_page 0xa51c -> correlateur -> d_fb_det),
@@ -13970,6 +13992,7 @@ void c54x_interrupt_ex(C54xState *s, int vec, int imr_bit)
 
     bool unmasked = (s->imr & (1 << imr_bit)) != 0;
     if (frame_force) unmasked = true;   /* VEC28-EXP : ligne frame cablee -> vectorise */
+    if (!unmasked) g_c54x_pending_irq_gated++;   /* T1 : IFR set mais IMR/INTM bloque */
 
     /* Per SPRU131: IDLE exits on ANY interrupt (masked or unmasked).
      * - Unmasked: branch to vector, set INTM=1
@@ -13978,6 +14001,7 @@ void c54x_interrupt_ex(C54xState *s, int vec, int imr_bit)
         s->idle = false;
         if (unmasked) {
             /* Service the interrupt: branch to vector */
+            g_c54x_isr_entered++;   /* T1 */
             s->ifr &= ~(1 << imr_bit);
             s->sp--;
             data_write(s, s->sp, (uint16_t)(s->pc + 1));
@@ -14022,6 +14046,7 @@ void c54x_interrupt_ex(C54xState *s, int vec, int imr_bit)
          * mauvais contexte → over-pop SP → DP garbage → self-CALA 0x70c3.
          * IFR reste set (non clearé) → l'IT est servie au prochain appel,
          * delay_slots étant retombé à 0 (max ~2 insns plus tard). */
+        g_c54x_isr_entered++;   /* T1 */
         s->ifr &= ~(1 << imr_bit);
         s->sp--;
         data_write(s, s->sp, (uint16_t)s->pc);

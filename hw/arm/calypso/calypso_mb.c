@@ -28,6 +28,23 @@
 #include "hw/arm/calypso/calypso_trx.h"   /* C54xState + calypso_trx_get_dsp()
                                              + calypso_trx_set_section_paths() */
 #include "calypso_dsp_shunt.h"
+#include "monitor/monitor.h"                 /* T1 : info dsp_irq */
+#include "qapi/qmp/qdict.h"
+#include "hw/arm/calypso/calypso_c54x.h"     /* T1 : compteurs g_c54x_* */
+
+/* T1 (2026-07-14) : `info dsp_irq` — snapshot des compteurs IT/ISR du c54x
+ * (instrument de T4). Le slot .hx "dsp_irq" (cmd=NULL) est rempli au runtime
+ * par monitor_register_hmp() dans calypso_machine_init. Pure lecture. */
+static void hmp_info_dsp_irq(Monitor *mon, const QDict *qdict)
+{
+    monitor_printf(mon,
+                   "interrupt_ex_called: %" PRIu64 "\n"
+                   "isr_entered: %" PRIu64 "\n"
+                   "rete_executed: %" PRIu64 "\n"
+                   "pending_irq_gated: %" PRIu64 "\n",
+                   g_c54x_irq_ex_called, g_c54x_isr_entered,
+                   g_c54x_rete_executed, g_c54x_pending_irq_gated);
+}
 
 #define CALYPSO_XRAM_BASE     0x01000000
 #define CALYPSO_XRAM_SIZE     (8 * 1024 * 1024)
@@ -78,6 +95,8 @@ static void calypso_machine_init(MachineState *machine)
     Error *err = NULL;
 
     fprintf(stderr, "[MB] === calypso_machine_init START ===\n");
+
+    monitor_register_hmp("dsp_irq", true, hmp_info_dsp_irq);   /* T1 */
 
     /* ---- CPU ---- */
     cpuobj = object_new(machine->cpu_type);

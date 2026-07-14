@@ -348,6 +348,19 @@ SRST
 ERST
 
     {
+        .name       = "dsp_irq",
+        .args_type  = "",
+        .params     = "",
+        .help       = "show Calypso C54x DSP IRQ/ISR counters",
+    },
+
+SRST
+  ``info dsp_irq``
+    Show Calypso C54x DSP interrupt/ISR counters (calypso fork, T1).
+    ``.cmd`` is NULL here; filled at runtime by monitor_register_hmp() in calypso_mb.c.
+ERST
+
+    {
         .name       = "capture",
         .args_type  = "",
         .params     = "",

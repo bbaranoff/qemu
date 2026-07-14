@@ -2340,6 +2340,26 @@ void calypso_trx_set_registers_path(const char *registers)
     g_section_registers = registers;
 }
 
+/* T3(a) 2026-07-14 — contrôle négatif de la branche api_write_cb (fourche go-live).
+ * Notifieur DSP->ARM, appelé par c54x.c:3403 à CHAQUE écriture DSP dans l'API RAM.
+ * (1) Trace EXHAUSTIVE de chaque woff propagé (liste runtime complète) -> on vérifie
+ *     de visu qu'AUCUN write DSP ne touche la gate go-live 0x098a-0x098e (woff
+ *     0x018a-0x018e). L'obs exhaustive enterre l'hypothèse "write rare manqué au grep".
+ * (2) Seule action non-oracle : pulse IRQ_API (mirror = redondant via read-path
+ *     dsp->data ; d_fb_det hook = oracle interdit). Prédiction écrite : A (câble
+ *     vivant + inerte : trace fire, data[0x4387] reste 0xab38, isr_entered=0). */
+static void calypso_trx_api_write_cb(void *opaque, uint16_t woff, uint16_t val)
+{
+    CalypsoTRX *s = (CalypsoTRX *)opaque;
+    static unsigned n = 0;
+    bool gate = (woff >= 0x018a && woff <= 0x018e);   /* DSP 0x098a-0x098e = enable go-live */
+    if (n++ < 2000 || gate)
+        fprintf(stderr, "[trx] T3a-APIWR #%u woff=0x%04x val=0x%04x%s\n",
+                n, woff, val, gate ? "   <<<<< GATE 0x098a-0x098e TOUCHEE !!!" : "");
+    if (s && s->irqs)
+        qemu_irq_raise(s->irqs[CALYPSO_IRQ_API]);   /* pulse IRQ_API (action non-oracle) */
+}
+
 /* ---- Init ---- */
 void calypso_trx_init(MemoryRegion *sysmem, qemu_irq *irqs)
 {
@@ -2392,6 +2412,13 @@ void calypso_trx_init(MemoryRegion *sysmem, qemu_irq *irqs)
         s->dsp = c54x_init();
         if (s->dsp) {
             c54x_set_api_ram(s->dsp, s->dsp_ram);
+            /* T3(a) : notifieur DSP->ARM (déclaré c54x.h:204). Contrôle négatif
+             * GATÉ derrière CALYPSO_T3A_APIWR (défaut OFF -> cb NULL = nu, pas de
+             * flood IRQ_API). Verdict rendu : câble vivant + inerte (A). */
+            if (getenv("CALYPSO_T3A_APIWR")) {
+                s->dsp->api_write_cb = calypso_trx_api_write_cb;
+                s->dsp->api_write_cb_opaque = s;
+            }
             bool have_sections = g_section_prom0 || g_section_prom1 ||
                                  g_section_prom2 || g_section_prom3 ||
                                  g_section_drom  || g_section_pdrom;

@@ -34,6 +34,9 @@
 
 /* DSP API region base: words >= 0x0800 are read by the DSP from api_ram. */
 #define A2D_API_BASE       0x0800
+/* T5 : miroir de C54X_API_SIZE (calypso_c54x.h:22) — 8K words api_ram. Borne
+ * haute de l'OR-write pour éviter l'écriture OOB dans s->api_ram[]. */
+#define A2D_API_SIZE       0x2000
 
 static int      a2d_on = -1;      /* -1 = unresolved, 0/1 = disabled/enabled     */
 static uint16_t a2d_word;         /* DSP task-ready word (default 0x0fff)         */
@@ -113,7 +116,21 @@ void calypso_arm2dsp_on_dsp_step(C54xState *s, uint16_t exec_pc)
     s->data[a2d_word] |= a2d_bit;
     /* words >= 0x0800 are read by the DSP from api_ram (shared DARAM/API RAM) */
     if (a2d_word >= A2D_API_BASE && s->api_ram) {
-        s->api_ram[a2d_word - A2D_API_BASE] |= a2d_bit;
+        uint16_t a2d_idx = a2d_word - A2D_API_BASE;
+        if (a2d_idx < A2D_API_SIZE) {
+            s->api_ram[a2d_idx] |= a2d_bit;
+        } else {
+            /* T5 (2026-07-14) : borne OOB restaurée. On CRIE au lieu de perdre en
+             * silence — si un a2d_word légitime tape hors-buffer, on le VOIT
+             * (symptôme config CALYPSO_ARM2DSP_TASKWORD), pas une corruption muette
+             * ni un write silencieusement perdu -> go-live échouant sans bruit. */
+            static unsigned a2d_oob_n = 0;
+            if (a2d_oob_n++ < 20)
+                fprintf(stderr, "[arm2dsp] T5 OOB REJETE : a2d_word=0x%04x idx=0x%04x "
+                        ">= A2D_API_SIZE=0x%04x (api_ram write perdu -- verifier "
+                        "CALYPSO_ARM2DSP_TASKWORD)\n",
+                        a2d_word, a2d_idx, (unsigned)A2D_API_SIZE);
+        }
     }
 
     if (a2d_posts <= 10 || (a2d_posts % 20000) == 0) {
