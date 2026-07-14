@@ -29,6 +29,12 @@ sleep 1
 # DSP : c54x (vraie ROM) par défaut. Mock gr-gsm : lancer avec CALYPSO_DSP= (vide).
 : "${CALYPSO_DSP:=c54x}"; export CALYPSO_DSP
 
+# === harvard-sh : shell live sur le DSP C54x (auto-deploy 2026-06-29) ===
+_HSH_DIR="$(cd "$(dirname "$0")" && pwd)"
+[ -f "$_HSH_DIR/harvard.sh" ] && cp -f "$_HSH_DIR/harvard.sh" /tmp/harvard.sh 2>/dev/null || true
+[ -f "$_HSH_DIR/hsh.py" ]     && cp -f "$_HSH_DIR/hsh.py"     /tmp/hsh.py     2>/dev/null || true
+echo "[run.sh] harvard-sh deploye -> DSP vivant :  docker exec -it <ctr> bash --rcfile /tmp/harvard.sh -i  (id/stack/task/u/x)"
+
 # ---- args : --gen-doc / --help -----------------------------------------------
 # --gen-doc : ne (re)lance PAS le pipeline ; suppose qu'il tourne deja dans le
 # container et lance pytest pour produire la doc (report.md condense +
