@@ -9,7 +9,8 @@
       "Bash(mkdir build:*)",
       "Bash(ls hw/arm/Kconfig*)",
       "Bash(rm:*)",
-      "Bash(chmod +x /home/nirvana/qemu/run-mobile.sh)"
+      "Bash(chmod +x /home/nirvana/qemu/run-mobile.sh)",
+      "Workflow(deep-research)"
     ]
   },
   "hooks": {
