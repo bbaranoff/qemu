@@ -203,7 +203,9 @@ static int ipc_tx_open_cnf(int rc, uint32_t num_chans, int32_t timingoffset)
 	OSMO_STRLCPY_ARRAY(ipc_prim->u.open_cnf.shm_name, DEFAULT_SHM_NAME);
 
 	chan_info = ipc_prim->u.open_cnf.chan_info;
-	for (i = 0; i < num_chans; i++) {
+	/* chan_info is a fixed chan_info[MAX_NUM_CHANS] array; never walk past it
+	 * even if called with an out-of-range num_chans. */
+	for (i = 0; i < num_chans && i < MAX_NUM_CHANS; i++) {
 		snprintf(chan_info->chan_ipc_sk_path, sizeof(chan_info->chan_ipc_sk_path),"%s/ipc_sock%d_%d",
 			 cmdline_cfg.ud_prefix_dir, cmdline_cfg.msocknum, i);
 		/* FIXME: dynamc chan limit, currently 8 */
@@ -235,6 +237,17 @@ int ipc_rx_open_req(struct ipc_sk_if_open_req *open_req)
 	/* calculate size needed */
 	unsigned int len;
 	unsigned int i;
+
+	/* num_chans is attacker-controlled (wire field from OPEN_REQ). The per-channel
+	 * producer handles below are stored in fixed 8-entry global arrays
+	 * (ios_tx_to_device[8] / ios_rx_from_device[8] / global_ctrl_socks[8]), so any
+	 * value outside 1..8 would write those pointers out of bounds. Reject early. */
+	if (open_req->num_chans == 0 || open_req->num_chans > 8) {
+		LOGP(DMAIN, LOGL_ERROR, "OPEN_REQ rejected: num_chans=%u out of range (1..8)\n",
+		     open_req->num_chans);
+		ipc_tx_open_cnf(-EINVAL, 0, 0);
+		return -EINVAL;
+	}
 
 	global_dev = uhdwrap_open(open_req);
 
