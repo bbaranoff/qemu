@@ -573,12 +573,14 @@ static void ul_gmsk_mod(const int8_t *bits, int16_t *iq)
     const int N = CALYPSO_BSP_BURSTLEN, OSR = CALYPSO_TRX_OSR, NS = N * OSR;
     int active = N;
     if (ACT > 0) active = ACT;
-    else {
-        int tail0 = 1, guard0 = 1;
-        for (int i = 0; i < 8 && i < N; i++) if (bits[i] > 0) { tail0 = 0; break; }
-        for (int i = 88; i < N; i++) if (bits[i] > 0) { guard0 = 0; break; }
-        if (tail0 && guard0) active = 88;   /* access burst (RACH) */
-    }
+    /* FIX RACH FANTÔMES : plus d'auto-détection access-burst depuis le motif de bits.
+     * Le repli non-RACH (bits BSP idle, souvent tail0+guard0) était modulé en
+     * access-burst -> osmo-trx détectait des RACH RA=3 FANTÔMES (mesuré : 90 CHAN RQD
+     * pour 6 vrais RACH) -> canaux SDCCH alloués sans SABM -> WAIT_RLL timeout ->
+     * fuite -> épuisement du pool -> le SMS MO n'obtient plus de canal. Le VRAI RACH
+     * passe par ul_mod_laurent (waveform osmo-trx exacte), JAMAIS par ul_gmsk_mod ;
+     * le self-test aussi. Donc ici = toujours burst normal 148 sym (override possible
+     * via CALYPSO_UL_ACTIVE_SYMS pour debug). */
     if (active > N) active = N;
 
     if (!USEG) {
@@ -864,7 +866,7 @@ static void ul_drain(void)
     if (!_stdone) { _stdone = 1; ul_laurent_selftest(); }   /* #12 : valide le port Laurent 1x */
     if (g_bsp_fd < 0) return;
     uint8_t pkt[UL_TRXD_HDR + CALYPSO_BSP_BURSTLEN + 16];
-    int got = 0;
+    int got = 0, got_rach = 0;   /* got_rach : un VRAI access-burst RACH a ete draine */
     for (;;) {
         ssize_t n = recvfrom(g_bsp_fd, pkt, sizeof(pkt), MSG_DONTWAIT, NULL, NULL);
         if (n < (ssize_t)(UL_TRXD_HDR + CALYPSO_BSP_BURSTLEN)) break;
@@ -933,6 +935,7 @@ static void ul_drain(void)
             ul_iq_record(g_ul_iq, CALYPSO_BSP_BURSTLEN * CALYPSO_TRX_OSR);  /* record I/Q UL (RACH brute BSP) */
         }
         got = 1;
+        if (used_tab) got_rach = 1;   /* seul un VRAI RACH (RA publiee) arme g_ul_pending */
         /* INSTR 2026-06-04 : dump one-shot des 1ers bursts UL recus du BSP pour
          * VOIR si c'est un vrai access-burst (sync RACH 41b) ou autre chose, et
          * confirmer la sortie OSR=4. Couper via CALYPSO_UL_DEBUG=0. */
@@ -951,7 +954,13 @@ static void ul_drain(void)
                  CALYPSO_BSP_BURSTLEN*CALYPSO_TRX_OSR, s0, s1, smid, bs);
         }
     }
-    if (got) g_ul_pending = 1;
+    /* FIX PHANTOM RACH : g_ul_pending (= déclenche la réinjection de g_rach_iq +
+     * la calibration FN) ne doit s'armer que pour un VRAI RACH, pas pour chaque burst
+     * SDCCH/idle drainé du BSP. Avant : tout burst -> g_ul_pending=1 -> réinjection du
+     * dernier RACH à chaque frame -> osmo-trx corrèle en boucle (200 RACH-DET / 9 vrais)
+     * -> CHAN RQD fantômes -> fuite SDCCH -> épuisement -> SMS sans canal. Le vrai RACH
+     * du mobile (used_tab=1, RA publiée) arme toujours g_ul_pending -> LU/RACH intacts. */
+    if (got_rach) g_ul_pending = 1;
 }
 
 /* === RELAIS I/Q CONTINU (mode full-grgsm) ===

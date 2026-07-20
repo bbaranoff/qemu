@@ -255,6 +255,9 @@ static void calypso_machine_init(MachineState *machine)
      * calypso_trx.c pour stopper les écritures DMA vers DARAM.
      * Cf hw/arm/calypso/calypso_dsp_shunt.c. */
     calypso_dsp_shunt_init(sysmem, &address_space_memory);
+    /* CALYPSO_DSP=c54x : relie le VRAI DSP au shunt pour la route c54x + overlay NDB
+     * (sinon g_shunt.c54x reste NULL et la branche route_c54x est morte). */
+    calypso_dsp_shunt_set_c54x(calypso_trx_get_dsp());
 
     fprintf(stderr, "[MB] === Machine ready ===\n");
     fprintf(stderr, "[MB]   Flash:  0x%08x–0x%08x (%d MiB pflash_cfi01)\n",

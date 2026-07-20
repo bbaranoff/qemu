@@ -1240,7 +1240,10 @@ static void calypso_tdma_tick(void *opaque) {
         bool imr_armed = !!(s->dsp->imr & (1 << C54X_INT_FRAME_BIT));
         bool periodic_armed = tpu_armed && imr_armed;
         bool force_pulse    = !!(s->tpu_regs[TPU_CTRL/2] & TPU_CTRL_DSP_EN);
-        if (periodic_armed || force_pulse) {
+        /* FIX DOUBLE-INT3 : quand la route c54x du shunt est active, c'est
+         * shunt_route_to_c54x() qui fire l'INT3 frame. Ne PAS le double-firer ici,
+         * sinon le c54x reçoit 2 IT frame/tick -> déraille -> crash qemu. */
+        if ((periodic_armed || force_pulse) && !calypso_dsp_shunt_route_c54x_active()) {
             c54x_interrupt_ex(s->dsp, C54X_INT_FRAME_VEC, C54X_INT_FRAME_BIT);
             if (force_pulse)
                 s->tpu_regs[TPU_CTRL/2] &= ~TPU_CTRL_DSP_EN;

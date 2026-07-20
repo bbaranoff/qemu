@@ -227,6 +227,13 @@ static bool shunt_route_c54x(void)
     return v;
 }
 
+/* Tag de log : en mode no-shunt/c54x le shunt agit en ASSIST -> ne pas
+ * afficher [dsp-shunt] (trompeur). SHUNT_LOG/SHUNT_ERR prefixent le tag runtime. */
+static inline const char *shunt_tag(void)
+{ return shunt_route_c54x() ? "[dsp/c54x]" : "[dsp-shunt]"; }
+#define SHUNT_LOG(fmt, ...) fprintf(stderr, "%s " fmt, shunt_tag(), ##__VA_ARGS__)
+#define SHUNT_ERR(fmt, ...) error_report("%s " fmt, shunt_tag(), ##__VA_ARGS__)
+
 /* ---- Helpers : read/write API RAM via AddressSpace (16-bit LE) ---- */
 static inline uint16_t shunt_read_w(uint32_t addr)
 {
@@ -398,7 +405,7 @@ static void shunt_latch_task(uint16_t new_d_dsp_page)
         int non_idle = (l2[1] != 0x03);
         if (non_idle || ul_log < 6) {
             if (!non_idle) ul_log++;
-            fprintf(stderr, "[dsp-shunt] SDCCH-UL%s task_u=0x%04x l1s%%51=%u "
+            SHUNT_LOG("SDCCH-UL%s task_u=0x%04x l1s%%51=%u "
                     "L2: %02x %02x %02x %02x %02x %02x %02x %02x\n",
                     non_idle ? " *NONIDLE*" : "", g_shunt.d_task_u,
                     (unsigned)(shunt_l1s_fn() % 51),
@@ -412,8 +419,7 @@ static void shunt_latch_task(uint16_t new_d_dsp_page)
     if (g_shunt.d_task_md == PM_DSP_TASK)
         shunt_dispatch_pm(page_idx);
 
-    fprintf(stderr,
-        "[dsp-shunt] LATCH page=%u task_md=%u task_d=%u task_u=%u task_ra=%u fn=%u\n",
+    SHUNT_LOG("LATCH page=%u task_md=%u task_d=%u task_u=%u task_ra=%u fn=%u\n",
         page_idx, g_shunt.d_task_md, g_shunt.d_task_d, g_shunt.d_task_u,
         g_shunt.d_task_ra, g_shunt.d_fn);
 }
@@ -506,7 +512,7 @@ static unsigned shunt_parse_canned(void)
         else if (can_tok_eq(t, "ANGLE")) m |= CAN_ANGLE;
         else if (can_tok_eq(t, "CRC"))   m |= CAN_CRC;
         else if (can_tok_eq(t, "FULL") || can_tok_eq(t, "ALL")) m = CAN_ALL;
-        else error_report("[dsp-shunt] CALYPSO_CANNED: token inconnu '%s' ignore", t);
+        else SHUNT_ERR("CALYPSO_CANNED: token inconnu '%s' ignore", t);
     }
     return m;
 }
@@ -562,8 +568,7 @@ static void shunt_dispatch_fb(uint8_t page_idx)
      * real DSP's task-completion echo. */
     shunt_write_w(rp_base(page_idx) + RP_D_TASK_MD, FB_DSP_TASK);
 
-    fprintf(stderr,
-        "[dsp-shunt] DISPATCH FB page=%u → d_fb_det=1 TOA=%d PM=0x%x "
+    SHUNT_LOG("DISPATCH FB page=%u → d_fb_det=1 TOA=%d PM=0x%x "
         "ANGLE=%d SNR=0x%x (NDB only)\n",
         page_idx, SHUNT_CANNED_TOA, SHUNT_CANNED_PM,
         SHUNT_CANNED_ANGLE, SHUNT_CANNED_SNR);
@@ -586,7 +591,7 @@ static void shunt_dispatch_sb(uint8_t page_idx)
     if (!g_shunt.sb_valid && no_canned) {
         static unsigned waitlog = 0;
         if (waitlog++ < 10)
-            fprintf(stderr, "[dsp-shunt] SB: pas encore de SCH reel (gr-gsm) "
+            SHUNT_LOG("SB: pas encore de SCH reel (gr-gsm) "
                     "-> pas de dispatch (no-canned, le firmware attend)\n");
         return;
     }
@@ -627,8 +632,7 @@ static void shunt_dispatch_sb(uint8_t page_idx)
     /* Ack on read page. */
     shunt_write_w(rp + RP_D_TASK_MD, SB_DSP_TASK);
 
-    fprintf(stderr,
-        "[dsp-shunt] DISPATCH SB page=%u → sb=0x%08x BSIC=%u FN=%u %s TOA=%d\n",
+    SHUNT_LOG("DISPATCH SB page=%u → sb=0x%08x BSIC=%u FN=%u %s TOA=%d\n",
         page_idx, sb, bsic, fn,
         g_shunt.sb_valid ? "(gr-gsm REEL)" : "(canned legacy)", shunt_toa_val());
 }
@@ -714,7 +718,7 @@ static void shunt_dispatch_allc(uint8_t page_idx)
                 shunt_write_w(rpA + RP_A_SERV_DEMOD + D_SNR   * 2, SHUNT_CANNED_SNR);
                 static unsigned n_agch = 0;
                 if (n_agch++ < 40 || (n_agch % 50) == 0)
-                    fprintf(stderr, "[dsp-shunt] DISPATCH AGCH IMM-ASS #%u burst_d=%u "
+                    SHUNT_LOG("DISPATCH AGCH IMM-ASS #%u burst_d=%u "
                             "tc=%d -> a_cd (chan_nr=0x90 attendu)\n",
                             n_agch, g_shunt.d_burst_d, tc);
                 return;                                   /* ce dispatch = l'IMM ASSIGN */
@@ -776,7 +780,7 @@ static void shunt_dispatch_allc(uint8_t page_idx)
                 shunt_write_w(rpA + RP_A_SERV_DEMOD + D_SNR   * 2, SHUNT_CANNED_SNR);
                 static unsigned n_sdcch = 0;
                 if (n_sdcch++ < 40 || (n_sdcch % 50) == 0)
-                    fprintf(stderr, "[dsp-shunt] DISPATCH SDCCH/4 SS0 #%u burst_d=%u "
+                    SHUNT_LOG("DISPATCH SDCCH/4 SS0 #%u burst_d=%u "
                             "tc=%d -> a_cd (chan_nr=0x20 attendu)\n",
                             n_sdcch, g_shunt.d_burst_d, tc);
                 /* CONSUME-ONCE (corrige) : presenter le UA sur TOUS les bursts du
@@ -826,7 +830,7 @@ static void shunt_dispatch_allc(uint8_t page_idx)
                 shunt_write_w(rpA + RP_A_SERV_DEMOD + D_SNR   * 2, SHUNT_CANNED_SNR);
                 static unsigned n_sacch = 0;
                 if (n_sacch++ < 20 || (n_sacch % 50) == 0)
-                    fprintf(stderr, "[dsp-shunt] DISPATCH SACCH SI6 #%u tc=%d -> a_cd\n", n_sacch, tc);
+                    SHUNT_LOG("DISPATCH SACCH SI6 #%u tc=%d -> a_cd\n", n_sacch, tc);
                 return;
             }
         }
@@ -869,7 +873,7 @@ static void shunt_dispatch_allc(uint8_t page_idx)
         n_disp++;
         if (is_bcch) { n_bcch++; n_since_bcch = 0; } else n_since_bcch++;
         if ((n_disp % 51) == 0)
-            fprintf(stderr, "[dsp-shunt] #12 BCCH-sched: %lu disp / %lu BCCH "
+            SHUNT_LOG("#12 BCCH-sched: %lu disp / %lu BCCH "
                     "(tc=%d ofs=%d)\n", n_disp, n_bcch, tc, bcch_ofs);
         /* Garde anti-famine : grace au boot (200 disp) + si 0 BCCH depuis 102
          * dispatches (désalignement total) on présente quand même → dégrade
@@ -920,8 +924,7 @@ static void shunt_dispatch_allc(uint8_t page_idx)
     shunt_write_w(rp + RP_A_SERV_DEMOD + D_ANGLE * 2, shunt_is_canned(CAN_ANGLE) ? SHUNT_CANNED_ANGLE : 0);
     shunt_write_w(rp + RP_A_SERV_DEMOD + D_SNR   * 2, (shunt_is_canned(CAN_SNR) || g_shunt.sb_valid) ? SHUNT_CANNED_SNR : 0);
 
-    fprintf(stderr,
-        "[dsp-shunt] DISPATCH ALLC page=%u burst_d=%u -> SI3 in a_cd[3..14] + "
+    SHUNT_LOG("DISPATCH ALLC page=%u burst_d=%u -> SI3 in a_cd[3..14] + "
         "a_serv_demod canned\n", page_idx, g_shunt.d_burst_d);
 }
 
@@ -944,8 +947,7 @@ static void shunt_dispatch_pm(uint8_t page_idx)
     shunt_write_w(rp + RP_D_TASK_MD, PM_DSP_TASK);
     static unsigned pm_log = 0;
     if (pm_log++ < 5)
-        fprintf(stderr,
-                "[dsp-shunt] DISPATCH PM page=%u → a_pm[0..2]=0x%04x (rxlev)\n",
+        SHUNT_LOG("DISPATCH PM page=%u → a_pm[0..2]=0x%04x (rxlev)\n",
                 page_idx, (uint16_t)pm_val);
 }
 
@@ -953,8 +955,7 @@ static void shunt_dispatch_nb(uint8_t page_idx, uint16_t task_d)
 {
     /* TODO : NB DL = decoded BCCH/CCCH burst payload into NDB a_cd[].
      * NB UL = consume burst bits from DARAM for TX (forwarded to bridge). */
-    fprintf(stderr,
-        "[dsp-shunt] DISPATCH NB page=%u task_d=%u (TODO)\n",
+    SHUNT_LOG("DISPATCH NB page=%u task_d=%u (TODO)\n",
         page_idx, task_d);
 }
 
@@ -1075,8 +1076,15 @@ void calypso_dsp_shunt_on_frame_tick(void)
     /* Priority order: md tasks (FB/SB) > NB DL > NB UL > ALLC.
      * Refine when canned policies land. */
     if (shunt_route_c54x() && g_shunt.c54x) {
-        /* CALYPSO_DSP=c54x : ne mocke PAS — route vers le VRAI DSP. */
+        /* CALYPSO_DSP=c54x : route vers le VRAI DSP, PUIS overlay des écritures NDB
+         * gr-gsm par-dessus le poison 0x70c4 du c54x. Le shunt écrit en DERNIER dans
+         * la même read-page -> ses valeurs priment (rxlev/FB/SB/SI réels) -> le mobile
+         * campe et fait sa LU en no-shunt (c54x). Le c54x tourne quand même (revival). */
         shunt_route_to_c54x(page);
+        if (md == PM_DSP_TASK)                          shunt_dispatch_pm(page);
+        else if (md == FB_DSP_TASK)                     shunt_dispatch_fb(page);
+        else if (md == SB_DSP_TASK && g_shunt.sb_valid) shunt_dispatch_sb(page);
+        if (td == ALLC_DSP_TASK)                        shunt_dispatch_allc(page);
     } else if (md == PM_DSP_TASK) {
         shunt_dispatch_pm(page);
     } else if (md == FB_DSP_TASK) {
@@ -1164,7 +1172,7 @@ static void calypso_dsp_shunt_feed_agch(const uint8_t *l2, int len)
             if ((uint32_t)(g_shunt.tick_cnt - g_shunt.agch_tick) <= (uint32_t)ttl) {
                 static unsigned drop = 0;
                 if (drop++ < 20 || (drop % 200) == 0)
-                    fprintf(stderr, "[dsp-shunt] feed_agch: PAGING mt=0x%02x DROP "
+                    SHUNT_LOG("feed_agch: PAGING mt=0x%02x DROP "
                             "(IMM ASSIGN 0x%02x encore valide en attente)\n", in_mt, cur_mt);
                 return;
             }
@@ -1205,7 +1213,7 @@ static void calypso_dsp_shunt_feed_agch(const uint8_t *l2, int len)
                              : (reqref_rw ? g_last_rach_conf_fn : 0);   /* per-ra exact, sinon fallback global */
             { static unsigned dbg = 0;
               if (dbg++ < 40)
-                  fprintf(stderr, "[dsp-shunt] FN-FIX probe RA=0x%02x "
+                  SHUNT_LOG("FN-FIX probe RA=0x%02x "
                           "memo_fn(RACH_CONF)=%u last_rach@500=%u l1s_fn=%u n=%d\n",
                           ra, memo_fn, shunt_last_rach_fn(), shunt_l1s_fn(), n); }
             if (memo_fn) {
@@ -1218,7 +1226,7 @@ static void calypso_dsp_shunt_feed_agch(const uint8_t *l2, int len)
                 g_shunt.agch_buf[9] = (uint8_t)(((t3 & 7) << 5) | (t2 & 0x1f));
                 static unsigned rwlog = 0;
                 if (rwlog++ < 30)
-                    fprintf(stderr, "[dsp-shunt] FN-FIX req-ref RA=0x%02x reecrite -> "
+                    SHUNT_LOG("FN-FIX req-ref RA=0x%02x reecrite -> "
                             "fn=%u (T1'=%u T2=%u T3=%u) adj=%d [last_rach.fn]\n",
                             ra, (uint32_t)fn, t1p, t2, t3, rr_adj);
             }
@@ -1227,7 +1235,7 @@ static void calypso_dsp_shunt_feed_agch(const uint8_t *l2, int len)
 
     g_shunt.agch_valid = true;
     g_shunt.agch_tick  = g_shunt.tick_cnt;
-    fprintf(stderr, "[dsp-shunt] feed_agch: IMM-ASS mt=0x%02x -> agch_buf "
+    SHUNT_LOG("feed_agch: IMM-ASS mt=0x%02x -> agch_buf "
             "(a presenter sur bloc CCCH)\n", l2[2]);
 }
 
@@ -1245,7 +1253,7 @@ static void calypso_dsp_shunt_feed_sdcch(const uint8_t *l2, int len)
 
     g_shunt.sdcch_valid = true;
     g_shunt.sdcch_tick  = g_shunt.tick_cnt;
-    fprintf(stderr, "[dsp-shunt] feed_sdcch: SDCCH/4 SS0 DL a0=0x%02x c=0x%02x "
+    SHUNT_LOG("feed_sdcch: SDCCH/4 SS0 DL a0=0x%02x c=0x%02x "
             "-> sdcch_buf (a presenter sur bloc fn%%51 22-25)\n", l2[0], l2[1]);
 }
 
@@ -1273,7 +1281,7 @@ static void calypso_dsp_shunt_feed_sacch(const uint8_t *l2, int len)
     g_shunt.sacch_real = true;                /* coupe la fabrication SI3->SI6 */
     static unsigned nf = 0;
     if (nf++ < 20 || (nf % 50) == 0)
-        fprintf(stderr, "[dsp-shunt] feed_sacch REEL: SI%d %do (mt=0x%02x) -> sacch_buf\n",
+        SHUNT_LOG("feed_sacch REEL: SI%d %do (mt=0x%02x) -> sacch_buf\n",
                 (l2[rr + 1] == 0x1d) ? 5 : 6, n, l2[rr + 1]);
 }
 
@@ -1341,7 +1349,7 @@ static void shunt_gsmtap_init(void)
     int port = (p && *p) ? atoi(p) : 4730;
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) {
-        error_report("[dsp-shunt] GSMTAP socket() failed: %s", strerror(errno));
+        SHUNT_ERR("GSMTAP socket() failed: %s", strerror(errno));
         return;
     }
     int one = 1;
@@ -1352,13 +1360,13 @@ static void shunt_gsmtap_init(void)
     sa.sin_port = htons((uint16_t)port);
     sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
-        error_report("[dsp-shunt] GSMTAP bind(:%d) failed: %s", port, strerror(errno));
+        SHUNT_ERR("GSMTAP bind(:%d) failed: %s", port, strerror(errno));
         close(fd);
         return;
     }
     g_gsmtap_fd = fd;
     qemu_set_fd_handler(fd, shunt_gsmtap_read, NULL, NULL);
-    error_report("[dsp-shunt] GSMTAP listener udp:127.0.0.1:%d → feed_si(a_cd) "
+    SHUNT_ERR("GSMTAP listener udp:127.0.0.1:%d → feed_si(a_cd) "
                  "(gr-gsm grgsm_decode -m BCCH y envoie le SI réel)", port);
 }
 
@@ -1402,7 +1410,7 @@ static void shunt_sch_read(void *opaque)
         g_shunt.sb_valid = true;
         static unsigned schlog = 0;
         if (first || schlog++ < 20 || (schlog % 200) == 0)
-            fprintf(stderr, "[dsp-shunt] SCH reel (gr-gsm): BSIC=%d "
+            SHUNT_LOG("SCH reel (gr-gsm): BSIC=%d "
                     "(ncc=%d bcc=%d) FN=%d TOA=%d%s\n", (int)g_shunt.sb_bsic,
                     (g_shunt.sb_bsic >> 3) & 7, g_shunt.sb_bsic & 7,
                     (int)fn, (int)g_shunt.sb_toa, first ? " [1er]" : "");
@@ -1415,7 +1423,7 @@ static void shunt_sch_init(void)
     int port = (p && *p) ? atoi(p) : 4731;
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) {
-        error_report("[dsp-shunt] SCH socket() failed: %s", strerror(errno));
+        SHUNT_ERR("SCH socket() failed: %s", strerror(errno));
         return;
     }
     int one = 1;
@@ -1426,13 +1434,13 @@ static void shunt_sch_init(void)
     sa.sin_port = htons((uint16_t)port);
     sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
-        error_report("[dsp-shunt] SCH bind(:%d) failed: %s", port, strerror(errno));
+        SHUNT_ERR("SCH bind(:%d) failed: %s", port, strerror(errno));
         close(fd);
         return;
     }
     g_sch_fd = fd;
     qemu_set_fd_handler(fd, shunt_sch_read, NULL, NULL);
-    error_report("[dsp-shunt] SCH listener udp:127.0.0.1:%d → feed_sb(BSIC/FN reels "
+    SHUNT_ERR("SCH listener udp:127.0.0.1:%d → feed_sb(BSIC/FN reels "
                  "gr-gsm) → shunt_dispatch_sb (remplace SHUNT_CANNED_BSIC)", port);
 }
 
@@ -1480,11 +1488,11 @@ static void shunt_shm_init(void)
 {
     int fd = shm_open(SHM_NAME, O_CREAT | O_RDWR, 0666);
     if (fd < 0) {
-        error_report("[dsp-shunt] shm_open(%s): %s", SHM_NAME, strerror(errno));
+        SHUNT_ERR("shm_open(%s): %s", SHM_NAME, strerror(errno));
         return;
     }
     if (ftruncate(fd, sizeof(struct dsp_shunt_shm)) != 0) {
-        error_report("[dsp-shunt] ftruncate shm: %s", strerror(errno));
+        SHUNT_ERR("ftruncate shm: %s", strerror(errno));
         close(fd);
         return;
     }
@@ -1492,13 +1500,13 @@ static void shunt_shm_init(void)
                    PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     close(fd);
     if (m == MAP_FAILED) {
-        error_report("[dsp-shunt] mmap shm: %s", strerror(errno));
+        SHUNT_ERR("mmap shm: %s", strerror(errno));
         return;
     }
     g_shm = m;
     g_shm->magic = 0x43445350;
     g_shm_last_si_seq = g_shm->si_seq;
-    error_report("[dsp-shunt] shm %s (=/dev/shm%s, %zu o) : I/Q in (feed_iq->gr-gsm) "
+    SHUNT_ERR("shm %s (=/dev/shm%s, %zu o) : I/Q in (feed_iq->gr-gsm) "
                  "+ SI out (gr-gsm->a_cd). gr-gsm AU MILIEU du shunt.",
                  SHM_NAME, SHM_NAME, sizeof(struct dsp_shunt_shm));
 
@@ -1515,17 +1523,17 @@ static void shunt_shm_init(void)
         if (g_iq_is_fifo) {
             g_iq_fd = open(cf, O_WRONLY | O_NONBLOCK);          /* FIFO : jamais bloquant, pas de create */
             if (g_iq_fd >= 0)
-                error_report("[dsp-shunt] I/Q -> %s (FIFO live fc32, non bloquant)", cf);
+                SHUNT_ERR("I/Q -> %s (FIFO live fc32, non bloquant)", cf);
             else if (errno == ENXIO)
-                error_report("[dsp-shunt] FIFO %s sans lecteur — open differe au feed", cf);
+                SHUNT_ERR("FIFO %s sans lecteur — open differe au feed", cf);
             else
-                error_report("[dsp-shunt] open(%s) FIFO: %s", cf, strerror(errno));
+                SHUNT_ERR("open(%s) FIFO: %s", cf, strerror(errno));
         } else {
             g_iq_fd = open(cf, O_WRONLY | O_CREAT | O_TRUNC, 0644);   /* cfile rejeu */
             if (g_iq_fd >= 0)
-                error_report("[dsp-shunt] enregistre l'I/Q -> %s (cfile fc32)", cf);
+                SHUNT_ERR("enregistre l'I/Q -> %s (cfile fc32)", cf);
             else
-                error_report("[dsp-shunt] open(%s) cfile: %s", cf, strerror(errno));
+                SHUNT_ERR("open(%s) cfile: %s", cf, strerror(errno));
         }
     }
     /* Record disque .cfile contigu (capture brute fc32) EN PLUS de la sortie live :
@@ -1540,9 +1548,9 @@ static void shunt_shm_init(void)
     if (*rec && !(g_iq_fd >= 0 && !g_iq_is_fifo && strcmp(rec, g_iq_path) == 0)) {
         g_iq_rec = fopen(rec, "wb");
         if (g_iq_rec)
-            error_report("[dsp-shunt] record disque I/Q -> %s (cfile fc32 contigu)", rec);
+            SHUNT_ERR("record disque I/Q -> %s (cfile fc32 contigu)", rec);
         else
-            error_report("[dsp-shunt] fopen(%s) record: %s", rec, strerror(errno));
+            SHUNT_ERR("fopen(%s) record: %s", rec, strerror(errno));
     }
     /* cfile #2 : reconstruction FN-espacee (zero-fill des trames manquantes) pour
      * que grgsm retrouve la 51-mf et decode la SACCH (SI5/SI6). Test offline, ne
@@ -1551,7 +1559,7 @@ static void shunt_shm_init(void)
     if (cf2 && *cf2) {
         g_iq_cfile2 = fopen(cf2, "wb");
         if (g_iq_cfile2)
-            error_report("[dsp-shunt] cfile #2 FN-espace -> %s (gap zero-fill)", cf2);
+            SHUNT_ERR("cfile #2 FN-espace -> %s (gap zero-fill)", cf2);
     }
 }
 
@@ -1682,7 +1690,7 @@ void calypso_dsp_shunt_init(MemoryRegion *system_memory, AddressSpace *as)
      * après le tick L1=c, donc ses écritures d_fb_det/a_sch/a_cd priment. */
     const char *env = getenv("CALYPSO_DSP_SHUNT");
     bool shunt_env_on = (env && strcmp(env, "1") == 0);
-    if (!shunt_env_on && !calypso_l1_c_active()) {
+    if (!shunt_env_on && !calypso_l1_c_active() && !shunt_route_c54x()) {
         g_shunt.active = false;
         return;
     }
@@ -1716,7 +1724,7 @@ void calypso_dsp_shunt_init(MemoryRegion *system_memory, AddressSpace *as)
     g_canned = shunt_parse_canned();
     {
         const char *no_canned = getenv("CALYPSO_SHUNT_NO_CANNED");
-        error_report("[dsp-shunt] CALYPSO_CANNED (dette fabriquée EXPLICITE) : "
+        SHUNT_ERR("CALYPSO_CANNED (dette fabriquée EXPLICITE) : "
                      "FBDET=%d TOA=%d PM=%d SNR=%d ANGLE=%d CRC=%d  "
                      "[non-canné=valeur réelle/0]. Hors var : BSIC=%s, SI=%s.",
                      !!(g_canned & CAN_FBDET), !!(g_canned & CAN_TOA),
@@ -1728,7 +1736,7 @@ void calypso_dsp_shunt_init(MemoryRegion *system_memory, AddressSpace *as)
                         : "réel via feed_si (+ fallback legacy possible)");
     }
 
-    error_report("[dsp-shunt] active — c54x emulator should be skipped, "
+    SHUNT_ERR("active — c54x emulator should be skipped, "
                  "BSP DMA→DARAM should be gated. Watch /tmp/qemu.log for "
                  "LATCH/DISPATCH lines.");
 }
@@ -1814,7 +1822,7 @@ void calypso_dsp_shunt_feed_si(const uint8_t *l2, int len)
                        inj = (e && *e == '0') ? 0 : 1; }
         if (inj) l1ctl_inject_dl_si(g_shunt.si_buf, 23, calypso_trx_get_fn());
     }
-    fprintf(stderr, "[dsp-shunt] feed_si: SI réel %d o injecté → a_cd "
+    SHUNT_LOG("feed_si: SI réel %d o injecté → a_cd "
             "(L2[0..2]=%02x %02x %02x)\n", n, l2[0],
             n > 1 ? l2[1] : 0, n > 2 ? l2[2] : 0);
 }
