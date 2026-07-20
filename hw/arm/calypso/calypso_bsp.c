@@ -403,8 +403,19 @@ static void bsp_trxd_readable(void *opaque)
      * On NE remplit donc PAS la queue DARAM (bsp_enqueue) -> sinon elle sature
      * (bursts_dropped_queue_full) -> backpressure qui remonte et TUE l'IPC/BTS.
      * On rend la main : l'IPC continue de couler, le shm est nourri. */
-    if (calypso_dsp_shunt_active())
-        return;
+    {
+        /* Frontiere B (2026-07-20) : en mode revive c54x (DSP=c54x + RUN_C54X=1)
+         * le correlateur NATIF lit la DARAM 0x2a00 -> on NE return PAS, on remplit
+         * AUSSI la DARAM pour lui fournir de IQ (le DSP la consomme -> pas la
+         * saturation du shunt-only). Hors revive : comportement inchange. */
+        static int bsp_revive = -1;
+        if (bsp_revive < 0) {
+            const char *e = getenv("CALYPSO_DSP_RUN_C54X");
+            bsp_revive = (calypso_dsp_shunt_route_c54x_active() && e && *e == '1') ? 1 : 0;
+        }
+        if (calypso_dsp_shunt_active() && !bsp_revive)
+            return;
+    }
 
     /* TRXDv0 DL: tn(1) fn(4) rssi(1) toa(2) bits(148) = 156 bytes.
      * (Confirmed empirically 2026-05-07 — earlier "asymmetric 6-byte

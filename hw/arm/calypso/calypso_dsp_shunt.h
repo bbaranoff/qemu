@@ -44,5 +44,6 @@ void calypso_dsp_shunt_record_rach(uint8_t ra);
 struct C54xState;
 void calypso_dsp_shunt_set_c54x(struct C54xState *s);
 bool calypso_dsp_shunt_route_c54x_active(void);
+bool calypso_dsp_shunt_early_booted(void);
 
 #endif /* CALYPSO_DSP_SHUNT_H */

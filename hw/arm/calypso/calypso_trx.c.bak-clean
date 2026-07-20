@@ -11,6 +11,7 @@
 #include "sysemu/runstate.h"          /* runstate_is_running() — gate DSP tick on ARM halt */
 #include "exec/address-spaces.h"
 #include "hw/irq.h"
+#include "hw/core/cpu.h"   /* current_cpu / get_pc — probe golive */
 #include "hw/arm/calypso/calypso_trx.h"
 #include "hw/arm/calypso/calypso_uart.h"
 #include "hw/arm/calypso/calypso_c54x.h"
@@ -359,6 +360,25 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
 {
     CalypsoTRX *s = opaque;
     if (offset >= CALYPSO_DSP_SIZE) return;
+
+    /* [c54x-bootmbox] READ-ONLY : l'ARM ecrit-il le mailbox de boot DSP ?
+     * data[0x0fff]=cmd golive(2/4) <- ARM off 0xFFE ; data[0x0ffe]=entry <- 0xFFC.
+     * Si ce log n'apparait JAMAIS -> l'ARM ne poste pas le golive (sequence
+     * download court-circuitee par le blob-load) -> fix qemu = modeliser le boot.
+     * Si il apparait mais data[0x0fff] reste 0x0001 -> bug de mapping. Cap 40. */
+    if (offset >= 0x0FF8 && offset <= 0x0FFE) {
+        static unsigned bm = 0;
+        /* cap releve + focus cmd (0x0ffe->data[0xfff]) : voir si lARM RE-poste le
+         * golive APRES le c54x_reset de DSP_DL_STATUS=READY, ou pre-charge 1x. */
+        if (bm++ < 300) {
+            uint64_t arm_pc = (current_cpu && current_cpu->cc && current_cpu->cc->get_pc)
+                              ? current_cpu->cc->get_pc(current_cpu) : 0;
+            fprintf(stderr, "[c54x-bootmbox] ARM WR off=0x%04x -> data[0x%04x] "
+                    "val=0x%04x fn=%u ARM_PC=0x%08llx\n",
+                    (unsigned)offset, (unsigned)(offset/2 + 0x0800),
+                    (unsigned)value, s->fn, (unsigned long long)arm_pc);
+        }
+    }
 
     /* === Unconditional probe : count ALL writes by offset range ===
      * Gated par CALYPSO_DEBUG=DSP_WRITE_COUNT. Bucket par 0x40-byte zone

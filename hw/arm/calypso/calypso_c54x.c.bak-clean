@@ -849,6 +849,46 @@ static void fbdb_probe_init_lazy(void)
     }
 }
 
+/* ============================================================
+ * CRASH-PC CATCHER (env CALYPSO_C54X_CRASHPC=1) : capture le dernier
+ * PC/insn du c54x avant SIGSEGV/ABRT/FPE/BUS, pour localiser le crash
+ * de la revive c54x (shunt_route_to_c54x -> c54x_run reveille dans le
+ * code L1 du firmware). Sans overhead sauf si l'env est arme.
+ * ============================================================ */
+#include <signal.h>
+#include <unistd.h>
+static volatile sig_atomic_t g_c54x_crash_en = -1;
+static volatile uint16_t     g_c54x_crash_pc = 0;
+static volatile uint32_t     g_c54x_crash_insn = 0;
+static void c54x_crash_handler(int sig)
+{
+    char buf[160];
+    int n = snprintf(buf, sizeof buf,
+        "\n[c54x] *** CRASH sig=%d last_pc=0x%04x insn=%u ***\n",
+        sig, (unsigned)g_c54x_crash_pc, (unsigned)g_c54x_crash_insn);
+    if (n > 0) { ssize_t w = write(2, buf, (size_t)n); (void)w; }
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+static inline void c54x_crashpc_tick(C54xState *s)
+{
+    if (g_c54x_crash_en < 0) {
+        const char *e = getenv("CALYPSO_C54X_CRASHPC");
+        g_c54x_crash_en = (e && *e == '1') ? 1 : 0;
+        if (g_c54x_crash_en) {
+            signal(SIGSEGV, c54x_crash_handler);
+            signal(SIGABRT, c54x_crash_handler);
+            signal(SIGFPE,  c54x_crash_handler);
+            signal(SIGBUS,  c54x_crash_handler);
+            fprintf(stderr, "[c54x] CRASH-PC catcher armed (SIGSEGV/ABRT/FPE/BUS)\n");
+        }
+    }
+    if (g_c54x_crash_en) {
+        g_c54x_crash_pc   = s->pc;
+        g_c54x_crash_insn = s->insn_count;
+    }
+}
+
 /* Hook called from c54x_run top-of-loop, before c54x_exec_one. */
 static void fbdb_probe_check_pc(uint16_t pc, void *s_void)
 {
@@ -1617,6 +1657,35 @@ static int      g_fbwatch_on = -1;
 
 static uint16_t data_read(C54xState *s, uint16_t addr)
 {
+    /* [c54x-poll] READ-ONLY : identifie ce que le spin boot-ROM 0xb41c poll.
+     * Le c54x natif est parque dans 0xb41c<->0xb427 (INTM=1). S'il lit une
+     * case mailbox API-RAM que l'ARM ne poste jamais -> le vrai bug est
+     * ARM-side (l'ARM ne signale jamais 'init done' -> le firmware ne fait
+     * jamais son propre RSBX INTM). Cap 40, ~zero cout hors zone. */
+    /* [c54x-golive-poll] READ-ONLY : que POLL la boucle go-live 0xa4ca-0xa4e2 ?
+     * (3e verrou : le DSP entre dans le go-live mais boucle avant 0xa51b RSBX INTM).
+     * Meme technique que le poll boot qui a nomme BL_CMD_STATUS. Cap 60. */
+    if (s->pc >= 0xa4ca && s->pc <= 0xa4e2) {
+        static unsigned gpw = 0;
+        if (gpw < 60) {
+            gpw++;
+            fprintf(stderr, "[c54x-golive-poll] pc=0x%04x rd addr=0x%04x val=0x%04x "
+                    "DP=0x%03x AR1=0x%04x AR2=0x%04x AR3=0x%04x A=0x%010llx insn=%u\n",
+                    s->pc, addr, s->data[addr], (unsigned)(s->st0 & 0x1FF),
+                    s->ar[1], s->ar[2], s->ar[3],
+                    (unsigned long long)(s->a & 0xFFFFFFFFFFULL), s->insn_count);
+        }
+    }
+    if (s->pc >= 0xb41c && s->pc <= 0xb428) {
+        static unsigned pollw = 0;
+        if (pollw < 40) {
+            pollw++;
+            fprintf(stderr, "[c54x-poll] pc=0x%04x rd addr=0x%04x val=0x%04x "
+                    "DP=0x%03x ARP=%u AR1=0x%04x AR3=0x%04x insn=%u\n",
+                    s->pc, addr, s->data[addr], (unsigned)(s->st0 & 0x1FF),
+                    (unsigned)((s->st0 >> 13) & 7), s->ar[1], s->ar[3], s->insn_count);
+        }
+    }
     /* Correlator read tracer (env-gated CALYPSO_CORRELATOR_TRACE=1).
      * Record addr seulement quand PC ∈ [CORR_PC_LO..CORR_PC_HI) (FB-det range).
      * Range étendu 2026-05-25 night à 0x8d00..0x9000 (cf comment block au L639).
@@ -2317,6 +2386,17 @@ static void stkw_rec(C54xState *s, uint16_t addr, uint16_t val)
 
 static void data_write(C54xState *s, uint16_t addr, uint16_t val)
 {
+    /* [c54x-bootmbox-wr] RO : qui ECRIT le mailbox de boot data[0xfff]=cmd /
+     * data[0xffe]=entry, avec quel PC ? Tranche golive(2) pose puis clobber
+     * IDLE(1) par le boot DSP (ordering) vs jamais pose dans data[]. Cap 40. */
+    if (addr == 0x0fff || addr == 0x0ffe) {
+        static unsigned bmw = 0;
+        if (bmw++ < 40)
+            fprintf(stderr, "[c54x-bootmbox-wr] DSP WR data[0x%04x] <- 0x%04x "
+                    "dsp_ram[same]=0x%04x PC=0x%04x insn=%u\n", addr, val,
+                    s->api_ram ? s->api_ram[addr - C54X_API_BASE] : 0xDEAD,
+                    s->pc, s->insn_count);
+    }
     /* WRITE-WATCH (2026-06-24, RO) : qui ECRIT 0x434f (FIFO write ptr),
      * 0x434e (FIFO read ptr), 0x3f6d (soft-vector go-live) — avec quel PC.
      * Tranche empiriquement ECRITURE-ACTIVE (par un chemin) vs residu/defaut :
@@ -10309,6 +10389,7 @@ static void dsp_trap_dump(C54xState *s, uint16_t exec_pc, uint16_t exec_op,
 int c54x_run(C54xState *s, int n_insns)
 {
     int executed = 0;
+    c54x_crashpc_tick(s);  /* arm catcher AVANT la boucle : capte un crash de setup / 1re insn */
 
     /* Log first 10 instructions of each run (for 2nd cycle debug) */
     static int run_num = 0;
@@ -11934,6 +12015,55 @@ int c54x_run(C54xState *s, int n_insns)
         corr_entry_track(s->pc, s);
         /* FBDB-PROBE (env CALYPSO_FBDB_PROBE=1, c web reframe 2026-05-25 night2) :
          * trace B@fbd9, A@fbdb (= post F2xx SUB), A@fbf3 (= before STLM A,AR4). */
+        /* [c54x-b405] trace le write soft-vector data[0x3f6d]=0xa4df @0xb405 :
+         * immediat ROM (ST #lk) ou calcule (STL A, registre) ? Dump opcodes + regs. */
+        /* [c54x-fill] trace le RPT-fill 0x5a00 (setup + compteur lku + entree) :
+         * pourquoi il s'arrete a 0x5ac7 (un mot trop tot) -> mem[0x5ac8]=0 -> storm. */
+        /* [c54x-corr] Frontiere B : le correlateur FB (PROM0 0x8d00-0x9000 / 0xee38)
+         * s-execute-t-il, et data[0x2a00] (buffer I/Q) a-t-il des samples ? */
+        if ((s->pc >= 0x8d00 && s->pc < 0x9000) || (s->pc >= 0xee20 && s->pc < 0xee60)) {
+            static unsigned corr_hit = 0; static unsigned corr_log = 0;
+            corr_hit++;
+            if (corr_log < 20 && (corr_hit % 4096) == 1) {
+                corr_log++;
+                fprintf(stderr, "[c54x-corr] CORRELATOR pc=0x%04x hits=%u AR3=0x%04x "
+                        "data[0x2a00..3]=%04x %04x %04x %04x A=0x%010llx insn=%u\n",
+                        s->pc, corr_hit, s->ar[3],
+                        s->data[0x2a00], s->data[0x2a01], s->data[0x2a02], s->data[0x2a03],
+                        (unsigned long long)(s->a & 0xFFFFFFFFFFULL), s->insn_count);
+            }
+        }
+        if (s->pc == 0xb37c) {
+            static int caller_done = 0;
+            if (!caller_done) { caller_done = 1;
+                fprintf(stderr, "[c54x-caller] enter 0xb37c SP=0x%04x insn=%u chain[-16..-1]:",
+                        s->sp, s->insn_count);
+                for (int _i = 16; _i >= 1; _i--)
+                    fprintf(stderr, " %04x", pc_ring[(pc_ring_idx - _i) & 255]);
+                fprintf(stderr, "\n");
+            }
+        }
+        if (s->pc >= 0xb37c && s->pc <= 0xb392) {
+            static unsigned nfl = 0;
+            if (nfl++ < 40)
+                fprintf(stderr, "[c54x-fill] pc=0x%04x op=0x%04x w1=0x%04x AR0=0x%04x "
+                        "rpt_count=%d rpt_active=%d prev=0x%04x A=0x%06llx insn=%u\n",
+                        s->pc, prog_fetch(s, s->pc), prog_fetch(s, (uint16_t)(s->pc+1)),
+                        s->ar[0], s->rpt_count, s->rpt_active, s->last_exec_pc,
+                        (unsigned long long)(s->a & 0xFFFFFFULL), s->insn_count);
+        }
+        if (s->pc >= 0xb400 && s->pc <= 0xb408) {
+            static unsigned nb405 = 0;
+            if (nb405++ < 24)
+                fprintf(stderr, "[c54x-b405] pc=0x%04x op=0x%04x w1=0x%04x w2=0x%04x "
+                        "A=0x%010llx AR1=%04x AR2=%04x AR3=%04x DP=0x%03x d[0x3f6d]=0x%04x insn=%u\n",
+                        s->pc, prog_fetch(s, s->pc), prog_fetch(s, (uint16_t)(s->pc+1)),
+                        prog_fetch(s, (uint16_t)(s->pc+2)),
+                        (unsigned long long)(s->a & 0xFFFFFFFFFFULL),
+                        s->ar[1], s->ar[2], s->ar[3], (unsigned)(s->st0 & 0x1FF),
+                        s->data[0x3f6d], s->insn_count);
+        }
+        c54x_crashpc_tick(s);
         fbdb_probe_check_pc(s->pc, s);
         /* FORCE-INTM-ONESHOT (env CALYPSO_FORCE_INTM_ONESHOT=1, c web reframe
          * 2026-05-25 night4) : sonde arbitrage — clear INTM UNE FOIS quand

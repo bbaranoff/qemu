@@ -1214,9 +1214,42 @@ bool calypso_dsp_shunt_active(void)
 }
 
 /* CALYPSO_DSP=c54x : relie le handle du VRAI DSP (depuis calypso_mb.c). */
+static bool g_c54x_early_booted = false;
+bool calypso_dsp_shunt_early_booted(void) { return g_c54x_early_booted; }
+
 void calypso_dsp_shunt_set_c54x(C54xState *s)
 {
     g_shunt.c54x = s;
+
+    /* [c54x-earlyboot] FIX race d'ordre golive (2026-07-20, mode B).
+     * Root cause : l'ARM poste le golive (data[0x0fff]=cmd 2/4, data[0x0ffe]=entry)
+     * a fn=0/+0.073s, MAIS le c54x ne bootait qu'a +5.6s (1er shunt_route_to_c54x)
+     * -> son init-IDLE a 0xb419 (ST #1,*0xfff) ecrasait le 0x0002 de l'ARM -> spin
+     * eternel a 0xb41c. Etat PERSISTE entre wakes (verifie : 0xb419 ne tourne
+     * qu'une fois, insn accumule, meme objet DSP). Fix = booter le c54x ICI
+     * (machine-init, AVANT que le vCPU ARM tourne -> AVANT le golive), pour qu'il
+     * pose son IDLE et se parke a 0xb41c AVANT l'ecriture ARM. 0xb419 ne re-tourne
+     * plus (PC persiste) -> le 0x0002 survit -> le 1er wake shunt le consomme ->
+     * golive natif (le firmware fait son propre RSBX INTM). Zero FORCE_ : on force
+     * le QUAND du boot, aucune valeur de mailbox. One-shot, gate mode revive. */
+    if (s && shunt_route_c54x()) {
+        static int rc = -1;
+        if (rc < 0) { const char *e = getenv("CALYPSO_DSP_RUN_C54X"); rc = (e && *e == '1') ? 1 : 0; }
+        if (rc) {
+            uint16_t pc0 = s->pc;
+            s->running = true;
+            c54x_run(s, 2000);   /* reset(0xff80) -> 0xb419 (pose IDLE) -> park 0xb41c */
+            if (s->pc >= 0xb41c && s->pc <= 0xb428) {
+                g_c54x_early_booted = true;   /* gate le re-reset trx:701 */
+                fprintf(stderr, "[c54x-earlyboot] PARK pc=0x%04x (de 0x%04x) insn=%u "
+                        "data[0x0fff]=0x%04x data[0x0ffe]=0x%04x (attendu IDLE 0x0001)\n",
+                        s->pc, pc0, s->insn_count, s->data[0x0fff], s->data[0x0ffe]);
+            } else
+                fprintf(stderr, "[c54x-earlyboot] WARN pas parque pc=0x%04x insn=%u "
+                        "-> B invalide, basculer sur A (execution continue)\n",
+                        s->pc, s->insn_count);
+        }
+    }
 }
 
 /* Predicat dedie : shunt actif ET route c54x demandee. Utilise par
