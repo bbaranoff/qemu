@@ -45,6 +45,9 @@
 #include "sysemu/dma.h"
 #include "qemu/main-loop.h"
 #include "calypso_dsp_shunt.h"
+#include "calypso_c54x.h"   /* C54xState + c54x_bsp_load/run/interrupt_ex/wake (CALYPSO_DSP=c54x route) */
+#include "calypso_layer1.h" /* calypso_l1_c_active() : ungate SB/SI (+FB) sous CALYPSO_L1=c */
+extern int g_c54x_int3_src;  /* diag source INT3 (RO) */
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -134,6 +137,10 @@
 #define D_SNR               3
 
 /* ---- pending-task state ---- */
+#ifndef SHM_IQ_LEN
+#define SHM_IQ_LEN    320          /* int16 par slot (>= 296 = 148 complexes cs16) */
+#endif
+
 struct dsp_shunt_state {
     bool       active;                /* CALYPSO_DSP_SHUNT=1 */
     AddressSpace *as;                 /* ARM AS to peek/poke API RAM */
@@ -187,6 +194,15 @@ struct dsp_shunt_state {
     /* PM REEL (no-hardcode) : magnitude moyenne du dernier burst DL (feed_iq).
      * Remplace le canned 0x7000 / le 0=-110 : le firmware en derive le vrai rxlev. */
     uint16_t   last_pm;
+    /* CALYPSO_DSP=c54x : handle du VRAI DSP (relie via calypso_dsp_shunt_set_c54x()
+     * depuis calypso_mb.c). NULL => route c54x inactive (fallback mock). */
+    C54xState *c54x;
+    /* Dernier burst I/Q DL stashe par feed_iq pour pilotage au frame tick
+     * (cs16 entrelace I,Q). Rejoue via c54x_bsp_load dans shunt_route_to_c54x(). */
+    int16_t    last_iq[SHM_IQ_LEN];
+    int        last_iq_n;
+    uint32_t   last_iq_fn;
+    bool       last_iq_valid;
 };
 
 /* FN TDMA reelle (calypso_trx.c) pour recoder la FN du shunt (LATCH d_fn=0). */
@@ -198,6 +214,18 @@ extern volatile uint32_t g_last_rach_conf_fn;
 extern volatile uint32_t g_rach_conf_fn[256];   /* per-ra : FN exact du RACH_CONF keye par ra (defini l1ctl_sock.c) */
 
 static struct dsp_shunt_state g_shunt;
+
+/* CALYPSO_DSP=c54x : route les ordres+I/Q vers le VRAI c54x (pas de mock).
+ * getenv lu une seule fois (idiome memoize du fichier). */
+static bool shunt_route_c54x(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("CALYPSO_DSP");
+        v = (e && strcmp(e, "c54x") == 0) ? 1 : 0;
+    }
+    return v;
+}
 
 /* ---- Helpers : read/write API RAM via AddressSpace (16-bit LE) ---- */
 static inline uint16_t shunt_read_w(uint32_t addr)
@@ -972,6 +1000,62 @@ static void shunt_dispatch_tch_dl(uint8_t page_idx)
     shunt_write_w(aa + 6 + 32, (uint16_t)fr[32] << 8);  /* octet impair en poids fort */
 }
 
+/* CALYPSO_DSP=c54x : pilote le VRAI DSP depuis le frame tick du shunt.
+ * Les ordres (d_task_md/d_task_d/d_task_u/d_task_ra) sont DEJA dans l'api_ram
+ * partagee (c54x->api_ram == dsp_ram cote ARM), donc pas de recopie du
+ * descripteur ici. On (a) DMA la write-page API -> DARAM 0x0586 (le trx skippe
+ * cette DMA quand le shunt est actif, on la refait nous-memes), (b) recharge le
+ * dernier burst I/Q dans bsp_buf, (c) leve INT3 (FRAME) + wake, (d) execute le
+ * budget c54x_run.
+ *
+ * FIX (verif report) : la write-page MCU->DSP est a BASE_API_W_PAGE_0/1
+ * (0xFFD00000 / 0xFFD00028), PAS a BASE_API_NDB (0xFFD001A8). On reutilise le
+ * helper wp_base() existant. Replique la DMA de trx calypso_dsp_done(@711) :
+ * data[0x0584]=page, data[0x0585]=fn, data[0x0586+i]=wp[i] (i<20), et le mirror
+ * api_ram[0x08D4 - C54X_API_BASE]=page (d_dsp_page cote DSP, lu par le firmware). */
+static void shunt_route_to_c54x(uint8_t page_idx)
+{
+    C54xState *dsp = g_shunt.c54x;
+    if (!dsp)
+        return;
+
+    /* (a) API write-page -> DARAM 0x0586 (replique de la DMA trx gatee a :711).
+     * wp_base(page_idx) = adresse MMIO absolue de la write-page (== dsp_ram).
+     * Le mot d_dsp_page (NDB+0 = 0xFFD001A8) est lu live (= s->dsp_ram[0x01A8/2]
+     * cote trx) pour data[0x0584] et le mirror 0x08D4. */
+    {
+        uint32_t wbase    = wp_base(page_idx);
+        uint16_t dsp_page = shunt_read_w(BASE_API_NDB + NDB_D_DSP_PAGE);
+        dsp->data[0x0584] = dsp_page;
+        dsp->data[0x0585] = (uint16_t)(g_shunt.d_fn & 0xFFFF);
+        for (int i = 0; i < 20; i++)
+            dsp->data[0x0586 + i] = shunt_read_w(wbase + (uint32_t)i * 2);
+        /* mirror d_dsp_page cote DSP (le firmware le lit a api_ram 0x08D4). */
+        if (dsp->api_ram)
+            dsp->api_ram[0x08D4 - C54X_API_BASE] = dsp_page;
+    }
+
+    /* (b) rejoue le dernier burst I/Q (cs16 entrelace I,Q) dans bsp_buf. */
+    if (g_shunt.last_iq_valid && g_shunt.last_iq_n > 0)
+        c54x_bsp_load(dsp, (const uint16_t *)g_shunt.last_iq, g_shunt.last_iq_n);
+
+    /* (c) INT3 FRAME + wake : reveille le DSP s'il etait idle/halt. */
+    g_c54x_int3_src = 3;
+    c54x_interrupt_ex(dsp, C54X_INT_FRAME_VEC, C54X_INT_FRAME_BIT);
+    c54x_wake(dsp);
+
+    /* (d) execute le budget (1 trame nominale ~256000 insns ; ajustable env). */
+    {
+        static int budget = -1;
+        if (budget < 0) {
+            const char *b = getenv("CALYPSO_DSP_BUDGET");
+            budget = (b && *b) ? atoi(b) : 256000;
+            if (budget <= 0) budget = 256000;
+        }
+        c54x_run(dsp, budget);
+    }
+}
+
 /* ---- Service hook : called from calypso_trx frame_irq tick ---- */
 void calypso_dsp_shunt_on_frame_tick(void)
 {
@@ -990,7 +1074,10 @@ void calypso_dsp_shunt_on_frame_tick(void)
 
     /* Priority order: md tasks (FB/SB) > NB DL > NB UL > ALLC.
      * Refine when canned policies land. */
-    if (md == PM_DSP_TASK) {
+    if (shunt_route_c54x() && g_shunt.c54x) {
+        /* CALYPSO_DSP=c54x : ne mocke PAS — route vers le VRAI DSP. */
+        shunt_route_to_c54x(page);
+    } else if (md == PM_DSP_TASK) {
         shunt_dispatch_pm(page);
     } else if (md == FB_DSP_TASK) {
         shunt_dispatch_fb(page);
@@ -1360,7 +1447,9 @@ static void shunt_sch_init(void)
  * ====================================================================== */
 #define SHM_NAME      "/calypso_dsp_shunt"
 #define SHM_IQ_SLOTS  64           /* ring de bursts (absorbe les stalls du decode gr-gsm) */
+#ifndef SHM_IQ_LEN
 #define SHM_IQ_LEN    320          /* int16 par slot (>= 296 = 148 complexes cs16) */
+#endif
 
 struct shm_iq_slot {
     uint32_t fn;                   /* frame number du burst */
@@ -1470,8 +1559,10 @@ static void shunt_shm_init(void)
  * entrelaces I,Q) qu'elle DMA dans la DARAM. Publie dans le shm pour gr-gsm. */
 void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
 {
-    if (!g_shm || !iq || n <= 0)
+    if (!iq || n <= 0)
         return;
+    if (!g_shm && !(shunt_route_c54x() && g_shunt.c54x))
+        return;   /* sans shm ET sans route c54x, rien a faire */
     if (n > SHM_IQ_LEN)
         n = SHM_IQ_LEN;
     /* PM REEL : magnitude moyenne (MAV) du burst DL -> g_shunt.last_pm. Pas de
@@ -1483,12 +1574,25 @@ void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
         uint32_t mav = (uint32_t)(acc / (uint32_t)n);
         g_shunt.last_pm = (mav > 0xffff) ? 0xffff : (uint16_t)mav;
     }
-    struct shm_iq_slot *slot = &g_shm->iq[g_shm->iq_wr % SHM_IQ_SLOTS];
-    slot->fn = fn;
-    slot->n  = (uint32_t)n;
-    memcpy(slot->iq, iq, (size_t)n * sizeof(int16_t));
-    __sync_synchronize();
-    g_shm->iq_wr++;               /* publie le burst (le lecteur poll iq_wr) */
+
+    /* CALYPSO_DSP=c54x : stash du dernier burst (cs16 I,Q) ; rejoue dans
+     * bsp_buf depuis shunt_route_to_c54x() au frame tick. */
+    if (shunt_route_c54x() && g_shunt.c54x) {
+        int m = (n > SHM_IQ_LEN) ? SHM_IQ_LEN : n;
+        memcpy(g_shunt.last_iq, iq, (size_t)m * sizeof(int16_t));
+        g_shunt.last_iq_n     = m;
+        g_shunt.last_iq_fn    = fn;
+        g_shunt.last_iq_valid = true;
+    }
+
+    if (g_shm) {
+        struct shm_iq_slot *slot = &g_shm->iq[g_shm->iq_wr % SHM_IQ_SLOTS];
+        slot->fn = fn;
+        slot->n  = (uint32_t)n;
+        memcpy(slot->iq, iq, (size_t)n * sizeof(int16_t));
+        __sync_synchronize();
+        g_shm->iq_wr++;               /* publie le burst (le lecteur poll iq_wr) */
+    }
 
     /* Sorties fc32 (I,Q normalise) : (a) live -> FIFO (FFT, drop) ou fichier, via
      * g_iq_fd ; (b) record disque contigu -> g_iq_rec (rejeu deterministe). fbuf
@@ -1509,6 +1613,26 @@ void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
         }
         if (g_iq_rec)                                  /* record disque : jamais bloquant */
             fwrite(fbuf, sizeof(float), (size_t)n, g_iq_rec);
+    }
+    /* cfile #2 FN-espace : chaque burst TS0 a sa position de trame
+     * ((fn-base)*spf int16), trames manquantes zero-fillees -> grgsm retrouve la
+     * 51-mf -> SACCH (SI5/SI6) decodable. spf = int16/trame TDMA (def 2500=1x,
+     * sweepable via CALYPSO_IQ_CFILE_SPF pour le test offline). */
+    if (g_iq_cfile2) {
+        static int spf = -1; static uint32_t base_fn = 0; static int64_t pos = 0; static int have_base = 0;
+        if (spf < 0) { const char *e = getenv("CALYPSO_IQ_CFILE_SPF"); spf = (e && *e) ? atoi(e) : 2500; }
+        if (!have_base) { base_fn = fn; pos = 0; have_base = 1; }
+        int64_t target = (int64_t)fn - (int64_t)base_fn;
+        if (target < 0) target += 2715648;            /* hyperframe wrap */
+        target *= spf;
+        int64_t gap = target - pos;
+        if (gap < 0 || gap > (int64_t)spf * 300) { base_fn = fn; pos = 0; gap = 0; }  /* rebase si saut anormal */
+        static const float zeros[512] = {0};
+        while (gap > 0) { int c = gap > 512 ? 512 : (int)gap; fwrite(zeros, sizeof(float), (size_t)c, g_iq_cfile2); pos += c; gap -= c; }
+        float fbuf2[SHM_IQ_LEN];
+        for (int i = 0; i < n; i++) fbuf2[i] = (float)iq[i] / 32768.0f;
+        fwrite(fbuf2, sizeof(float), (size_t)n, g_iq_cfile2);
+        pos += n;
     }
     /* cfile #2 FN-espace : chaque burst TS0 a sa position de trame
      * ((fn-base)*spf int16), trames manquantes zero-fillees -> grgsm retrouve la
@@ -1551,8 +1675,14 @@ static void shunt_poll_si_shm(void)
 /* ---- init : called from machine setup when CALYPSO_DSP_SHUNT=1 ---- */
 void calypso_dsp_shunt_init(MemoryRegion *system_memory, AddressSpace *as)
 {
+    /* Actif si CALYPSO_DSP_SHUNT=1 OU CALYPSO_L1=c : dans ce dernier cas le HLE
+     * (calypso_layer1.c) pilote le FB, mais SB (a_sch) + SI (a_cd) n'existent que
+     * dans le shunt -> on l'arme aussi pour fournir le chemin réception prouvé
+     * (FB+SB+SI) qui va jusqu'au LU accept. Le shunt on_frame_tick tourne ~1ms
+     * après le tick L1=c, donc ses écritures d_fb_det/a_sch/a_cd priment. */
     const char *env = getenv("CALYPSO_DSP_SHUNT");
-    if (!env || strcmp(env, "1") != 0) {
+    bool shunt_env_on = (env && strcmp(env, "1") == 0);
+    if (!shunt_env_on && !calypso_l1_c_active()) {
         g_shunt.active = false;
         return;
     }
@@ -1693,4 +1823,18 @@ void calypso_dsp_shunt_feed_si(const uint8_t *l2, int len)
 bool calypso_dsp_shunt_active(void)
 {
     return g_shunt.active;
+}
+
+/* CALYPSO_DSP=c54x : relie le handle du VRAI DSP (depuis calypso_mb.c). */
+void calypso_dsp_shunt_set_c54x(C54xState *s)
+{
+    g_shunt.c54x = s;
+}
+
+/* Predicat dedie : shunt actif ET route c54x demandee. Utilise par
+ * calypso_trx.c pour autoriser la DMA page->DARAM en mode c54x sans
+ * reactiver le c54x_run du trx (le shunt possede c54x_run). */
+bool calypso_dsp_shunt_route_c54x_active(void)
+{
+    return g_shunt.active && shunt_route_c54x();
 }

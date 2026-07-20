@@ -14,6 +14,7 @@
 #include "hw/arm/calypso/calypso_trx.h"
 #include "hw/arm/calypso/calypso_uart.h"
 #include "hw/arm/calypso/calypso_c54x.h"
+#include "hw/arm/calypso/calypso_timer.h"   /* calypso_timer_lost_frame_tick() */
 #include "hw/arm/calypso/calypso_full_pcb.h"  /* api_ram_lock pour MTTCG race fix */
 #include "hw/arm/calypso/calypso_bsp.h"
 #include "hw/arm/calypso/calypso_iota.h"
@@ -100,6 +101,7 @@ static CalypsoTRX *g_trx;
 
 #include "qemu/atomic.h"
 #include "calypso_dsp_shunt.h"
+#include "calypso_layer1.h"   /* CALYPSO_L1=c : HLE L1 scaffold (FB via corrélation host) */
 
 /* FBSB host-side orchestration. Reintroduced after preNoCell refactor
  * (28 Apr) accidentally removed the wire. The bridge delivers I/Q from
@@ -590,6 +592,11 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
         hwaddr w1_d  = DSP_API_W_PAGE1 + DB_W_D_TASK_D * 2;
         if ((offset == w0_md || offset == w1_md ||
              offset == w0_d  || offset == w1_d) && value != 0) {
+            /* CALYPSO_L1=c : latch le d_task_md écrit par l'ARM (le poll tick-time
+             * rate ce transient, l1s efface la write-page chaque frame). */
+            if (calypso_l1_c_active() && (offset == w0_md || offset == w1_md)) {
+                calypso_layer1_on_task_write((uint16_t)value);
+            }
             static unsigned task_log = 0;
             /* Always log non-PM tasks (value != 1) so FB_TASK=5 / SB=6
              * surfaces no matter when it occurs. PM=1 thinned. */
@@ -1250,6 +1257,17 @@ static void calypso_tdma_tick(void *opaque) {
             dsp_n_exec_5 = c54x_run(s->dsp, dsp_budget);
         }
 
+        /* CALYPSO_L1=c : pilote le modèle L1 HLE APRÈS le c54x RX (qui ne produit
+         * rien d'exploitable) -> d_fb_det + a_sync_demod sont les dernières écritures
+         * de la frame. Lit l'I/Q injectée en DARAM 0x2a00 et corrèle le FCCH. */
+        /* Ne PAS piloter le modèle L1=c quand le shunt est actif : il écrirait
+         * d_fb_det=0 par-dessus le d_fb_det=1 du shunt (clobber -> FB perdu).
+         * Le shunt possède alors la réception (FB+SB+SI). Le modèle L1=c ne tourne
+         * que sans shunt (chemin HLE pur). */
+        if (calypso_l1_c_active() && !calypso_dsp_shunt_active()) {
+            calypso_layer1_tick(s->dsp, s->dsp_ram, s->fn);
+        }
+
         /* Do NOT clear tasks here — the firmware's l1s_compl() does
          * dsp_api_memset() on the write page at the start of each frame,
          * before tdma_sched_execute() writes new tasks. Clearing here
@@ -1368,6 +1386,9 @@ static void calypso_tdma_tick(void *opaque) {
             }
         }
     }
+    /* Fige timer #1 sur la grille de trame pour cette IRQ délivrée -> le firmware
+     * check_lost_frame() voit un pas de 1875 exact (fin du spam LOST). */
+    calypso_timer_lost_frame_tick(s->fn);
     qemu_irq_raise(s->irqs[CALYPSO_IRQ_TPU_FRAME]);
     timer_mod_ns(s->frame_irq_timer,
                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000);

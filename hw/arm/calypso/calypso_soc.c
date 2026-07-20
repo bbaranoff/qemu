@@ -265,6 +265,9 @@ static void calypso_soc_realize(DeviceState *dev, Error **errp)
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->timer1), 0, CALYPSO_TIMER1_BASE);
     sysbus_connect_irq(SYS_BUS_DEVICE(&s->timer1), 0, INTH_IRQ(IRQ_TIMER1));
+    /* timer #1 = hwtimer lu par check_lost_frame() : active le latch frame-locked
+     * (supprime le spam LOST sous REALTIME/-icount). */
+    calypso_timer_register_lost(DEVICE(&s->timer1));
 
     /* ---- Timer 2 ---- */
     object_initialize_child(OBJECT(dev), "timer2", &s->timer2, TYPE_CALYPSO_TIMER);
