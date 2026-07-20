@@ -849,6 +849,46 @@ static void fbdb_probe_init_lazy(void)
     }
 }
 
+/* ============================================================
+ * CRASH-PC CATCHER (env CALYPSO_C54X_CRASHPC=1) : capture le dernier
+ * PC/insn du c54x avant SIGSEGV/ABRT/FPE/BUS, pour localiser le crash
+ * de la revive c54x (shunt_route_to_c54x -> c54x_run reveille dans le
+ * code L1 du firmware). Sans overhead sauf si l'env est arme.
+ * ============================================================ */
+#include <signal.h>
+#include <unistd.h>
+static volatile sig_atomic_t g_c54x_crash_en = -1;
+static volatile uint16_t     g_c54x_crash_pc = 0;
+static volatile uint32_t     g_c54x_crash_insn = 0;
+static void c54x_crash_handler(int sig)
+{
+    char buf[160];
+    int n = snprintf(buf, sizeof buf,
+        "\n[c54x] *** CRASH sig=%d last_pc=0x%04x insn=%u ***\n",
+        sig, (unsigned)g_c54x_crash_pc, (unsigned)g_c54x_crash_insn);
+    if (n > 0) { ssize_t w = write(2, buf, (size_t)n); (void)w; }
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+static inline void c54x_crashpc_tick(C54xState *s)
+{
+    if (g_c54x_crash_en < 0) {
+        const char *e = getenv("CALYPSO_C54X_CRASHPC");
+        g_c54x_crash_en = (e && *e == '1') ? 1 : 0;
+        if (g_c54x_crash_en) {
+            signal(SIGSEGV, c54x_crash_handler);
+            signal(SIGABRT, c54x_crash_handler);
+            signal(SIGFPE,  c54x_crash_handler);
+            signal(SIGBUS,  c54x_crash_handler);
+            fprintf(stderr, "[c54x] CRASH-PC catcher armed (SIGSEGV/ABRT/FPE/BUS)\n");
+        }
+    }
+    if (g_c54x_crash_en) {
+        g_c54x_crash_pc   = s->pc;
+        g_c54x_crash_insn = s->insn_count;
+    }
+}
+
 /* Hook called from c54x_run top-of-loop, before c54x_exec_one. */
 static void fbdb_probe_check_pc(uint16_t pc, void *s_void)
 {
@@ -10304,6 +10344,7 @@ static void dsp_trap_dump(C54xState *s, uint16_t exec_pc, uint16_t exec_op,
 int c54x_run(C54xState *s, int n_insns)
 {
     int executed = 0;
+    c54x_crashpc_tick(s);  /* arm catcher AVANT la boucle : capte un crash de setup / 1re insn */
 
     /* Log first 10 instructions of each run (for 2nd cycle debug) */
     static int run_num = 0;
@@ -11929,6 +11970,7 @@ int c54x_run(C54xState *s, int n_insns)
         corr_entry_track(s->pc, s);
         /* FBDB-PROBE (env CALYPSO_FBDB_PROBE=1, c web reframe 2026-05-25 night2) :
          * trace B@fbd9, A@fbdb (= post F2xx SUB), A@fbf3 (= before STLM A,AR4). */
+        c54x_crashpc_tick(s);
         fbdb_probe_check_pc(s->pc, s);
         /* FORCE-INTM-ONESHOT (env CALYPSO_FORCE_INTM_ONESHOT=1, c web reframe
          * 2026-05-25 night4) : sonde arbitrage — clear INTM UNE FOIS quand

@@ -1516,7 +1516,11 @@ rm -f "$QEMU_LOG" "$OSMOCON_LOG" "$MOBILE_LOG" "$BTS_LOG" \
       "$MON_SOCK" "$L1CTL_SOCK" "$QEMU_DUMMY_SOCK" \
       "$IPC_MSOCK_PATH" "${IPC_MSOCK_PATH}_0"
 
-tmux kill-session -t "$SESSION" 2>/dev/null || true
+# kill-SERVER (pas kill-session) : un serveur tmux perime (env 0-CALYPSO d un
+# boot anterieur) serait reutilise par new-session -> panes send-keys sans env.
+# Le socket par defaut n heberge que la session calypso (l init est sur
+# -S /tmp/osmocom_tmux), donc kill-server ici est sur et force un serveur frais.
+tmux kill-server 2>/dev/null || true
 killall -q -9 qemu-system-arm osmo-bts-trx mobile osmocon osmo-trx-ipc >/dev/null 2>&1 || true   # PAS python3 (tue le tslog -> Killed moche) ; les pkills cibles gerent grgsm/si_bridge
 pkill -9 -f calypso-ipc-device 2>/dev/null || true
 # full-grgsm : tuer les restes qui tiennent des ports (5810/5811/6700/6800/4730)
@@ -1805,6 +1809,14 @@ if [ -x "$_NM" ] && [ -r "$FW_ELF" ]; then
 else
     echo "[run.sh] WARN: nm/ELF absent, dsp-shunt garde ses adresses par defaut (peut casser l'AGCH si firmware rebuild)"
 fi
+
+# --- ENV-WINS/PROPAGATION : garantit que TOUTE CALYPSO_* (calypso.env + defauts
+#     run.sh + CLI) est marquee export -> atteint l environ du child QEMU (& fork).
+#     Exporte la var TELLE QUELLE (aucune reaffectation) : une valeur passee en
+#     CLI/env n est jamais reecrite. Idempotent. ---
+while IFS= read -r _v; do export "$_v"; done < <(compgen -v | grep "^CALYPSO_")
+unset _v
+echo "[run.sh] env-propagation: $(compgen -v | grep -c "^CALYPSO_") CALYPSO_* exportees vers qemu"
 
 L1CTL_SOCK="$QEMU_DUMMY_SOCK" \
 "$QEMU" -M "$MACHINE_ARG" -cpu arm946 \
