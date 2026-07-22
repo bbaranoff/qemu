@@ -114,6 +114,21 @@ uint32_t shunt_encode_sb(uint8_t bsic, uint16_t t1, uint8_t t2, uint8_t t3)
 /* ---- DISPATCH : FB writes NDB only ---- */
 void shunt_dispatch_fb(uint8_t page_idx)
 {
+    /* [2026-07-22] REAL FB (gate CALYPSO_SHUNT_REAL_FB) : injecte les valeurs
+     * REELLES calculees depuis la RX (g_shunt.rx_*) au lieu des cannes. */
+    {
+        static int real_fb = -1;
+        if (real_fb < 0) { const char *e = getenv("CALYPSO_SHUNT_REAL_FB"); real_fb = (e && *e == '1') ? 1 : 0; }
+        if (real_fb) {
+            shunt_write_w(BASE_API_NDB + NDB_D_FB_DET, g_shunt.rx_fb_det ? 1 : 0);
+            shunt_write_w(BASE_API_NDB + NDB_A_SYNC_DEMOD + D_TOA   * 2, g_shunt.rx_toa);
+            shunt_write_w(BASE_API_NDB + NDB_A_SYNC_DEMOD + D_PM    * 2, g_shunt.last_pm);
+            shunt_write_w(BASE_API_NDB + NDB_A_SYNC_DEMOD + D_ANGLE * 2, (uint16_t)g_shunt.rx_afc);
+            shunt_write_w(BASE_API_NDB + NDB_A_SYNC_DEMOD + D_SNR   * 2, g_shunt.rx_snr);
+            shunt_write_w(rp_base(page_idx) + RP_D_TASK_MD, FB_DSP_TASK);
+            return;
+        }
+    }
     /* d_fb_det = 1 ("FOUND"). prim_fbsb.c:404 reads this from NDB.
      * Canned CAN_FBDET = on force "trouvé" (pas de vrai détecteur FB ici). */
     /* FBDET non-canné = état RÉEL de détection gr-gsm : "trouvé" ssi un SCH a

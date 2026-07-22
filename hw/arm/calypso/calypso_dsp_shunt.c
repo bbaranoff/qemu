@@ -37,6 +37,7 @@
  */
 
 #include "qemu/osdep.h"
+#include <math.h>
 #include "qemu/log.h"
 #include "qemu/error-report.h"
 #include "exec/memory.h"
@@ -461,7 +462,7 @@ void calypso_dsp_shunt_on_frame_tick(void)
             }
             if (run_c54x) shunt_route_to_c54x(page);
         }
-        if (md == PM_DSP_TASK)                          shunt_dispatch_pm(page);
+        if (md == PM_DSP_TASK)                          do { static int nf_pm=-1; if(nf_pm<0){const char*e=getenv("CALYPSO_SHUNT_NO_FAKE_PM");nf_pm=(e&&*e=='1')?1:0;} if(!nf_pm) shunt_dispatch_pm(page); } while(0);
         else if (md == FB_DSP_TASK) {
             /* [2026-07-22] Gate le fake FB en revive : CALYPSO_SHUNT_NO_FAKE_FB=1
              * -> skip le d_fb_det bidon (NDB only) pour laisser le VRAI correlateur
@@ -473,7 +474,7 @@ void calypso_dsp_shunt_on_frame_tick(void)
         else if (md == SB_DSP_TASK && g_shunt.sb_valid) shunt_dispatch_sb(page);
         if (td == ALLC_DSP_TASK)                        shunt_dispatch_allc(page);
     } else if (md == PM_DSP_TASK) {
-        shunt_dispatch_pm(page);
+        do { static int nf_pm=-1; if(nf_pm<0){const char*e=getenv("CALYPSO_SHUNT_NO_FAKE_PM");nf_pm=(e&&*e=='1')?1:0;} if(!nf_pm) shunt_dispatch_pm(page); } while(0);
     } else if (md == FB_DSP_TASK) {
         shunt_dispatch_fb(page);
     } else if (md == SB_DSP_TASK) {
@@ -968,6 +969,73 @@ void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
         for (int i = 0; i < n; i++) { int v = iq[i]; acc += (v < 0) ? (uint32_t)(-v) : (uint32_t)v; }
         uint32_t mav = (uint32_t)(acc / (uint32_t)n);
         g_shunt.last_pm = (mav > 0xffff) ? 0xffff : (uint16_t)mav;
+    }
+
+    /* [2026-07-22] Detection FCCH REELLE (gate CALYPSO_SHUNT_REAL_FB) : coherence
+     * + dphi sur la vraie RX -> d_fb_det/AFC/SNR/TOA reels (bypass go-live DSP). */
+    {
+        static int real_fb = -1;
+        if (real_fb < 0) { const char *e = getenv("CALYPSO_SHUNT_REAL_FB"); real_fb = (e && *e == '1') ? 1 : 0; }
+        if (real_fb) {
+            int nc = n / 2;
+            if (nc >= 8) {
+                double ar = 0, ai = 0, den = 0;
+                for (int k = 1; k < nc; k++) {
+                    double i0 = iq[2*(k-1)], q0 = iq[2*(k-1)+1];
+                    double i1 = iq[2*k],     q1 = iq[2*k+1];
+                    ar += i1*i0 + q1*q0; ai += q1*i0 - i1*q0;
+                    den += sqrt((i0*i0+q0*q0)*(i1*i1+q1*q1));
+                }
+                double coh = (den > 0) ? sqrt(ar*ar + ai*ai) / den : 0;
+                double dphi = atan2(ai, ar);
+                double e1 = fabs(dphi - M_PI/2.0), e8 = fabs(dphi - M_PI/8.0);
+                double best = (e1 < e8) ? M_PI/2.0 : M_PI/8.0;
+                /* [2026-07-22] SERRE : seule la VRAIE FCCH (dphi ~ pi/2 @1SPS ou
+                 * pi/8 @4SPS, coherence tres haute) -> det=1 UNIQUEMENT sur la frame
+                 * FCCH (sinon l'ARM ne peut pas etablir le timing multiframe). */
+                int det = (coh > 0.95) && ((e1 < 0.10) || (e8 < 0.05));
+                g_shunt.rx_fb_det = det;
+                g_shunt.rx_snr    = (uint16_t)(coh * (double)0x7000);
+                g_shunt.rx_afc    = (int16_t)((dphi - best) * 2000.0);
+                g_shunt.rx_toa    = 23;
+                /* [2026-07-22] Ecrit d_fb_det+sync dans le NDB PAR FRAME (comme le vrai
+                 * DSP qui tourne 12 frames apres 1 dispatch) -> l'ARM lit 1 sur chaque
+                 * attempt (il le remet a 0 apres lecture, prim_fbsb.c:318). Fix desync. */
+                /* Ecrit dsp->data[] DIRECT (comme shunt_route_to_c54x l.396) : le
+                 * shunt_write_w/dma_memory_write ne mirror PAS vers dsp->data ou
+                 * l'ARM+fbsb lisent (0x08F8..). DSP-words : d_fb_det=0x08F8,
+                 * a_sync_demod TOA=0x08FA PM=0x08FB ANG=0x08FC SNR=0x08FD. */
+                static unsigned _wl = 0;
+                if (_wl++ < 12)
+                    fprintf(stderr, "[shunt] FB-WRITE-DBG det=%d c54x=%p data=%p api=%p\n",
+                            det, (void*)g_shunt.c54x,
+                            g_shunt.c54x ? (void*)g_shunt.c54x->data : (void*)0,
+                            g_shunt.c54x ? (void*)g_shunt.c54x->api_ram : (void*)0);
+                if (det && g_shunt.c54x && g_shunt.c54x->data) {
+                    uint16_t *dd = g_shunt.c54x->data;
+                    dd[0x08F8] = 1;
+                    dd[0x08FA] = g_shunt.rx_toa;
+                    dd[0x08FB] = g_shunt.last_pm;
+                    dd[0x08FC] = (uint16_t)g_shunt.rx_afc;
+                    dd[0x08FD] = g_shunt.rx_snr;
+                    if (g_shunt.c54x->api_ram) {
+                        uint16_t *nar = g_shunt.c54x->api_ram;
+                        nar[0x08F8 - C54X_API_BASE] = 1;
+                        nar[0x08FA - C54X_API_BASE] = g_shunt.rx_toa;
+                        nar[0x08FB - C54X_API_BASE] = g_shunt.last_pm;
+                        nar[0x08FC - C54X_API_BASE] = (uint16_t)g_shunt.rx_afc;
+                        nar[0x08FD - C54X_API_BASE] = g_shunt.rx_snr;
+                    }
+                }
+                static unsigned rfl = 0;
+                if (rfl < 20 || (det && rfl < 300)) {
+                    fprintf(stderr, "[shunt] REAL-FB fn=%u nc=%d coh=%.3f dphi=%.3f "
+                            "det=%d SNR=0x%04x AFC=%d\n", fn, nc, coh, dphi, det,
+                            g_shunt.rx_snr, g_shunt.rx_afc);
+                    rfl++;
+                }
+            }
+        }
     }
 
     /* CALYPSO_DSP=c54x : stash du dernier burst (cs16 I,Q) ; rejoue dans

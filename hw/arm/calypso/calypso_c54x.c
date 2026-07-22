@@ -13938,14 +13938,17 @@ void c54x_interrupt_ex(C54xState *s, int vec, int imr_bit)
             /* [2026-07-22] FRAME-IT-PROBE (gated CALYPSO_FRAME_IT_PROBE) : d_dsp_page
              * au moment de CHAQUE frame IT -> bit1 (B_GSM_TASK) set ici ou pas ? */
             {
-                static unsigned fitlog = 0;
-                if (getenv("CALYPSO_FRAME_IT_PROBE") && fitlog < 60) {
-                    fprintf(stderr, "[c54x] FRAME-IT#%u d_dsp_page=0x%04x (B_GSM_TASK=%d) "
+                static unsigned fitlog = 0, fithit = 0;
+                int btask = !!(s->data[0x08D4] & 2);
+                if (getenv("CALYPSO_FRAME_IT_PROBE") &&
+                    (fitlog < 20 || btask || (fitlog % 8000) == 0)) {
+                    if (btask) fithit++;
+                    fprintf(stderr, "[c54x] FRAME-IT#%u d_dsp_page=0x%04x (B_GSM_TASK=%d hits=%u) "
                             "IMR=0x%04x INTM=%d idle=%d insn=%u\n",
-                            fitlog, s->data[0x08D4], !!(s->data[0x08D4] & 2),
+                            fitlog, s->data[0x08D4], btask, fithit,
                             s->imr, !!(s->st1 & ST1_INTM), s->idle, s->insn_count);
-                    fitlog++;
                 }
+                fitlog++;
             }
             if ((s->data[0x08D4] & 0x0002) && !g_noforce) {   /* B_GSM_TASK pending, hors mode golive */
                 frame_force = true;

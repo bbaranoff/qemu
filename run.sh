@@ -2016,8 +2016,12 @@ fi
 # 127.0.0.1:$CALYPSO_SHUNT_GSMTAP_PORT (4730) → le listener du shunt appelle
 # feed_si → a_cd. Le mobile campe sur le VRAI SI démodulé du signal du BTS.
 # Requiert : shunt actif (tee) + BTS présent (I/Q). venv /root/.env (gnuradio+gsm).
-if [ "${CALYPSO_DSP_SHUNT:-0}" = "1" ] && [ "${CALYPSO_SKIP_BTS:-0}" != "1" ] \
-   && [ "${CALYPSO_SKIP_DEMOD_BRIDGE:-1}" != "1" ]; then
+# [2026-07-22] B : grgsm decode le stream continu structure aussi en FULL.
+# CALYPSO_FORCE_DEMOD_BRIDGE=1 override DSP_SHUNT + SKIP_DEMOD_BRIDGE (le tee I/Q
+# vers 6703 tourne deja en full car shunt_active=true via route_c54x).
+if { [ "${CALYPSO_DSP_SHUNT:-0}" = "1" ] || [ "${CALYPSO_FORCE_DEMOD_BRIDGE:-0}" = "1" ]; } \
+   && [ "${CALYPSO_SKIP_BTS:-0}" != "1" ] \
+   && { [ "${CALYPSO_SKIP_DEMOD_BRIDGE:-1}" != "1" ] || [ "${CALYPSO_FORCE_DEMOD_BRIDGE:-0}" = "1" ]; }; then
     DEMOD_BRIDGE="${CALYPSO_DEMOD_BRIDGE:-/opt/GSM/qemu_bcch_grgsm.py}"
     DEMOD_BRIDGE_LOG="${DEMOD_BRIDGE_LOG:-$LOGDIR/demod_bridge.log}"
     DEMOD_PYTHON="${CALYPSO_BRIDGE_PYTHON:-/root/.env/bin/python3}"
@@ -2082,7 +2086,7 @@ fi
 # feed_iq) ; grgsm_shm_decode.py lit le ring -> demod (theta) + decode BCCH ->
 # ecrit le SI dans la zone sortie -> shunt_poll_si_shm -> feed_si -> a_cd -> le
 # mobile (osmocon) campe sur la VRAIE SI decodee. mmap = fix shmat conteneur.
-if [ "$CALYPSO_MODE" = "full-grgsm" ]; then
+if [ "$CALYPSO_MODE" = "full-grgsm" ] || [ "${CALYPSO_FORCE_DEMOD_BRIDGE:-0}" = "1" ]; then
     # RECORD drainer : iq_record.fifo (ecrit NON-BLOQUANT par qemu, frame par
     # frame) -> /tmp/record.cfile (ring 128MB) HORS du hot-path qemu => PLUS
     # d underrun (c est le fwrite du ring DANS qemu qui les causait). si_bridge

@@ -77,3 +77,15 @@ end
 
 printf "[l1_break20] tracepoints armes sur la chaine dispatch DSP.\n"
 printf "  -> tape:  continue   (laisse ~20s)   puis Ctrl-C   puis  dispatch_report\n"
+
+# ============================================================================
+# [2026-07-22] Inspection d_fb_det LU par l'ARM (prim_fbsb.c:404 l1s_fbdet_resp)
+# Montre ce que l'ARM voit REELLEMENT dans le NDB au moment du check FB.
+# ============================================================================
+break prim_fbsb.c:404
+commands
+  silent
+  printf ">> fbdet_resp att=%d : d_fb_det=%d | a_sync_demod[0..3]=%d %d %d %d\n", attempt, dsp_api.ndb->d_fb_det, dsp_api.ndb->a_sync_demod[0], dsp_api.ndb->a_sync_demod[1], dsp_api.ndb->a_sync_demod[2], dsp_api.ndb->a_sync_demod[3]
+  continue
+end
+printf "[l1_break20] + breakpoint l1s_fbdet_resp (d_fb_det lu par l'ARM)\n"

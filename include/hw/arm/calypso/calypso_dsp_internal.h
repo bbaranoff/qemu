@@ -159,6 +159,12 @@ struct dsp_shunt_state {
     int        last_iq_n;
     uint32_t   last_iq_fn;
     bool       last_iq_valid;
+    /* [2026-07-22] Detection FCCH REELLE host-side (CALYPSO_SHUNT_REAL_FB) :
+     * correle last_iq (vraie RX) -> d_fb_det/AFC/SNR/TOA reels (bypass go-live). */
+    int        rx_fb_det;
+    uint16_t   rx_snr;
+    int16_t    rx_afc;
+    uint16_t   rx_toa;
 };
 
 /* ---- Canned tuning ---- */
