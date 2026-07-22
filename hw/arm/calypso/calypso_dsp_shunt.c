@@ -462,7 +462,14 @@ void calypso_dsp_shunt_on_frame_tick(void)
             if (run_c54x) shunt_route_to_c54x(page);
         }
         if (md == PM_DSP_TASK)                          shunt_dispatch_pm(page);
-        else if (md == FB_DSP_TASK)                     shunt_dispatch_fb(page);
+        else if (md == FB_DSP_TASK) {
+            /* [2026-07-22] Gate le fake FB en revive : CALYPSO_SHUNT_NO_FAKE_FB=1
+             * -> skip le d_fb_det bidon (NDB only) pour laisser le VRAI correlateur
+             * produire le resultat (isole le go-live : d_fb_det reste 0 si bloque). */
+            static int no_fake_fb = -1;
+            if (no_fake_fb < 0) { const char *e = getenv("CALYPSO_SHUNT_NO_FAKE_FB"); no_fake_fb = (e && *e == '1') ? 1 : 0; }
+            if (!no_fake_fb) shunt_dispatch_fb(page);
+        }
         else if (md == SB_DSP_TASK && g_shunt.sb_valid) shunt_dispatch_sb(page);
         if (td == ALLC_DSP_TASK)                        shunt_dispatch_allc(page);
     } else if (md == PM_DSP_TASK) {

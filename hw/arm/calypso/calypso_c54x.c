@@ -13935,6 +13935,18 @@ void c54x_interrupt_ex(C54xState *s, int vec, int imr_bit)
             vec = 28; imr_bit = 12;
             static int g_noforce = -1;
             if (g_noforce < 0) g_noforce = getenv("CALYPSO_DSP_GOLIVE_BOOT") ? 1 : 0;
+            /* [2026-07-22] FRAME-IT-PROBE (gated CALYPSO_FRAME_IT_PROBE) : d_dsp_page
+             * au moment de CHAQUE frame IT -> bit1 (B_GSM_TASK) set ici ou pas ? */
+            {
+                static unsigned fitlog = 0;
+                if (getenv("CALYPSO_FRAME_IT_PROBE") && fitlog < 60) {
+                    fprintf(stderr, "[c54x] FRAME-IT#%u d_dsp_page=0x%04x (B_GSM_TASK=%d) "
+                            "IMR=0x%04x INTM=%d idle=%d insn=%u\n",
+                            fitlog, s->data[0x08D4], !!(s->data[0x08D4] & 2),
+                            s->imr, !!(s->st1 & ST1_INTM), s->idle, s->insn_count);
+                    fitlog++;
+                }
+            }
             if ((s->data[0x08D4] & 0x0002) && !g_noforce) {   /* B_GSM_TASK pending, hors mode golive */
                 frame_force = true;
                 static unsigned fvlog = 0;
