@@ -36,6 +36,13 @@ void calypso_dsp_shunt_feed_si(const uint8_t *l2, int len);
  * I,Q) dans le buffer shm pour que gr-gsm (le DSP) la lise et la decode. */
 void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n);
 
+/* [2026-07-22] Injection READ-SIDE des resultats FB/SB REELS (gate
+ * CALYPSO_SHUNT_REAL_FB) : appelee depuis calypso_dsp_read sur le read MMIO
+ * ARM, immunise contre l'ordonnancement intra-trame (l'ARM lit TOUJOURS la
+ * derniere detection reelle). off = ARM byte offset dans l'API RAM.
+ * Retourne true si elle a override *out. */
+bool calypso_dsp_shunt_real_fb_read(uint32_t off, uint16_t *out);
+
 /* SONDE B : enregistre la FN TDMA reelle par RA lors dun RACH UL. */
 void calypso_dsp_shunt_record_rach(uint8_t ra);
 

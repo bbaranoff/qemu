@@ -28,7 +28,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 
-/* ARM byte offset of d_dsp_page (DSP word 0x08D4). B_GSM_TASK = bit1. */
+/* ARM byte offset of d_dsp_page (DSP word 0x08E2). B_GSM_TASK = bit1. */
 #define A2D_DSP_PAGE_OFF   0x01A8
 #define A2D_B_GSM_TASK     0x0002
 
@@ -94,12 +94,12 @@ void calypso_arm2dsp_on_dsp_step(C54xState *s, uint16_t exec_pc)
     }
     if (a2d_cont < 0) a2d_cont = getenv("CALYPSO_ARM2DSP_CONT") ? 1 : 0;
     /* CONT mode : re-post every step while the ARM's B_GSM_TASK is asserted in
-     * DSP memory (d_dsp_page word 0x08D4 bit1), so the task-ready bit is set when
+     * DSP memory (d_dsp_page word 0x08E2 bit1), so the task-ready bit is set when
      * the dispatcher checks it (b424) despite b419 clearing it. Non-CONT : one
      * post per ARM write (a2d_pending). */
     if (a2d_cont) {
-        uint16_t page = s->api_ram ? s->api_ram[0x08D4 - A2D_API_BASE]
-                                   : s->data[0x08D4];
+        uint16_t page = s->api_ram ? s->api_ram[0x08E2 - A2D_API_BASE]
+                                   : s->data[0x08E2];
         if (!(page & A2D_B_GSM_TASK)) {
             return;
         }

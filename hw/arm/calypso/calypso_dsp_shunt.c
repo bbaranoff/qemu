@@ -359,7 +359,7 @@ static void shunt_dispatch_tch_dl(uint8_t page_idx)
  * (0xFFD00000 / 0xFFD00028), PAS a BASE_API_NDB (0xFFD001A8). On reutilise le
  * helper wp_base() existant. Replique la DMA de trx calypso_dsp_done(@711) :
  * data[0x0584]=page, data[0x0585]=fn, data[0x0586+i]=wp[i] (i<20), et le mirror
- * api_ram[0x08D4 - C54X_API_BASE]=page (d_dsp_page cote DSP, lu par le firmware). */
+ * api_ram[0x08E2 - C54X_API_BASE]=page (d_dsp_page cote DSP, lu par le firmware). */
 /* Lecture DIRECTE de l'espace data[] du c54x pour une adresse API ARM,
  * SANS round-trip MMIO calypso_dsp_read (qui prend calypso_pcb_daram_lock,
  * mutex non-recursif -> re-lock/abort quand on est deja dans le contexte
@@ -379,21 +379,28 @@ static void shunt_route_to_c54x(uint8_t page_idx)
     /* (a) API write-page -> DARAM 0x0586 (replique de la DMA trx gatee a :711).
      * wp_base(page_idx) = adresse MMIO absolue de la write-page (== dsp_ram).
      * Le mot d_dsp_page (NDB+0 = 0xFFD001A8) est lu live (= s->dsp_ram[0x01A8/2]
-     * cote trx) pour data[0x0584] et le mirror 0x08D4. */
+     * cote trx) pour data[0x0584] et le mirror 0x08E2. */
     {
         uint32_t wbase    = wp_base(page_idx);
         fprintf(stderr, "[c54x-route] a1 wbase=0x%08x\n", wbase);
-        uint16_t dsp_page = shunt_c54x_api_rd(dsp, BASE_API_NDB + NDB_D_DSP_PAGE);
-        fprintf(stderr, "[c54x-route] a2 dsp_page=0x%04x data=%p api_ram=%p\n", dsp_page, (void*)dsp->data, (void*)dsp->api_ram);
+        /* [2026-07-22] FIX offset ARM->DSP : d_dsp_page est a l'offset 0 du NDB
+         * -> DSP-word data[0x08E2] (= NDB_D_DSP_PAGE). L'ancien
+         * `BASE_API_NDB + NDB_D_DSP_PAGE` = 0xFFD001A8 + 0x08E2 melangeait
+         * adresse ARM et DSP-word -> lisait data[0x0D3E]=garbage(0xf600) puis
+         * clobbait la vraie valeur ARM. On lit data[0x08E2] DIRECTEMENT. */
+        uint16_t dsp_page = dsp->data[NDB_D_DSP_PAGE];
+        fprintf(stderr, "[c54x-route] a2 dsp_page=0x%04x (data[0x08E2]) "
+                "[ancien buggy data[0x0D3E]=0x%04x] api_ram=%p\n",
+                dsp_page, dsp->data[0x0D3E], (void*)dsp->api_ram);
         dsp->data[0x0584] = dsp_page;
         dsp->data[0x0585] = (uint16_t)(g_shunt.d_fn & 0xFFFF);
         fprintf(stderr, "[c54x-route] a3 data-hdr-ok\n");
         for (int i = 0; i < 20; i++)
             dsp->data[0x0586 + i] = shunt_c54x_api_rd(dsp, wbase + (uint32_t)i * 2);
         fprintf(stderr, "[c54x-route] a4 wp-copy-ok\n");
-        /* mirror d_dsp_page cote DSP (le firmware le lit a api_ram 0x08D4). */
+        /* mirror d_dsp_page cote DSP (le firmware le lit a api_ram 0x08E2). */
         if (dsp->api_ram)
-            dsp->api_ram[0x08D4 - C54X_API_BASE] = dsp_page;
+            dsp->api_ram[0x08E2 - C54X_API_BASE] = dsp_page;
     }
 
     fprintf(stderr, "[c54x-route] a-daram-ok\n");
@@ -953,6 +960,33 @@ static void shunt_shm_init(void)
 
 /* ENTREE du DSP shunte : la BSP appelle ceci avec l'I/Q DL (cs16, n int16
  * entrelaces I,Q) qu'elle DMA dans la DARAM. Publie dans le shm pour gr-gsm. */
+/* [2026-07-22] Injection READ-SIDE FB/SB REELS. Voir header. La detection
+ * (feed_iq) met a jour g_shunt.rx_* ; c'est ICI, sur le read MMIO ARM, qu'on
+ * livre la valeur -> aucune dependance de timing write/read intra-trame.
+ *   FB  (NDB)  : 0x01F0 d_fb_det, 0x01F4 TOA, 0x01F6 PM, 0x01F8 ANGLE, 0x01FA SNR
+ *   SB  (db_r) : 0x0060 (page0) / 0x0088 (page1) a_serv_demod[D_TOA] */
+bool calypso_dsp_shunt_real_fb_read(uint32_t off, uint16_t *out)
+{
+    static int real_fb = -1;
+    if (real_fb < 0) {
+        const char *e = getenv("CALYPSO_SHUNT_REAL_FB");
+        real_fb = (e && *e == '1') ? 1 : 0;
+    }
+    if (!real_fb) return false;
+    switch (off) {
+    case 0x01F0: *out = g_shunt.rx_fb_det ? 1 : 0;    return true; /* d_fb_det */
+    case 0x01F4: *out = g_shunt.rx_toa;               return true; /* a_sync TOA */
+    case 0x01F6: *out = g_shunt.last_pm;              return true; /* a_sync PM  */
+    case 0x01F8: *out = (uint16_t)g_shunt.rx_afc;     return true; /* a_sync ANGLE(AFC) */
+    case 0x01FA: *out = g_shunt.rx_snr;               return true; /* a_sync SNR */
+    /* SB via db_r a_serv_demod[D_TOA] (page0/page1) : seulement si SB reel poste */
+    case 0x0060: case 0x0088:
+        if (g_shunt.sb_valid) { *out = g_shunt.rx_toa; return true; }
+        return false;
+    default: return false;
+    }
+}
+
 void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
 {
     if (!iq || n <= 0)
@@ -1011,22 +1045,10 @@ void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
                             det, (void*)g_shunt.c54x,
                             g_shunt.c54x ? (void*)g_shunt.c54x->data : (void*)0,
                             g_shunt.c54x ? (void*)g_shunt.c54x->api_ram : (void*)0);
-                if (det && g_shunt.c54x && g_shunt.c54x->data) {
-                    uint16_t *dd = g_shunt.c54x->data;
-                    dd[0x08F8] = 1;
-                    dd[0x08FA] = g_shunt.rx_toa;
-                    dd[0x08FB] = g_shunt.last_pm;
-                    dd[0x08FC] = (uint16_t)g_shunt.rx_afc;
-                    dd[0x08FD] = g_shunt.rx_snr;
-                    if (g_shunt.c54x->api_ram) {
-                        uint16_t *nar = g_shunt.c54x->api_ram;
-                        nar[0x08F8 - C54X_API_BASE] = 1;
-                        nar[0x08FA - C54X_API_BASE] = g_shunt.rx_toa;
-                        nar[0x08FB - C54X_API_BASE] = g_shunt.last_pm;
-                        nar[0x08FC - C54X_API_BASE] = (uint16_t)g_shunt.rx_afc;
-                        nar[0x08FD - C54X_API_BASE] = g_shunt.rx_snr;
-                    }
-                }
+                /* [2026-07-22] Write async dsp->data[] SUPPRIME : la livraison
+                 * FB/SB se fait desormais READ-SIDE (calypso_dsp_shunt_real_fb_read
+                 * appelee par calypso_dsp_read), immunisee contre l'ordonnancement
+                 * intra-trame. feed_iq ne fait QUE mettre a jour g_shunt.rx_*. */
                 static unsigned rfl = 0;
                 if (rfl < 20 || (det && rfl < 300)) {
                     fprintf(stderr, "[shunt] REAL-FB fn=%u nc=%d coh=%.3f dphi=%.3f "

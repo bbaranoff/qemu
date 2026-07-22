@@ -217,7 +217,19 @@ static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
      * `toa-=23 → 0` → passe le check `toa > bits_delta`. db_r page0=0xFFD00050
      * (off 0x50) / page1=0xFFD00078 (off 0x78), struct DSP33-36 a_serv_demod
      * @word8 → D_TOA = off 0x60 (p0) / 0x88 (p1). */
+    /* [2026-07-22] Injection READ-SIDE REAL_FB/SB : PRECEDE (et court-circuite)
+     * le FORCE_TOA canned. Livre la derniere detection FCCH reelle (g_shunt.rx_*)
+     * sur le read MMIO ARM -> immunise d_fb_det/a_sync_demod/SB-TOA contre
+     * l'ordonnancement intra-trame. Gate CALYPSO_SHUNT_REAL_FB. */
+    bool real_fb_hit = false;
     if (size == 2) {
+        uint16_t rv;
+        if (calypso_dsp_shunt_real_fb_read((uint32_t)offset, &rv)) {
+            val = rv;
+            real_fb_hit = true;
+        }
+    }
+    if (!real_fb_hit && size == 2) {
         static int force_toa = -2;  /* -2 = uninit, -1 = off */
         if (force_toa == -2) {
             const char *e = getenv("CALYPSO_FORCE_TOA");
@@ -360,6 +372,31 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
     CalypsoTRX *s = opaque;
     if (offset >= CALYPSO_DSP_SIZE) return;
 
+    /* [2026-07-22] WR-RAW (ungated, cap 60) : voir TOUS les writes ARM qui
+     * passent par ce hook -> l'ARM commande-t-il le DSP ici, ou tout bypasse ? */
+    {
+        /* [2026-07-22] cible les writes OPERATIONNELS (fn>100, hors zeroisage boot) :
+         * write-page (task_d/md 0x00-0x50) + NDB (d_dsp_page 0x1A8+). Voit-on
+         * l'ARM commander le DSP (task + B_GSM_TASK) ? */
+        static unsigned wraw = 0;
+        /* CIBLE demod-command uniquement (task_d p0=0x00/p1=0x28, task_md p0=0x08/p1=0x30,
+         * d_dsp_page 0x1A8), val!=0, TOUTES trames -> l'ARM commande-t-il jamais, et
+         * SEED5AC8 change-t-il ca ? Skip AFC/ABB (bruit). */
+        /* Elargi : toute la plage NDB (0x01A8-0x0210) non-nulle -> trouver le VRAI
+         * offset de d_dsp_page (valeur 0x0002/0x0003 = B_GSM_TASK|w_page). */
+        if (value != 0 && ((offset >= 0x01A8 && offset < 0x0210) ||
+             offset==0x0000||offset==0x0008||offset==0x0028||offset==0x0030)
+            && wraw < 80) {
+            wraw++;
+            const char *z = (value==0x0002||value==0x0003) ? " <== B_GSM_TASK! (d_dsp_page?)" :
+                            (offset == 0x01A8) ? " <== NDB+0" :
+                            (offset == 0x0000 || offset == 0x0028) ? " <== task_d" :
+                            " <== task_md";
+            fprintf(stderr, "[calypso-trx] WR-OP off=0x%04x val=0x%04x size=%u fn=%u%s\n",
+                    (unsigned)offset, (unsigned)value, size, s->fn, z);
+        }
+    }
+
     /* === Unconditional probe : count ALL writes by offset range ===
      * Gated par CALYPSO_DEBUG=DSP_WRITE_COUNT. Bucket par 0x40-byte zone
      * pour voir si ARM hit les bonnes zones (page 0 task 0x00-0x1F, page 1
@@ -437,6 +474,12 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
      * Écrit par dsp_end_scenario(): `ndb->d_dsp_page = B_GSM_TASK | w_page`.
      * Si jamais hit → dsp_end_scenario jamais fired → w_page stuck à 0.
      * Gated par CALYPSO_DEBUG=D_DSP_PAGE. */
+    if (offset == 0x01A8) {   /* [2026-07-22] ungated any-size : l'ARM ecrit-il d_dsp_page ? */
+        static unsigned ddp_any = 0;
+        if (ddp_any++ < 30)
+            fprintf(stderr, "[calypso-trx] DDP-ANY WR val=0x%04x size=%u (B_GSM_TASK=%d) fn=%u insn-arm\n",
+                    (unsigned)value, size, !!(value & 2), s->fn);
+    }
     if (offset == 0x01A8 && size == 2) {
         if (calypso_debug_enabled("D_DSP_PAGE")) {
             static unsigned ddp_log = 0;

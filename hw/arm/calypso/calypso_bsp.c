@@ -986,7 +986,7 @@ void calypso_bsp_rx_burst(uint8_t tn, uint32_t fn,
 
     if (bsp.dsp && bsp.dsp->api_ram) {
         static uint32_t obs_n = 0;
-        uint16_t cur = bsp.dsp->api_ram[0x08D4 - 0x0800];
+        uint16_t cur = bsp.dsp->api_ram[0x08E2 - 0x0800];
         obs_n++;
         if (calypso_debug_enabled("PUMP") &&
             (obs_n <= 20 || obs_n % 37 == 0)) {
@@ -1151,7 +1151,7 @@ void calypso_bsp_deliver_buffered(uint32_t current_fn)
          * Probe read-only voir commentaire dans calypso_bsp_rx_burst. */
         if (bsp.dsp && bsp.dsp->api_ram) {
             static uint32_t obs_n = 0;
-            uint16_t cur = bsp.dsp->api_ram[0x08D4 - 0x0800];
+            uint16_t cur = bsp.dsp->api_ram[0x08E2 - 0x0800];
             obs_n++;
             if (calypso_debug_enabled("PUMP") &&
                 (obs_n <= 20 || obs_n % 37 == 0)) {
