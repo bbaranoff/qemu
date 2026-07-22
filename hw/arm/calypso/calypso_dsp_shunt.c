@@ -137,7 +137,13 @@ static void shunt_latch_task(uint16_t new_d_dsp_page)
 
     g_shunt.page_idx  = page_idx;
     g_shunt.d_task_d  = shunt_read_w(wp + WP_D_TASK_D);
-    g_shunt.d_burst_d = shunt_read_w(wp + WP_D_BURST_D);
+    /* [2026-07-22] PERCMD : ne PAS ecraser d_burst_d ici (horloge scenario =
+     * aliasee, capture souvent cmd=0 debut de bloc) ; le mirror per-commande
+     * (calypso_dsp_shunt_wp_burst_write) en est le seul maitre -> X suit la
+     * vraie sequence 0,1,2,3. Gate off (=0) revient a l ancienne capture. */
+    { static int pc = -1; if (pc < 0) { const char *e = getenv("CALYPSO_SHUNT_BURST_PERCMD");
+                                        pc = (e && *e == 0) ? 0 : 1; }
+      if (!pc) g_shunt.d_burst_d = shunt_read_w(wp + WP_D_BURST_D); }
     g_shunt.d_task_u  = shunt_read_w(wp + WP_D_TASK_U);
     g_shunt.d_task_md = shunt_read_w(wp + WP_D_TASK_MD);
     g_shunt.d_task_ra = shunt_read_w(wp + WP_D_TASK_RA);
@@ -411,7 +417,18 @@ static void shunt_route_to_c54x(uint8_t page_idx)
     fprintf(stderr, "[c54x-route] b-bsp-load-ok n=%d\n", g_shunt.last_iq_n);
     /* (c) INT3 FRAME + wake : reveille le DSP s'il etait idle/halt. */
     g_c54x_int3_src = 3;
-    c54x_interrupt_ex(dsp, C54X_INT_FRAME_VEC, C54X_INT_FRAME_BIT);
+    /* [2026-07-22] FRAME_IT_NATIVE : tick propre — livre le scheduler frame
+     * (vec28/bit12) DIRECTEMENT au frame-tick, pas via le remap 19/3. Le
+     * c54x_irq_level_check le prend quand INTM=0 (prise naturelle, pas de force).
+     * = le vrai primitif HW frame-sync. Sinon (legacy) : vec19/bit3 (+remap VEC28). */
+    {
+        static int fin = -1;
+        if (fin < 0) fin = getenv("CALYPSO_FRAME_IT_NATIVE") ? 1 : 0;
+        if (fin)
+            c54x_interrupt_ex(dsp, 28, 12);   /* scheduler frame IT, tick propre */
+        else
+            c54x_interrupt_ex(dsp, C54X_INT_FRAME_VEC, C54X_INT_FRAME_BIT);
+    }
     c54x_wake(dsp);
     /* revive: c54x_run loop gate = (running && !idle). c54x_wake ne clear que
      * idle ; en mode route_c54x le chemin trx qui posait running=true est gate
@@ -1232,11 +1249,47 @@ void calypso_dsp_shunt_feed_fb_result(int found, int16_t toa,
  * l'I/Q réel du BTS. Le shunt l'écrit ensuite dans a_cd (shunt_dispatch_allc)
  * à la place du SI3 canned → "sans hack", vrai signal. len doit être 23 (XCCH
  * L2). Réécrit à chaque nouveau SI (rotation SI1/2/3/4 du BCCH). */
+/* [2026-07-22] DE-ALIAS du d_burst_d. RACINE du jitter burst-ID : g_shunt.d_burst_d
+ * etait capture dans shunt_latch_task (horloge d_dsp_page/scenario) qui SOUS-
+ * ECHANTILLONNE le flux commande NB propre 0,1,2,3 -> sequence aliasee periode-12,
+ * phase figee au boot (non-deterministe). Ici on capture+mirror A CHAQUE ecriture
+ * ARM de la write-page d_burst_d (WP_D_BURST_D : offset 0x0002 page0 / 0x002A page1),
+ * 1:1 avec les commandes -> plus d'aliasing. On ecrit l'echo (avec l'offset SCHED)
+ * sur LES DEUX read-pages pour que le mobile lise toujours la commande la plus
+ * recente quel que soit r_page. Gate CALYPSO_SHUNT_BURST_PERCMD (defaut ON). */
+void calypso_dsp_shunt_wp_burst_write(uint32_t off, uint16_t value)
+{
+    static int en = -1;
+    if (en < 0) { const char *e = getenv("CALYPSO_SHUNT_BURST_PERCMD");
+                  en = (e && *e == '0') ? 0 : 1; }
+    if (!en) return;
+    if (off != 0x0002 && off != 0x002A) return;   /* WP_D_BURST_D page0/1 */
+    g_shunt.d_burst_d = (uint16_t)(value & 3);
+    uint16_t x = shunt_burst_echo();
+    shunt_write_w(BASE_API_R_PAGE_0 + RP_D_BURST_D, x);
+    shunt_write_w(BASE_API_R_PAGE_1 + RP_D_BURST_D, x);
+    { static unsigned n = 0, z = 0;
+      if ((value & 3) != 0 && n < 40) { n++;
+        fprintf(stderr, "[shunt] WP-BURST-NONZERO off=0x%04x cmd=%u -> X=%u insn\n",
+                (unsigned)off, value & 3, x); }
+      else if ((value & 3) == 0) { z++;
+        if (z % 500 == 1) fprintf(stderr, "[shunt] WP-BURST cmd=0 x%u (aucun non-zero: ARM ne commande QUE burst 0)\n", z); } }
+}
+
 void calypso_dsp_shunt_feed_si(const uint8_t *l2, int len)
 {
     if (!l2 || len <= 0) {
         g_shunt.si_valid = false;
         return;
+    }
+    /* [2026-07-22] Gate test natif : CALYPSO_SHUNT_FEED_SI=0 coupe l'injection du
+     * SI reel dans a_cd -> a_cd ne se remplit QUE si la demod native (corr 0x8d00
+     * -> NB) produit vraiment le bloc. Prouve natif vs plomberie. Defaut ON (=1). */
+    {
+        static int fs = -1;
+        if (fs < 0) { const char *e = getenv("CALYPSO_SHUNT_FEED_SI");
+                      fs = (e && *e == '0') ? 0 : 1; }
+        if (!fs) { g_shunt.si_valid = false; return; }
     }
     int n = len < 23 ? len : 23;
     /* (A) range la frame dans le slot de SON type (RR PD=0x06, mt=l2[2]) :

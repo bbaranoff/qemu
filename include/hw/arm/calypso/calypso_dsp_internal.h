@@ -202,6 +202,7 @@ const char *shunt_tag(void);
 bool shunt_route_c54x(void);
 uint16_t shunt_read_w(uint32_t addr);
 void shunt_write_w(uint32_t addr, uint16_t v);
+uint16_t shunt_burst_echo(void);   /* [2026-07-22] echo burst commande (per-cmd mirror) */
 uint32_t shunt_l1s_fn(void);
 uint32_t shunt_last_rach_fn(void);
 uint32_t wp_base(uint8_t page_idx);

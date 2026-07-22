@@ -86,6 +86,44 @@ uint32_t rp_base(uint8_t page_idx) {
 
 bool shunt_is_canned(unsigned bit) { return (g_canned & bit) != 0; }
 
+/* [2026-07-22] Echo de d_burst_d pour RP_D_BURST_D. Le shunt echo le burst
+ * COMMANDE (WP_D_BURST_D), mais l1s_nb_resp attend le burst DEMODULE (decale du
+ * pipeline cmd->resp + toggle w_page/r_page) -> mismatch systematique +1
+ * (BURST ID 2!=1). Gate CALYPSO_SHUNT_BURST_M1=1 : echo (d_burst_d - 1) mod 4
+ * pour coller au resp. Racine = le shunt echo le mauvais page/timing. */
+uint16_t shunt_burst_echo(void)
+{
+    /* [2026-07-22] Phase-lock burst. Echoter WP_D_BURST_D (l'horloge d_dsp_page)
+     * DERIVE contre le schedule per-burst du mobile -> BURST ID mismatch jittery.
+     * CALYPSO_SHUNT_BURST_FN=1 : calcule d_burst_d depuis le FN L1 REEL
+     * (shunt_l1s_fn(), l'horloge que le mobile lit) -> phase-locke. Offset
+     * ajustable CALYPSO_SHUNT_BURST_OFS (0..3) pour caler la phase. Defaut =
+     * echo WP (ancien comportement). */
+    static int fn_mode = -1, ofs = -99;
+    if (fn_mode < 0) {
+        /* [2026-07-22] ECHO = DEFAUT. Le fn ne peut PAS suivre un burst_id
+         * block-relatif : les blocs CCCH ne demarrent pas tous a 4-aligne
+         * (starts 6,12,16,22,26,32,36,42,46 -> mix 0/2 mod 4) -> fn&3 chaotique.
+         * L echo suit la sequence de commande ARM (g_shunt.d_burst_d, capturee
+         * en shunt_latch_task) qui EST propre 0,1,2,3 par bloc. fn=experimental. */
+        const char *e = getenv("CALYPSO_SHUNT_BURST_FN");
+        fn_mode = (e && *e) ? atoi(e) : 0;
+    }
+    if (ofs == -99) {
+        const char *e = getenv("CALYPSO_SHUNT_BURST_OFS");
+        if (e && *e) ofs = atoi(e);
+        else if (getenv("CALYPSO_SHUNT_BURST_M1")) ofs = -1;
+        /* echo : la write page (commande ARM) precede le resp de +2 bursts
+         * (SCHED prim_rx_nb.c:213-214 : frame N -> resp(k)+cmd(k+2)) -> ofs=-2.
+         * Offset CONSTANT (pas jittery) : si residuel, c est -1 ou -3 (timing
+         * intra-trame latch/resp), sweepable. -2 == +2 mod 4. */
+        else ofs = fn_mode ? 2 : -2;
+    }
+    if (fn_mode)
+        return (uint16_t)(((int)shunt_l1s_fn() + ofs + 4) & 3);
+    return (uint16_t)((g_shunt.d_burst_d + ofs + 4) & 3);
+}
+
 /* Valeur TOA pour a_*_demod[TOA] : cannée (23 = on-time) si CAN_TOA, sinon le
  * TOA REEL mesuré par gr-gsm (sb_toa) dès qu'un SCH a été décodé ; fallback 23
  * tant qu'aucun SCH (pas 0 : évite de catastropher l'alignement avant lock). */
@@ -277,7 +315,7 @@ void shunt_dispatch_allc(uint8_t page_idx)
                 }
                 uint32_t rpA = rp_base(page_idx);
                 shunt_write_w(rpA + RP_D_TASK_D,  ALLC_DSP_TASK);
-                shunt_write_w(rpA + RP_D_BURST_D, g_shunt.d_burst_d);
+                shunt_write_w(rpA + RP_D_BURST_D, shunt_burst_echo());
                 shunt_write_w(rpA + RP_A_SERV_DEMOD + D_TOA   * 2, shunt_toa_val());
                 shunt_write_w(rpA + RP_A_SERV_DEMOD + D_PM    * 2, shunt_is_canned(CAN_PM) ? SHUNT_CANNED_PM : g_shunt.last_pm);
                 shunt_write_w(rpA + RP_A_SERV_DEMOD + D_ANGLE * 2, 0);
@@ -339,7 +377,7 @@ void shunt_dispatch_allc(uint8_t page_idx)
                 }
                 uint32_t rpA = rp_base(page_idx);
                 shunt_write_w(rpA + RP_D_TASK_D,  ALLC_DSP_TASK);
-                shunt_write_w(rpA + RP_D_BURST_D, g_shunt.d_burst_d);
+                shunt_write_w(rpA + RP_D_BURST_D, shunt_burst_echo());
                 shunt_write_w(rpA + RP_A_SERV_DEMOD + D_TOA   * 2, shunt_toa_val());
                 shunt_write_w(rpA + RP_A_SERV_DEMOD + D_PM    * 2, shunt_is_canned(CAN_PM) ? SHUNT_CANNED_PM : g_shunt.last_pm);
                 shunt_write_w(rpA + RP_A_SERV_DEMOD + D_ANGLE * 2, 0);
@@ -389,7 +427,7 @@ void shunt_dispatch_allc(uint8_t page_idx)
                 }
                 uint32_t rpA = rp_base(page_idx);
                 shunt_write_w(rpA + RP_D_TASK_D,  ALLC_DSP_TASK);
-                shunt_write_w(rpA + RP_D_BURST_D, g_shunt.d_burst_d);
+                shunt_write_w(rpA + RP_D_BURST_D, shunt_burst_echo());
                 shunt_write_w(rpA + RP_A_SERV_DEMOD + D_TOA   * 2, shunt_toa_val());
                 shunt_write_w(rpA + RP_A_SERV_DEMOD + D_PM    * 2, shunt_is_canned(CAN_PM) ? SHUNT_CANNED_PM : g_shunt.last_pm);
                 shunt_write_w(rpA + RP_A_SERV_DEMOD + D_ANGLE * 2, 0);
@@ -449,7 +487,7 @@ void shunt_dispatch_allc(uint8_t page_idx)
             uint32_t rp_c  = rp_base(page_idx);
             shunt_write_w(addr0 + 0, 0x0003);          /* a_cd[0] FIRE = CRC fail */
             shunt_write_w(rp_c + RP_D_TASK_D,  ALLC_DSP_TASK);
-            shunt_write_w(rp_c + RP_D_BURST_D, g_shunt.d_burst_d);
+            shunt_write_w(rp_c + RP_D_BURST_D, shunt_burst_echo());
             return;                          /* pas de SI sur le CCCH */
         }
     }
@@ -478,20 +516,29 @@ void shunt_dispatch_allc(uint8_t page_idx)
      * On echo le d_burst_d que l'ARM a poste dans la read page pour que
      * le check passe. Sinon le firmware bail avant dsp_memcpy_from_api()
      * et n'envoie JAMAIS L1CTL_DATA_IND. */
-    uint32_t rp = rp_base(page_idx);
-    shunt_write_w(rp + RP_D_TASK_D,  ALLC_DSP_TASK);
-    shunt_write_w(rp + RP_D_BURST_D, g_shunt.d_burst_d);
+    /* [2026-07-22] DUAL-PAGE : le fix d'offset d_dsp_page a rendu page_idx
+     * alternant (avant il etait fige a 0 via le garbage 0xf600 = w_page&1). Or le
+     * mobile lit db_r[r_page] (r_page toggle INDEPENDAMMENT du w_page porte par
+     * d_dsp_page). On ecrit donc les champs read-page sur LES DEUX pages -> le
+     * mobile les lit quel que soit r_page. Gate CALYPSO_SHUNT_DUAL_PAGE (def ON). */
+    static int canned_on = -1, dual = -1;
+    if (canned_on < 0) canned_on = getenv("CALYPSO_SHUNT_CANNED") ? 1 : 0;
+    if (dual < 0) { const char *ed = getenv("CALYPSO_SHUNT_DUAL_PAGE"); dual = (ed && *ed == '0') ? 0 : 1; }
+    for (int pg = 0; pg < 2; pg++) {
+        if (!dual && pg != page_idx) continue;
+        uint32_t rp = rp_base(pg);
+        shunt_write_w(rp + RP_D_TASK_D,  ALLC_DSP_TASK);
+        shunt_write_w(rp + RP_D_BURST_D, shunt_burst_echo());
+        shunt_write_w(rp + RP_A_SERV_DEMOD + D_TOA   * 2, shunt_toa_val());
+        shunt_write_w(rp + RP_A_SERV_DEMOD + D_PM    * 2,
+                      (canned_on || shunt_is_canned(CAN_PM)) ? SHUNT_CANNED_PM : g_shunt.last_pm);
+        shunt_write_w(rp + RP_A_SERV_DEMOD + D_ANGLE * 2, shunt_is_canned(CAN_ANGLE) ? SHUNT_CANNED_ANGLE : 0);
+        shunt_write_w(rp + RP_A_SERV_DEMOD + D_SNR   * 2,
+                      (canned_on || shunt_is_canned(CAN_SNR)) ? SHUNT_CANNED_SNR : g_shunt.rx_snr);
+    }
 
-    /* a_serv_demod[4] = {TOA, PM, ANGLE, SNR} per-burst measurements.
-     * Firmware prim_rx_nb.c:89-94 reads these. Canned : TOA=23, PM=high,
-     * ANGLE=0 (AFC converged), SNR=high (passes AFC_SNR_THRESHOLD). */
-    shunt_write_w(rp + RP_A_SERV_DEMOD + D_TOA   * 2, shunt_toa_val());
-    shunt_write_w(rp + RP_A_SERV_DEMOD + D_PM    * 2, shunt_is_canned(CAN_PM)    ? SHUNT_CANNED_PM    : g_shunt.last_pm);
-    shunt_write_w(rp + RP_A_SERV_DEMOD + D_ANGLE * 2, shunt_is_canned(CAN_ANGLE) ? SHUNT_CANNED_ANGLE : 0);
-    shunt_write_w(rp + RP_A_SERV_DEMOD + D_SNR   * 2, (shunt_is_canned(CAN_SNR) || g_shunt.sb_valid) ? SHUNT_CANNED_SNR : 0);
-
-    SHUNT_LOG("DISPATCH ALLC page=%u burst_d=%u -> SI3 in a_cd[3..14] + "
-        "a_serv_demod canned\n", page_idx, g_shunt.d_burst_d);
+    SHUNT_LOG("DISPATCH ALLC page=%u burst_d=%u -> SI3 a_cd[3..14] + a_serv_demod %s\n",
+        page_idx, g_shunt.d_burst_d, canned_on ? "CANNED(hack)" : "reel");
 }
 
 /* ---- DISPATCH PM : tâche power-measurement (md=1). Écrit a_pm[3] @ +0x18,

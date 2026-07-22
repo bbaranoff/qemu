@@ -371,6 +371,8 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
 {
     CalypsoTRX *s = opaque;
     if (offset >= CALYPSO_DSP_SIZE) return;
+    /* [2026-07-22] de-alias burst-ID : mirror d_burst_d par commande */
+    calypso_dsp_shunt_wp_burst_write((uint32_t)offset, (uint16_t)value);
 
     /* [2026-07-22] WR-RAW (ungated, cap 60) : voir TOUS les writes ARM qui
      * passent par ce hook -> l'ARM commande-t-il le DSP ici, ou tout bypasse ? */

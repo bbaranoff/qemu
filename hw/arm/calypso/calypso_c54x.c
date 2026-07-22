@@ -1033,12 +1033,22 @@ static void force_intm_oneshot_check(C54xState *s)
     if (g_force_intm_oneshot_enabled <= 0) return;
     if (g_force_intm_oneshot_done) return;
     int intm_set = !!(s->st1 & ST1_INTM);
-    int brint0_pending = !!(s->ifr & (1 << 5));
-    if (!(intm_set && brint0_pending)) return;
-    /* Skip very early boot — wait for stable stuck state. */
-    if (s->insn_count < 1000000) return;
-    /* Optional PC gate : if set, only fire at the specified PC (= safe point). */
-    if (g_force_intm_at_pc != 0xFFFF && s->pc != g_force_intm_at_pc) return;
+    if (!intm_set) return;
+    /* [2026-07-22] FAIRE FIRE L IFR. Au go-live (0xa4e1) IMR=0x3000 (bit frame
+     * demasque) mais IFR=0 -> aucune IT pending, clearer INTM ne fait rien. Le
+     * frame-IT n est jamais latche (modele IT c54x incomplet). Donc AU PC cible :
+     * on FORCE l IFR frame pending (IFR |= bits demasques) PUIS on clear INTM ->
+     * l IT part. Sans PC-gate : ancien comportement (fire sur IT deja pending). */
+    if (g_force_intm_at_pc != 0xFFFF) {
+        if (s->pc != g_force_intm_at_pc) return;
+        uint16_t unmasked = s->imr & 0x3000;   /* vec28/frame (bit12) + bit13 */
+        if (!unmasked) return;                 /* rien de demasque a forcer */
+        s->ifr |= unmasked;                    /* <-- pose l IT frame pending */
+    } else {
+        int it_pending = !!(s->ifr & s->imr);
+        if (!it_pending) return;
+        if (s->insn_count < 1000000) return;
+    }
     /* FIRE one-shot : clear INTM, log context. */
     g_force_intm_oneshot_done = 1;
     g_force_intm_oneshot_insn = s->insn_count;
@@ -2703,6 +2713,21 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
         }
     }
 
+    /* [2026-07-22] WATCH-VEC : writes vers table de vecteurs IT (0x0080-0x00FF)
+     * + dispatch 0x013b (0x0138-0x013c). Tranche (a) jamais ecrit / (b) ecrit-
+     * droppe / (c) corrompu. Env dediee CALYPSO_WATCH_VEC. */
+    {
+        static int wv = -1;
+        if (wv < 0) { const char *e = getenv("CALYPSO_WATCH_VEC"); wv = (e && *e != 0) ? 1 : 0; }
+        if (wv && ((addr >= 0x0080 && addr <= 0x00FF) || (addr >= 0x0138 && addr <= 0x013C))) {
+            static unsigned wvn = 0;
+            if (wvn++ < 100)
+                fprintf(stderr, "[c54x] WATCH-VEC data[0x%04x] <- 0x%04x (was 0x%04x) "
+                        "PC=0x%04x op=0x%04x insn=%u\n",
+                        addr, val, s->data[addr], s->pc, prog_fetch(s, s->pc), s->insn_count);
+        }
+    }
+
     /* === SP-CATASTROPHE fix : DROM[0x9187] silicon-correct read-only ===
      * Per SPRU172C : when PMST.DROM=1, the DSP ROM in data space is
      * read-only. Our emulator previously allowed writes which corrupted
@@ -4285,6 +4310,33 @@ static int c54x_exec_one(C54xState *s)
                 fprintf(stderr, "[c54x] PROG[0x%04x..]= %04x %04x %04x %04x\n",
                         a, s->prog[a], s->prog[(uint16_t)(a+1)],
                         s->prog[(uint16_t)(a+2)], s->prog[(uint16_t)(a+3)]);
+        }
+    }
+    if (s->pc == 0x7234 && getenv("CALYPSO_AR0_DEBUG")) {
+        static int d72 = 0;
+        if (!d72) { d72 = 1;
+            int ovly = !!(s->pmst & PMST_OVLY);
+            fprintf(stderr, "[c54x] DERAIL-013B XPC=0x%02x PMST=0x%04x OVLY=%d fetch(0x013b)=0x%04x insn=%u\n",
+                    s->xpc & 0xFF, s->pmst, ovly, prog_fetch(s, 0x013b), s->insn_count);
+            fprintf(stderr, "[c54x] OVERLAY data[0x0138..]= %04x %04x %04x %04x %04x %04x %04x %04x\n",
+                    s->data[0x0138], s->data[0x0139], s->data[0x013a], s->data[0x013b],
+                    s->data[0x013c], s->data[0x013d], s->data[0x013e], s->data[0x013f]);
+            /* la boucle go-live 0xa4de-0xa4e8 (pourquoi 0xa4e1 reboucle) + le
+             * soft-vector data[0x3f6d] qui pilote le trampoline. */
+            fprintf(stderr, "[c54x] GOLIVE-CODE fetch: 0xa4de=%04x 0xa4df=%04x 0xa4e0=%04x 0xa4e1=%04x "
+                    "0xa4e2=%04x 0xa4e3=%04x 0xa4e4=%04x 0xa4e5=%04x  data[0x3f6d]=0x%04x\n",
+                    prog_fetch(s,0xa4de), prog_fetch(s,0xa4df), prog_fetch(s,0xa4e0), prog_fetch(s,0xa4e1),
+                    prog_fetch(s,0xa4e2), prog_fetch(s,0xa4e3), prog_fetch(s,0xa4e4), prog_fetch(s,0xa4e5),
+                    s->data[0x3f6d]);
+            fprintf(stderr, "[c54x] SOFTVEC data[0x3f6a]=0x%04x (CALA cible) 0x3f6b=0x%04x 0x3f6c=0x%04x "
+                    "0x3f6d=0x%04x  (0xa671=OK, 0x71f4=RECURSE)\n",
+                    s->data[0x3f6a], s->data[0x3f6b], s->data[0x3f6c], s->data[0x3f6d]);
+            fprintf(stderr, "[c54x] PROM0-src[0x7138..]= %04x %04x %04x %04x %04x %04x %04x %04x\n",
+                    s->prog[0x7138], s->prog[0x7139], s->prog[0x713a], s->prog[0x713b],
+                    s->prog[0x713c], s->prog[0x713d], s->prog[0x713e], s->prog[0x713f]);
+            /* + le code du scheduler 0x7234 pour reconfirmer CALL 0x013b */
+            fprintf(stderr, "[c54x] PROG[0x7234..]= %04x %04x %04x %04x\n",
+                    s->prog[0x7234], s->prog[0x7235], s->prog[0x7236], s->prog[0x7237]);
         }
     }
     uint8_t hi4 = (op >> 12) & 0xF;
@@ -12255,12 +12307,20 @@ int c54x_run(C54xState *s, int n_insns)
              * pas d'un poke arbitraire au BACC terminal. Timing sur : aucune
              * ecriture ne touche 0x5ac8 entre 0xb382 et le RET (0xab38). */
             if (seed_on && exec_pc == 0xb382) {
+                /* [2026-07-22] valeur du seed configurable : le RET terminal depile
+                 * mem[0x5ac8] pour choisir l entree go-live. 0x71f4 (defaut) ->
+                 * trampoline -> 0xa4df (SAUTE l enable RSBX INTM 0xa4d0). 0xa4c7 ->
+                 * entree par l ORM IMR -> RSBX INTM 0xa4d0 = enable natif -> la frame
+                 * IT (proprement livree bit12) est alors PRISE. CALYPSO_SEED5AC8_VAL. */
+                static int sval = -1;
+                if (sval < 0) { const char *e = getenv("CALYPSO_SEED5AC8_VAL");
+                                sval = (e && *e) ? (int)strtoul(e, NULL, 0) : 0x71f4; }
                 static unsigned sd = 0;
                 if (sd < 8)
                     fprintf(stderr, "[c54x] SEED-5AC8 (cable@0xb382 STM SP) #%u : "
-                            "mem[0x5ac8] 0x%04x->0x71f4 SP=0x%04x op=0x%04x insn=%u\n",
-                            ++sd, s->data[0x5ac8], s->sp, exec_op, s->insn_count);
-                s->data[0x5ac8] = 0x71f4;
+                            "mem[0x5ac8] 0x%04x->0x%04x SP=0x%04x op=0x%04x insn=%u\n",
+                            ++sd, s->data[0x5ac8], (unsigned)sval, s->sp, exec_op, s->insn_count);
+                s->data[0x5ac8] = (uint16_t)sval;
             }
         }
         /* GOLIVE-WATCH (ungated) : le firmware atteint-il enfin la routine go-live
@@ -12328,6 +12388,40 @@ int c54x_run(C54xState *s, int n_insns)
                         "[0x5ac7]=0x%04x [0x5ac8]=0x%04x [0x5ac9]=0x%04x\n",
                         s->data[0x5a00], s->data[0x5ac5], s->data[0x5ac6],
                         s->data[0x5ac7], s->data[0x5ac8], s->data[0x5ac9]);
+                /* [2026-07-22] routine go-live 0xa4c0-0xa4e4 : ORM 0xa4c7, test
+                 * wait-loop 0xa4d4 (cellules 0x098a/0x098c), pour porter vers ARM. */
+                /* store loop des vecteurs (0xb4c8-0xb4e0) + sa source (AR-setup) */
+                for (uint16_t a = 0xb4c8; a <= 0xb4e0; a += 4)
+                    fprintf(stderr, "[c54x] VECLOOP-PROG[0x%04x..]= %04x %04x %04x %04x\n",
+                            a, s->prog[a], s->prog[(uint16_t)(a+1)],
+                            s->prog[(uint16_t)(a+2)], s->prog[(uint16_t)(a+3)]);
+                /* go-live tail post-0xa582 : installe-t-il vec28 (write 0x00f0) ? */
+                for (uint16_t a = 0xa582; a <= 0xa5a2; a += 4)
+                    fprintf(stderr, "[c54x] GOTAIL-PROG[0x%04x..]= %04x %04x %04x %04x\n",
+                            a, s->prog[a], s->prog[(uint16_t)(a+1)],
+                            s->prog[(uint16_t)(a+2)], s->prog[(uint16_t)(a+3)]);
+                fprintf(stderr, "[c54x] VEC28-NOW data[0x00f0..0x00f3]= %04x %04x %04x %04x (doit brancher vers 0x7234)\n",
+                        s->data[0x00f0], s->data[0x00f1], s->data[0x00f2], s->data[0x00f3]);
+                for (uint16_t a = 0xb360; a <= 0xb384; a += 4)
+                    fprintf(stderr, "[c54x] HANDLER-B360[0x%04x..]= %04x %04x %04x %04x\n",
+                            a, s->prog[a], s->prog[(uint16_t)(a+1)],
+                            s->prog[(uint16_t)(a+2)], s->prog[(uint16_t)(a+3)]);
+                for (uint16_t a = 0x701c; a <= 0x7024; a += 4)
+                    fprintf(stderr, "[c54x] RET701F-PROG[0x%04x..]= %04x %04x %04x %04x\n",
+                            a, s->prog[a], s->prog[(uint16_t)(a+1)],
+                            s->prog[(uint16_t)(a+2)], s->prog[(uint16_t)(a+3)]);
+                for (uint16_t a = 0xa670; a <= 0xa680; a += 4)
+                    fprintf(stderr, "[c54x] CALA671-PROG[0x%04x..]= %04x %04x %04x %04x\n",
+                            a, s->prog[a], s->prog[(uint16_t)(a+1)],
+                            s->prog[(uint16_t)(a+2)], s->prog[(uint16_t)(a+3)]);
+                for (uint16_t a = 0xa4c0; a <= 0xa4e4; a += 4)
+                    fprintf(stderr, "[c54x] GOLIVE-PROG[0x%04x..]= %04x %04x %04x %04x\n",
+                            a, s->prog[a], s->prog[(uint16_t)(a+1)],
+                            s->prog[(uint16_t)(a+2)], s->prog[(uint16_t)(a+3)]);
+                fprintf(stderr, "[c54x] CTRL-CELLS data[0x098a]=0x%04x data[0x098c]=0x%04x "
+                        "data[0x3f70]=0x%04x api[0x098a]=0x%04x\n",
+                        s->data[0x098a], s->data[0x098c], s->data[0x3f70],
+                        s->api_ram ? s->api_ram[0x098a-0x0800] : 0xffff);
             }
         }
         /* RUNTIME-DYN (2026-06-24, RO) : dynamique de l'automate qui garde le
@@ -12342,6 +12436,23 @@ int c54x_run(C54xState *s, int n_insns)
                         "INTM=%d insn=%u\n", exec_pc, s->imr,
                         s->prog[(uint16_t)(exec_pc + 1)],
                         (s->st1 & ST1_INTM) ? 1 : 0, s->insn_count);
+        }
+        /* [2026-07-22] KEEP-IMR (gated CALYPSO_KEEP_IMR) : 0xb37e efface IMR ~47
+         * insns apres que POKE l'a arme -> la wait-loop tourne avec IMR=0 -> l'IT
+         * frame native jamais prise. On re-arme IMR=0x3000 (bit12/vec28) tant que
+         * le DSP est dans la wait-loop go-live [0xa4ca..0xa4e2]. Casse le chicken/
+         * egg : le frame IT native (pend=ifr&imr) peut alors etre pris, atteindre
+         * 0xa582 qui arme IMR=0x52fd nativement -> self-sustain. */
+        {
+            static int ki = -1;
+            if (ki < 0) ki = getenv("CALYPSO_KEEP_IMR") ? 1 : 0;
+            if (ki && exec_pc >= 0xa4ca && exec_pc <= 0xa4e2 && s->imr == 0) {
+                s->imr = 0x3000;
+                static unsigned kil = 0;
+                if (kil++ < 8)
+                    fprintf(stderr, "[c54x] KEEP-IMR re-arme IMR=0x3000 @PC=0x%04x insn=%u\n",
+                            exec_pc, s->insn_count);
+            }
         }
         if (exec_pc == 0xa4d4) {
             static unsigned wt = 0; static uint16_t last = 0xffff;
@@ -12953,6 +13064,23 @@ int c54x_run(C54xState *s, int n_insns)
                         s->insn_count);
             }
         }
+        /* [2026-07-22] INTM-TRANS : trace toute bascule du bit INTM (ST1 b11)
+         * avec le PC/opcode qui l'a causee. Repond a "INTM passe-t-il jamais a
+         * 0, et si oui qui le re-arme". Silent sauf CALYPSO_DEBUG=INTM-TRANS. */
+        {
+            static int g_intm_prev_tr = -1, g_intm_tr_en = -1;
+            if (g_intm_tr_en < 0) { const char *e = getenv("CALYPSO_INTM_TRANS");
+                                    g_intm_tr_en = (e && *e != 0) ? 1 : 0; }
+            int intm_now_tr = !!(s->st1 & ST1_INTM);
+            if (intm_now_tr != g_intm_prev_tr && g_intm_tr_en) {
+                fprintf(stderr, "[c54x] INTM-TRANS %d->%d PC=0x%04x op=0x%04x "
+                        "IFR=0x%04x IMR=0x%04x insn=%u\n",
+                        g_intm_prev_tr, intm_now_tr, exec_pc, exec_op,
+                        s->ifr, s->imr, s->insn_count);
+            }
+            g_intm_prev_tr = intm_now_tr;
+        }
+
         /* SP-event ring : enregistre tout changement de SP (push/pop) avec
          * le PC/op responsable. Sert le dump BLACKHOLE-CALA. */
         if (s->sp != sp_before_exec) {
@@ -14088,9 +14216,14 @@ void c54x_interrupt_ex(C54xState *s, int vec, int imr_bit)
      * une ligne cablee vectorise ; aucun poke d'IMR/table/d_fb_det. */
     bool frame_force = false;
     {
-        static int g_v28 = -1;
+        static int g_v28 = -1, g_native = -1;
         if (g_v28 < 0) g_v28 = getenv("CALYPSO_DSP_FRAME_VEC28") ? 1 : 0;
-        if (g_v28 && vec == C54X_INT_FRAME_VEC && imr_bit == C54X_INT_FRAME_BIT) {
+        if (g_native < 0) g_native = getenv("CALYPSO_FRAME_IT_NATIVE") ? 1 : 0;
+        /* [2026-07-22] CALYPSO_FRAME_IT_NATIVE : livraison PROPRE du scheduler frame.
+         * Remap l IT frame (vec19/bit3 = stub RETE) vers vec28/bit12 (le vrai scheduler
+         * HW frame-sync) et pose SEULEMENT IFR bit12 -> prise naturelle par
+         * c54x_irq_level_check quand INTM=0. Remplace le frame_force crade de VEC28. */
+        if ((g_v28 || g_native) && vec == C54X_INT_FRAME_VEC && imr_bit == C54X_INT_FRAME_BIT) {
             vec = 28; imr_bit = 12;
             static int g_noforce = -1;
             if (g_noforce < 0) g_noforce = getenv("CALYPSO_DSP_GOLIVE_BOOT") ? 1 : 0;
@@ -14109,7 +14242,7 @@ void c54x_interrupt_ex(C54xState *s, int vec, int imr_bit)
                 }
                 fitlog++;
             }
-            if ((s->data[0x08E2] & 0x0002) && !g_noforce) {   /* B_GSM_TASK pending, hors mode golive */
+            if (!g_native && (s->data[0x08E2] & 0x0002) && !g_noforce) {   /* B_GSM_TASK pending, hors mode golive (frame_force = VEC28 crade, PAS en mode natif) */
                 frame_force = true;
                 static unsigned fvlog = 0;
                 if (fvlog++ < 30)

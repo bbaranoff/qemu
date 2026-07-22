@@ -31,6 +31,9 @@ void calypso_dsp_shunt_feed_fb_result(int found, int16_t toa,
  * décodée depuis l'I/Q réel du BTS, écrite dans a_cd à la place du SI3 canned.
  * Point d'injection commun aux deux fronts de démod. */
 void calypso_dsp_shunt_feed_si(const uint8_t *l2, int len);
+/* [2026-07-22] Mirror d_burst_d PAR COMMANDE (de-alias) : appele depuis
+ * calypso_dsp_write a chaque write ARM de la write-page. off = MMIO offset. */
+void calypso_dsp_shunt_wp_burst_write(uint32_t off, uint16_t value);
 
 /* ENTREE du DSP shunte : la BSP pousse l'I/Q DL (cs16, n int16 entrelaces
  * I,Q) dans le buffer shm pour que gr-gsm (le DSP) la lise et la decode. */
