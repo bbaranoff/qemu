@@ -8115,7 +8115,11 @@ static int c54x_exec_one(C54xState *s)
          * BC 0xa4cd (AEQ, A==0) jamais relachee -> RSBX INTM 0xa51b jamais atteint. */
         {
             static int fix_mvdm = -1;
-            if (fix_mvdm < 0) fix_mvdm = getenv("CALYPSO_FIX_MVDM") ? 1 : 0;
+            /* [2026-07-23] DEFAULT ON : fix ISA MVDM/MVMD (decode conforme tic54x-opc).
+             * Debloque la SM go-live 0xaad5 (A fige a 0 sinon) -> D_TASK_MD-RD 0->1859,
+             * DSP lit db_w + atteint dispatcher trame. Regression 2026-05-15 (0xfd23/fd25)
+             * levee (setup amont MVKD 0x70/MVDK 0x71 fait). OFF via CALYPSO_FIX_MVDM_OFF. */
+            if (fix_mvdm < 0) fix_mvdm = getenv("CALYPSO_FIX_MVDM_OFF") ? 0 : 1;
             if (fix_mvdm && (op & 0xFF00) == 0x7200) {       /* MVDM dmad, MMR */
                 uint16_t dmad = prog_fetch(s, s->pc + 1);
                 uint16_t mmr  = op & 0x00FF;
@@ -11107,6 +11111,43 @@ int c54x_run(C54xState *s, int n_insns)
             } else if (redir7000) { s->sp = 0x5AC8; s->pc = 0x7000; }
             else s->pc = 0x7120;
         }
+        /* [2026-07-23] MASK-ROM TABLE-INIT (default ON) : le dump PROM ne contient
+         * pas le mask-ROM TI qui, au reset, PEUPLE la table de handlers de tache
+         * (0x4c04-0x4c5d) -- sinon 0 apres le clear RPTB 0x8869 -> l'entree firmware
+         * 0x7120 BACC d[0x4c5b]=null et 0x7025/0xd247/0xc8e9/corr ne tournent JAMAIS.
+         * On MODELISE ce HW absent : au cold-reset (PC=0xff80,SP=0x1100) pose SP=0x5AC8,
+         * PUSH retour=0xb410 (reset handler normal -> park b41c PRESERVE), saute 0xc704
+         * (fill table, RET @0xc826, adressage ABSOLU -> OK meme AR/DP non-init). INITTAB
+         * a prouve que peupler la table debloque FB. OFF via CALYPSO_MASKROM_INIT_OFF=1.
+         * Exclusif avec redir_legacy (qui gere deja 0xff80). */
+        if (!redir_legacy && s->pc == 0xFF80 && s->sp == 0x1100) {
+            static int mrti = -1;
+            if (mrti < 0) mrti = getenv("CALYPSO_MASKROM_INIT") ? 1 : 0;   /* [2026-07-23] OPT-IN (default OFF) : le forcing boot-op derail (etat froid) ; garde pour A/B */
+            if (mrti) {
+                static int mrti_log = 0;
+                if (mrti_log < 2) { mrti_log++;
+                    fprintf(stderr, "[c54x] MASK-ROM-INIT: cold-reset SP=0x5AC8, run table-init 0xc704 (RET 0xb410) insn=%u\n", s->insn_count); }
+                s->sp = 0x5AC8;
+                s->sp--; s->data[s->sp] = 0x7120;   /* retour = entree firmware (BACC d[0x4c5b] peuple) */
+                s->pc = 0xc704;                       /* peuple table handlers -> RET 0x7120 -> operationnel */
+            }
+        }
+        /* [2026-07-23] TABLE RE-POPULATE apres le clear boot : la routine 0x8866-0x886a
+         * (RPTB memset 64 mots) WIPE la table handlers APRES le populate mask-rom (insn
+         * ~19793 > insn 92). Le firmware normal ferait clear->populate mais 0xc704 n'est
+         * jamais atteint apres le clear. Fix : au RET du clear (0x886a), si la table est
+         * vide, rediriger vers 0xc704 (populate ; son RET @0xc826 depile le meme retour
+         * = caller du clear). Self-heal a chaque clear. OFF via CALYPSO_MASKROM_INIT_OFF. */
+        if (s->pc == 0x886a && s->data[0x4c5c] == 0) {
+            static int mrti2 = -1;
+            if (mrti2 < 0) mrti2 = getenv("CALYPSO_MASKROM_INIT") ? 1 : 0;   /* OPT-IN (default OFF) */
+            if (mrti2) {
+                static int rlg = 0;
+                if (rlg < 3) { rlg++;
+                    fprintf(stderr, "[c54x] TABLE-REPOPULATE @0x886a (clear a wipe la table) -> run 0xc704 insn=%u\n", s->insn_count); }
+                s->pc = 0xc704;
+            }
+        }
         /* === SOFT-RESET-TRIGGER probe (2026-05-28) ===
          * SP-CATASTROPHE trace montre PC=0x7120 (boot init via notre override
          * 0xFF80) re-firing à insn=190M. C'est un soft-reset interne firmware.
@@ -12217,7 +12258,7 @@ int c54x_run(C54xState *s, int n_insns)
          * arme IMR=0x52fd -> frame IT prise -> corr tourne -> self-sustain -> PROUVE. */
         if (exec_pc == 0xa4e4) {
             static int i435 = -1;
-            if (i435 < 0) i435 = getenv("CALYPSO_INIT_435B_OFF") ? 0 : 1;
+            if (i435 < 0) { const char *_e435 = getenv("CALYPSO_INIT_435B_OFF"); i435 = (_e435 && atoi(_e435)) ? 0 : 1; }  /* [2026-07-23] fix gate: teste VALEUR (OFF=0 => actif) */
             if (i435 && s->data[0x435b] == 0) {
                 static unsigned in = 0;
                 if (in++ < 4)
@@ -12254,6 +12295,83 @@ int c54x_run(C54xState *s, int n_insns)
                             s->insn_count);
             }
         }
+        /* [2026-07-23] CALA-TRACE : chaque CALA (call accumulator, op f4e3/f5e3) dans la
+         * region go-live/dispatch -> logge la CIBLE (A low16). Cherche si une CALA calcule
+         * 0x89xx/0x8d00 (corrélateur FB) ou une adresse idle/fausse. Gate CALYPSO_CALA_TRACE_OFF. */
+        {
+            static int _ct = -1;
+            if (_ct < 0) _ct = getenv("CALYPSO_CALA_TRACE_OFF") ? 0 : 1;
+            if (_ct) {
+                uint16_t _cop = prog_fetch(s, exec_pc);
+                if ((_cop == 0xf4e3 || _cop == 0xf5e3) &&
+                    ((exec_pc >= 0xa4e4 && exec_pc <= 0xa5d0) ||
+                     (exec_pc >= 0x7100 && exec_pc <= 0x7120) ||
+                     (exec_pc >= 0xb010 && exec_pc <= 0xb030) ||   /* [2026-07-23] dispatch tache 0xb01e (CALA via d[0x43d8]) */
+                     (exec_pc >= 0xb380 && exec_pc <= 0xb40f))) {
+                    static unsigned _ctn = 0;
+                    if (_ctn++ < 120)
+                        fprintf(stderr, "[c54x] CALA-TRACE pc=0x%04x -> target=0x%04x "
+                                "task_md(0804)=%04x d[43d8]=%04x d[3f70]=%04x d[435b]=%04x insn=%u\n",
+                                exec_pc, (uint16_t)(s->a & 0xFFFF),
+                                s->data[0x0804], s->data[0x43d8],
+                                s->data[0x3f70], s->data[0x435b], s->insn_count);
+                }
+            }
+        }
+        /* [2026-07-23] INSTALL-TRACE : le bloc 0xc7xx installe la table de handlers de tache
+         * (STL A -> d[4c5c] a 0xc803). d[4c5c]=0 -> corr FB jamais dispatche. Ce bloc est-il
+         * atteint, et A vaut quoi a 0xc803 ? Litteraux voisins (d[4c5a]/d[4c5d]) = bloc atteint ?
+         * Gate CALYPSO_INSTALL_TRACE_OFF. */
+        {
+            static int _it = -1;
+            if (_it < 0) _it = getenv("CALYPSO_INSTALL_TRACE_OFF") ? 0 : 1;
+            if (_it && (exec_pc==0xc7fa || exec_pc==0xc801 || exec_pc==0xc803 ||
+                        exec_pc==0xc805 || exec_pc==0xc7e2 || exec_pc==0xc827)) {
+                static unsigned _itn = 0;
+                if (_itn++ < 30)
+                    fprintf(stderr, "[c54x] INSTALL-TRACE pc=0x%04x A=0x%04x "
+                            "d[4c5a]=%04x d[4c5c]=%04x d[4c5d]=%04x d[3f5e]=%04x insn=%u\n",
+                            exec_pc, (uint16_t)(s->a & 0xFFFF),
+                            s->data[0x4c5a], s->data[0x4c5c], s->data[0x4c5d],
+                            s->data[0x3f5e], s->insn_count);
+            }
+        }
+        /* [2026-07-23] BACC-C827-SRC : d'OU vient le saut vers 0xc827 (qui skippe l'install
+         * de la table de handlers 0xc7a0-0xc825) ? Traque prev_pc + op + A + AR quand on entre
+         * a 0xc827 sans fall-through (prev != 0xc825/0xc826). Gate CALYPSO_BACC_C827_OFF. */
+        {
+            static uint16_t _pp827 = 0;
+            static int _bsc = -1;
+            if (_bsc < 0) _bsc = getenv("CALYPSO_BACC_C827_OFF") ? 0 : 1;
+            if (_bsc && exec_pc == 0xc827 && _pp827 != 0xc825 && _pp827 != 0xc826 && _pp827 != 0xc827) {
+                static unsigned _bn = 0;
+                if (_bn++ < 15)
+                    fprintf(stderr, "[c54x] BACC-C827-SRC from=0x%04x op@from=0x%04x A=0x%04x "
+                            "AR[0..7]=%04x %04x %04x %04x %04x %04x %04x %04x insn=%u\n",
+                            _pp827, prog_fetch(s, _pp827), (uint16_t)(s->a & 0xFFFF),
+                            s->ar[0], s->ar[1], s->ar[2], s->ar[3], s->ar[4], s->ar[5], s->ar[6], s->ar[7],
+                            s->insn_count);
+            }
+            _pp827 = exec_pc;
+        }
+        /* [2026-07-23] PHASE-SM : la state-machine d[3f70] (phase go-live->operationnel).
+         * 0xddeb LD d[0x098a];BC si A==0 -> reset phase=0. 0xde86 LD d[0x098c]. 0xde9c ST#2.
+         * d[0x098a]/d[0x098c] = handshake ARM (l'ARM DOIT les poser !=0 pour avancer -> d[3f70]=2).
+         * Logge les points de decision + valeurs. Gate CALYPSO_PHASE_SM_OFF. */
+        {
+            static int _ps = -1;
+            if (_ps < 0) _ps = getenv("CALYPSO_PHASE_SM_OFF") ? 0 : 1;
+            if (_ps && (exec_pc==0xddeb || exec_pc==0xde86 || exec_pc==0xde97 ||
+                        exec_pc==0xde9c || exec_pc==0xde8b || exec_pc==0xdea8 || exec_pc==0xdddb)) {
+                static unsigned _psn = 0;
+                if (_psn++ < 40)
+                    fprintf(stderr, "[c54x] PHASE-SM pc=0x%04x A=0x%04x d[3f70]=%04x "
+                            "d[098a]=%04x d[098b]=%04x d[098c]=%04x d[098d]=%04x d[0fff]=%04x insn=%u\n",
+                            exec_pc, (uint16_t)(s->a & 0xFFFF), s->data[0x3f70],
+                            s->data[0x098a], s->data[0x098b], s->data[0x098c], s->data[0x098d],
+                            s->data[0x0fff], s->insn_count);
+            }
+        }
         if (exec_pc == 0xa51c) {   /* SM go-live lit d_dsp_page @0x08d4 (faux ?) */
             static unsigned dp=0;
             if (dp++ < 12)
@@ -12276,8 +12394,12 @@ int c54x_run(C54xState *s, int n_insns)
                         s->data[0x3f70], s->insn_count);
         }
         if (exec_pc == 0xb40f) {
+            /* [2026-07-23] DÉFAUT OFF : le storm est tué NATIVEMENT par le fix ISA LD #k8u
+             * (calypso_c54x.c:7702, le <<16 mettait AR7=0x4387 idle au lieu de 0x43c0 go-live).
+             * Ce hack (mem[0x5ac8]=data[0x43c0]) ne faisait que masquer ce bug -> plus nécessaire.
+             * Opt-in CALYPSO_MASKROM_GOLIVE=1 pour le réactiver (A/B). */
             static int mrg = -1;
-            if (mrg < 0) mrg = getenv("CALYPSO_MASKROM_GOLIVE_OFF") ? 0 : 1;
+            if (mrg < 0) mrg = getenv("CALYPSO_MASKROM_GOLIVE") ? 1 : 0;
             if (mrg && s->data[0x5ac8] == 0 && s->data[0x43c0] != 0) {
                 static unsigned mgn = 0;
                 if (mgn++ < 4)
