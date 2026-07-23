@@ -2524,6 +2524,16 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
                     s->ar[4], s->ar[5], s->ar[6], s->ar[7], s->insn_count);
     }
 
+    /* [2026-07-23] 3FCD-WR : qui ecrit data[0x3fcd] (la CIBLE du RET@0x0157 :
+     * le handler frame 0x013b fait PSHD *(0x3fcd) puis RET -> saute a data[0x3fcd].
+     * =0 en QEMU -> derail. Trouver qui/quoi doit le peupler. Cap 40. */
+    if (addr == 0x3fcd || addr == 0x3fce || addr == 0x3fcf) {
+        static unsigned f3=0;
+        if (f3++ < 40)
+            fprintf(stderr, "[c54x] 3FCD-WR data[0x%04x] 0x%04x -> 0x%04x PC=0x%04x A=0x%06llx XPC=%u insn=%u\n",
+                    addr, s->data[addr], val, s->pc,
+                    (unsigned long long)(s->a & 0xFFFFFFULL), s->xpc, s->insn_count);
+    }
     /* SONDE GAP-1 : qui ECRIT data[0x43c0] (le pointeur de dispatch lu par le
      * tremplin 0xb40e/0xb40f bacc), qui vaut 0xf074 (adresse de table = derail) ? */
     if (addr == 0x43c0) {
@@ -2551,9 +2561,22 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
      * data[0x4387] avec un vrai handler (!= 0xab38 idle) ? (test H1). Cap 40. */
     if (addr == 0x4387) {
         static unsigned s4=0;
-        if (s4++<40)
-            fprintf(stderr, "[c54x] SLOT4387-WR data[0x4387] <- 0x%04x PC=0x%04x insn=%u\n",
-                    val, s->pc, s->insn_count);
+        if (s4++<12) {
+            /* [2026-07-22] contexte COMPLET : d ou vient la valeur 0x%04x ? (index
+             * de dispatch). Dump AR/A/B/DP/ST0 + les 6 mots prog autour du store
+             * pour reconstruire le calcul d index de la table 0xab10. */
+            fprintf(stderr, "[c54x] SLOT4387-WR data[0x4387] <- 0x%04x PC=0x%04x insn=%u\n"
+                    "         A=0x%06llx B=0x%06llx T=0x%04x DP=0x%03x ST0=0x%04x\n"
+                    "         AR0=%04x AR1=%04x AR2=%04x AR3=%04x AR4=%04x AR5=%04x AR6=%04x AR7=%04x\n"
+                    "         prog[pc-3..pc+2]=%04x %04x %04x %04x %04x %04x\n",
+                    val, s->pc, s->insn_count,
+                    (unsigned long long)(s->a & 0xFFFFFFULL), (unsigned long long)(s->b & 0xFFFFFFULL),
+                    s->t, (s->st0 & ST0_DP_MASK), s->st0,
+                    s->ar[0],s->ar[1],s->ar[2],s->ar[3],s->ar[4],s->ar[5],s->ar[6],s->ar[7],
+                    prog_fetch(s,(uint16_t)(s->pc-3)), prog_fetch(s,(uint16_t)(s->pc-2)),
+                    prog_fetch(s,(uint16_t)(s->pc-1)), prog_fetch(s,s->pc),
+                    prog_fetch(s,(uint16_t)(s->pc+1)), prog_fetch(s,(uint16_t)(s->pc+2)));
+        }
     }
     /* SONDE Phase B SEED-WR : qui ecrit la base de pile data[0x5ac8..0x5acc] =
      * l'adresse de retour que le RET du handler no-op (0xab38) depile ? Si
@@ -4186,7 +4209,18 @@ static bool c54x_irq_level_check(C54xState *s)
     }
     s->ifr &= ~(1u << b);
     s->sp--; data_write(s, s->sp, (uint16_t)s->pc);
-    s->sp--; data_write(s, s->sp, s->xpc);
+    /* [2026-07-22] FIX DRIFT SP (racine du storm bootstub) : pousser XPC SEULEMENT
+     * en mode etendu (xpc!=0). Le firmware sort l ISR via POPM ST1 + RCD (pop 1w=PC),
+     * PAS RETE (pop 2w, path mort cf l.5294). Quand xpc=0 (pas de paging), pousser
+     * XPC laisse un mot orphelin JAMAIS depile -> drift SP +1/IT -> SP wrap -> le RET
+     * bootstub 0xab38 pop mem[0x5ac8]=0 au lieu de mem[0x5ac7]=retour -> PC=0 storm.
+     * Vrai c54x standard = push PC seul. Legacy: CALYPSO_IT_PUSH_XPC_ALWAYS=1. */
+    {
+        static int always = -1;
+        if (always < 0) { const char *e = getenv("CALYPSO_IT_PUSH_XPC_ALWAYS");
+                          always = (e && *e != 0) ? 1 : 0; }
+        if (always || s->xpc != 0) { s->sp--; data_write(s, s->sp, s->xpc); }
+    }
     s->st1 |= ST1_INTM;
     s->xpc = 0;
     uint16_t iptr = (s->pmst >> PMST_IPTR_SHIFT) & 0x1FF;
@@ -12030,6 +12064,71 @@ int c54x_run(C54xState *s, int n_insns)
         /* Execute instruction */
         int consumed;
         uint16_t exec_pc = s->pc;
+        /* [2026-07-22] TERMINAL-DISP : au tremplin 0xb40e (LD *AR7,A) / 0xb40f (BACC A),
+         * quel slot est lu ? AR7 = l index de dispatch. data[AR7] = handler choisi
+         * (0xab38 idle = storm). data[0x43c0] = le pointeur go-live (0xa4c7) VOISIN.
+         * Montre si le terminal lit le mauvais slot (0x4387 idle au lieu de 0x43c0). */
+        if (exec_pc == 0xb40e || exec_pc == 0xb40f) {
+            static unsigned tn = 0;
+            if (tn++ < 8)
+                fprintf(stderr, "[c54x] TERMINAL-DISP PC=0x%04x AR7=0x%04x data[AR7]=0x%04x "
+                        "data[0x4387]=0x%04x data[0x43c0]=0x%04x A=0x%06llx SP=0x%04x insn=%u\n",
+                        exec_pc, s->ar[7], s->data[s->ar[7]],
+                        s->data[0x4387], s->data[0x43c0],
+                        (unsigned long long)(s->a & 0xFFFFFFULL), s->sp, s->insn_count);
+        }
+        /* [2026-07-22] FIX mask-ROM launch-vector (racine du storm, verifiee) :
+         * le scheduler boot fait `BACC A(=0xab38 idle=RET)` @0xb40f ; le RET depile
+         * mem[0x5ac8] = le VECTEUR DE LANCEMENT a la base de pile. Sur vrai HW ce mot
+         * est pre-charge (mask-ROM absent du dump) ; en QEMU il vaut 0 -> RET->PC=0
+         * -> storm. La bonne valeur = le pointeur go-live que le FIRMWARE LUI-MEME
+         * a ecrit a data[0x43c0] (=0xa4c7 = `ORM #0x3000,IMR` = arm IMR). On la
+         * derive (pas de constante magique) : mem[0x5ac8]=data[0x43c0] quand vide.
+         * => RET idle saute a l'arm IMR -> storm mort ET IMR arme. Ni seed 0x71f4
+         * (qui routait vers 0xa4df en SAUTANT l'arm IMR), ni poke arbitraire.
+         * Gate CALYPSO_MASKROM_GOLIVE_OFF=1 pour reproduire le storm brut (A/B). */
+        /* [2026-07-23] OVLY-TRACE : le handler frame 0x013b..0x0160 (overlay DARAM)
+         * derail au RET 0x0157 (pile vide). Trace pc/op/sp du 1er passage + dump du
+         * contenu overlay pour decoder ou est le desequilibre (PSHM non d-POPM /
+         * branche prise a tort avant les POPM). One-shot (1 frame). */
+        if (exec_pc >= 0x0138 && exec_pc <= 0x0160) {
+            static unsigned ot = 0; static int dumped = 0;
+            if (!dumped) {
+                dumped = 1;
+                fprintf(stderr, "[c54x] OVLY-DUMP data[0x0138..0x0160]:");
+                for (int a = 0x0138; a <= 0x0160; a++) fprintf(stderr, " %04x", s->data[a]);
+                fprintf(stderr, "\n");
+            }
+            if (ot++ < 48)
+                fprintf(stderr, "[c54x] OVLY-TRACE pc=0x%04x op=0x%04x sp=0x%04x A=0x%06llx insn=%u\n",
+                        exec_pc, prog_fetch(s, exec_pc), s->sp,
+                        (unsigned long long)(s->a & 0xFFFFFFULL), s->insn_count);
+        }
+        if (exec_pc == 0xa4cd) {   /* [2026-07-23] BC AEQ (0xf845) : pourquoi A==0 -> skip RSBX INTM (0xa4d0) ?
+                                    * 0xaad5 lit AR0=data[0x434e], AR1=data[0x434f] (ptrs) et calcule A. */
+            static unsigned an = 0;
+            if (an++ < 16)
+                fprintf(stderr, "[c54x] A4CD-BC A=0x%06llx (AEQ %s -> %s) "
+                        "d[434e]=%04x d[434f]=%04x d[*434e]=%04x d[*434f]=%04x d[3f70]=%04x insn=%u\n",
+                        (unsigned long long)(s->a & 0xFFFFFFULL),
+                        (s->a & 0xFFFFFFFFFFULL) == 0 ? "vrai" : "faux",
+                        (s->a & 0xFFFFFFFFFFULL) == 0 ? "BRANCHE(skip enable)" : "fall-through(RSBX INTM)",
+                        s->data[0x434e], s->data[0x434f],
+                        s->data[s->data[0x434e] & 0xFFFF], s->data[s->data[0x434f] & 0xFFFF],
+                        s->data[0x3f70], s->insn_count);
+        }
+        if (exec_pc == 0xb40f) {
+            static int mrg = -1;
+            if (mrg < 0) mrg = getenv("CALYPSO_MASKROM_GOLIVE_OFF") ? 0 : 1;
+            if (mrg && s->data[0x5ac8] == 0 && s->data[0x43c0] != 0) {
+                static unsigned mgn = 0;
+                if (mgn++ < 4)
+                    fprintf(stderr, "[c54x] MASKROM-GOLIVE: mem[0x5ac8] 0x0000 -> 0x%04x "
+                            "(=data[0x43c0], pointeur go-live firmware) insn=%u\n",
+                            s->data[0x43c0], s->insn_count);
+                s->data[0x5ac8] = s->data[0x43c0];
+            }
+        }
         uint16_t exec_op = prog_fetch(s, s->pc);
         /* === FBWATCH-ALIVE (canary) : PROUVE que la sonde est armée + sample PC
          * foreground. Si CE log sort, g_fbwatch_on=1 et le silence des autres
@@ -12294,13 +12393,18 @@ int c54x_run(C54xState *s, int n_insns)
          * 0x71f4 = `LD *(0x3f6d),A ; BACC A` honore ce vecteur -> 0xa4df ->
          * 0xa4ca/0xa500 -> 0xa51b RSBX INTM (1er enable IT du run) -> 0xa51c lit
          * d_dsp_page. MAIS le terminal 0xb40f BACC data[0x4387]=0xab38=RET depile
-         * mem[0x5ac8]=0 (jamais seme : init entre par branche, RPT-fill s'arrete
-         * a 0x5ac7) -> PC=0 -> storm, au lieu d'atteindre 0x71f4.
-         * TEST FALSIFIABLE (gated CALYPSO_SEED5AC8=1) : forcer mem[0x5ac8]=0x71f4
-         * au site du BACC terminal -> le RET (0xab38) doit alors atterrir sur le
-         * trampoline -> go-live. Succes = GOLIVE-WATCH voit 0xa51b + INTM-CLEAR. */
+         * mem[0x5ac8]=0 -> PC=0 -> storm, au lieu d'atteindre 0x71f4.
+         * ATTENTION (2026-07-22) : LE SEED N'EST PAS UN FIX. C'est un band-aid GATE
+         * (OFF par defaut, CALYPSO_SEED5AC8=1 pour l'activer). Poker mem[0x5ac8]
+         * MASQUE le vrai bug : verifie sur ROM (PROM0.bin, LE) le boot @0xb405 fait
+         * `ST #0xa4df, data[0x3f6d]` -> le soft-vector go-live vaut 0xa4df, qui SAUTE
+         * l'arm IMR (0xa4c7 `ORM #0x3000,IMR`) ET l'enable (0xa4d0 `RSBX INTM`). Donc
+         * meme mem[0x5ac8]=0x71f4 "correct" n'arme jamais l'IMR. La vraie cause du
+         * storm ET du no-enable reste a trouver (pourquoi 0xa4c7/0xa4d0 jamais
+         * atteints ; qui doit peupler mem[0x5ac8]). NE PAS traiter le seed en fix. */
         {
             static int seed_on = -1;
+            /* GATE : seed OFF par defaut (band-aid), ON seulement si CALYPSO_SEED5AC8=1. */
             if (seed_on < 0) { const char *e = getenv("CALYPSO_SEED5AC8"); seed_on = (e && atoi(e) > 0) ? 1 : 0; }
             /* [2026-07-22] CABLE sur le STM #0x5ac8,SP du DSP (PC=0xb382) : le
              * seed est desormais SOURCE du stack-init REEL du DSP (op=0x7718),
@@ -12391,6 +12495,12 @@ int c54x_run(C54xState *s, int n_insns)
                 /* [2026-07-22] routine go-live 0xa4c0-0xa4e4 : ORM 0xa4c7, test
                  * wait-loop 0xa4d4 (cellules 0x098a/0x098c), pour porter vers ARM. */
                 /* store loop des vecteurs (0xb4c8-0xb4e0) + sa source (AR-setup) */
+                /* routine 0xa9ea (CALL @0xb3f3, push retour 0xb3f5) : ou est
+                 * son over-pop (PSHM/POPM desequilibre) qui derive SP -> storm. */
+                for (uint16_t a = 0xa9ea; a <= 0xaa1a; a += 4)
+                    fprintf(stderr, "[c54x] A9EA-PROG[0x%04x..]= %04x %04x %04x %04x\n",
+                            a, s->prog[a], s->prog[(uint16_t)(a+1)],
+                            s->prog[(uint16_t)(a+2)], s->prog[(uint16_t)(a+3)]);
                 for (uint16_t a = 0xb4c8; a <= 0xb4e0; a += 4)
                     fprintf(stderr, "[c54x] VECLOOP-PROG[0x%04x..]= %04x %04x %04x %04x\n",
                             a, s->prog[a], s->prog[(uint16_t)(a+1)],
@@ -12809,6 +12919,27 @@ int c54x_run(C54xState *s, int n_insns)
                         (unsigned long long)(s->a & 0xFFFFFFFFFFULL),
                         (unsigned long long)(s->b & 0xFFFFFFFFFFULL), s->sp,
                         p4, p3, p2, p1, s->insn_count);
+                if (dz == 1) {
+                    /* [2026-07-22] SP-RING au 1er storm : les 24 derniers push/pop
+                     * (pc:op delta) -> l instruction qui over-pop et derive SP. */
+                    fprintf(stderr, "[c54x] SP-RING-AT-STORM (64 derniers, ancien->recent ; MISMATCH = op qui touche SP a tort):\n");
+                    for (int k = 63; k >= 0; k--) {
+                        struct sp_evt *e = &g_spring[(g_spring_idx - 1 - k) & 63];
+                        const char *mn = (e->op == 0xFC00) ? "RET" : classify_xfer_op(e->op);
+                        int exp = 99;  /* 99 = op non-transfert (PSHM/POPM/FRAME/STM-SP legit, ou inconnu) */
+                        if (e->op == 0xFC00) exp = +1;                                  /* RET */
+                        else if (!strcmp(mn,"CALL")||!strcmp(mn,"CALLD")||!strcmp(mn,"CALA")) exp = -1;
+                        else if (!strcmp(mn,"FCALL")||!strcmp(mn,"FCALLD")||!strcmp(mn,"FCALA")||!strcmp(mn,"FCALAD")) exp = -2;
+                        else if (!strcmp(mn,"RETE")) exp = +1;
+                        else if (!strcmp(mn,"FRET")||!strcmp(mn,"FRETD")) exp = +2;
+                        else if (!strcmp(mn,"B")||!strcmp(mn,"BD")||!strcmp(mn,"BACC")||!strcmp(mn,"FB")||!strcmp(mn,"FBD")||!strcmp(mn,"FBACC")||!strcmp(mn,"FBACCD")) exp = 0;
+                        const char *flag = "";
+                        if (exp != 99 && e->delta != exp) flag = "  <<< MISMATCH (delta != mnemo)";
+                        else if (exp == 99 && e->delta != 0) flag = "  <<< NON-XFER touche SP (PSHM/POPM/FRAME? ou parasite)";
+                        fprintf(stderr, "  pc=0x%04x op=0x%04x %-7s delta=%+d(exp%+d) sp=0x%04x%s\n",
+                                e->pc, e->op, mn, e->delta, exp, e->sp, flag);
+                    }
+                }
             }
         }
 
