@@ -1288,7 +1288,8 @@ static void calypso_tdma_tick(void *opaque) {
         bool was_idle = s->dsp->idle;
 
         bool tpu_armed = !(s->tpu_regs[TPU_INT_CTRL/2] & ICTRL_DSP_FRAME);
-        bool imr_armed = !!(s->dsp->imr & (1 << C54X_INT_FRAME_BIT));
+        static int _natfr = -1; if (_natfr < 0) _natfr = (getenv("CALYPSO_FRAME_IT_NATIVE") || getenv("CALYPSO_DSP_FRAME_VEC28")) ? 1 : 0;
+        bool imr_armed = !!(s->dsp->imr & (1 << (_natfr ? 12 : C54X_INT_FRAME_BIT)));  /* [2026-07-23] bit12 en natif (remap) */
         bool periodic_armed = tpu_armed && imr_armed;
         bool force_pulse    = !!(s->tpu_regs[TPU_CTRL/2] & TPU_CTRL_DSP_EN);
         /* FIX DOUBLE-INT3 : quand la route c54x du shunt est active, c'est

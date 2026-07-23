@@ -999,10 +999,13 @@ void calypso_bsp_rx_burst(uint8_t tn, uint32_t fn,
     /* Gate INT3 fire : skip si IFR.bit3 déjà set = DSP pas encore servi
      * le précédent. Évite stacking d'IRQs quand DSP traite plus lentement
      * que BSP delivery rate. */
-    if (bsp.dsp && bsp.dsp->running && !(bsp.dsp->ifr & (1 << 3))) {
-        c54x_interrupt_ex(bsp.dsp, 19, 3);  /* INT3 (frame) — vec 19, IMR bit 3 */
+    /* [2026-07-23] FIX namespace bit3/bit12 (diag horloges) : natif remappe vec19/bit3
+     * -> vec28/bit12 ; l anti-stack doit tester le bit REEL sinon gate tjrs ouvert -> flood. */
+    { static int _nat = -1; if (_nat < 0) _nat = (getenv("CALYPSO_FRAME_IT_NATIVE") || getenv("CALYPSO_DSP_FRAME_VEC28")) ? 1 : 0; int _fb = _nat ? 12 : 3;
+      if (bsp.dsp && bsp.dsp->running && !(bsp.dsp->ifr & (1 << _fb))) {
+        c54x_interrupt_ex(bsp.dsp, 19, 3);
         if (bsp.dsp->idle) bsp.dsp->idle = false;
-    }
+      } }
 
     int n = n_int16 < (int)bsp.daram_len ? n_int16 : (int)bsp.daram_len;
 
@@ -1163,10 +1166,11 @@ void calypso_bsp_deliver_buffered(uint32_t current_fn)
             }
         }
         /* Gate INT3 : skip si IFR.bit3 déjà set (cf rx_burst). */
-        if (bsp.dsp && bsp.dsp->running && !(bsp.dsp->ifr & (1 << 3))) {
-            c54x_interrupt_ex(bsp.dsp, 19, 3);  /* INT3 (frame) */
+        { static int _nat = -1; if (_nat < 0) _nat = (getenv("CALYPSO_FRAME_IT_NATIVE") || getenv("CALYPSO_DSP_FRAME_VEC28")) ? 1 : 0; int _fb = _nat ? 12 : 3;
+          if (bsp.dsp && bsp.dsp->running && !(bsp.dsp->ifr & (1 << _fb))) {
+            c54x_interrupt_ex(bsp.dsp, 19, 3);
             if (bsp.dsp->idle) bsp.dsp->idle = false;
-        }
+          } }
 
         int n = sl->n < (int)bsp.daram_len ? sl->n : (int)bsp.daram_len;
 

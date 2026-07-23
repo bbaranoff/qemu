@@ -152,6 +152,7 @@ uint32_t shunt_encode_sb(uint8_t bsic, uint16_t t1, uint8_t t2, uint8_t t3)
 /* ---- DISPATCH : FB writes NDB only ---- */
 void shunt_dispatch_fb(uint8_t page_idx)
 {
+    { static int _ginj = -1; if (_ginj < 0) { const char *_e = getenv("CALYPSO_INJECT_FB"); _ginj = (_e && *_e == '1') ? 1 : 0; } if (!_ginj) return; }  /* [2026-07-23] HACK injection sortie, DEFAUT OFF (natif) ; =CALYPSO_INJECT_FB=1 pour reactiver */
     /* [2026-07-22] REAL FB (gate CALYPSO_SHUNT_REAL_FB) : injecte les valeurs
      * REELLES calculees depuis la RX (g_shunt.rx_*) au lieu des cannes. */
     {
@@ -197,6 +198,7 @@ void shunt_dispatch_fb(uint8_t page_idx)
 /* ---- DISPATCH : SB writes READ PAGE only ---- */
 void shunt_dispatch_sb(uint8_t page_idx)
 {
+    { static int _ginj = -1; if (_ginj < 0) { const char *_e = getenv("CALYPSO_INJECT_SB"); _ginj = (_e && *_e == '1') ? 1 : 0; } if (!_ginj) return; }  /* [2026-07-23] HACK injection sortie, DEFAUT OFF (natif) ; =CALYPSO_INJECT_SB=1 pour reactiver */
     uint32_t rp = rp_base(page_idx);
 
     /* gr-gsm (= le DSP) a-t-il poste un vrai SCH (BSIC/FN reels via UDP 4731) ?
@@ -259,6 +261,7 @@ void shunt_dispatch_sb(uint8_t page_idx)
 
 void shunt_dispatch_allc(uint8_t page_idx)
 {
+    { static int _ginj = -1; if (_ginj < 0) { const char *_e = getenv("CALYPSO_INJECT_ACD"); _ginj = (_e && *_e == '1') ? 1 : 0; } if (!_ginj) return; }  /* [2026-07-23] HACK injection sortie, DEFAUT OFF (natif) ; =CALYPSO_INJECT_ACD=1 pour reactiver */
     /* a_cd layout (cf osmocom-bb prim_rx_nb.c) :
      *   a_cd[0]   = FIRE status bits (B_FIRE0/B_FIRE1) -> 0x0000 = CRC pass
      *   a_cd[1]   = (reserved / BLUD bit)              -> 0x0000

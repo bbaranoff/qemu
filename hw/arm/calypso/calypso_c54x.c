@@ -2524,9 +2524,36 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
                     s->ar[4], s->ar[5], s->ar[6], s->ar[7], s->insn_count);
     }
 
+    /* [2026-07-23] STATE435B-WR : qui ecrit data[0x435b] (mot d etat de la SM
+     * go-live 0xa4e4 : bits 0x10/0x40/0x100 gatent la progression + l enable INTM).
+     * =0 -> SM bloquee. Trouver qui doit le peupler (ARM ? task done ?). Cap 40. */
+    if (addr == 0x435b) {
+        static unsigned sw=0;
+        if (sw++ < 40)
+            fprintf(stderr, "[c54x] STATE435B-WR data[0x435b] 0x%04x -> 0x%04x PC=0x%04x A=0x%06llx insn=%u\n",
+                    s->data[0x435b], val, s->pc,
+                    (unsigned long long)(s->a & 0xFFFFFFULL), s->insn_count);
+    }
+    /* [2026-07-23] READY-WR : qui peuple la readiness du go-live (0xaad5 lit
+     * *data[0x434e]=*0x4340 et *data[0x434f]=*0x7f75 ; A=0 -> 0xa4cd skip enable).
+     * Watch les pointeurs (0x434e/0x434f) ET les cibles (0x4340/0x7f75). Cap 40. */
+    if (addr == 0x434e || addr == 0x434f || addr == 0x4340 || addr == 0x7f75) {
+        static unsigned rw=0;
+        if (rw++ < 40)
+            fprintf(stderr, "[c54x] READY-WR data[0x%04x] 0x%04x -> 0x%04x PC=0x%04x A=0x%06llx insn=%u\n",
+                    addr, s->data[addr], val, s->pc,
+                    (unsigned long long)(s->a & 0xFFFFFFULL), s->insn_count);
+    }
     /* [2026-07-23] 3FCD-WR : qui ecrit data[0x3fcd] (la CIBLE du RET@0x0157 :
      * le handler frame 0x013b fait PSHD *(0x3fcd) puis RET -> saute a data[0x3fcd].
      * =0 en QEMU -> derail. Trouver qui/quoi doit le peupler. Cap 40. */
+    if (addr == 0x0155 || addr == 0x013b || addr == 0x0154) {
+        static unsigned ov=0;
+        if (ov++ < 30)
+            fprintf(stderr, "[c54x] OVLD-WR data[0x%04x] 0x%04x -> 0x%04x PC=0x%04x A=0x%06llx insn=%u\n",
+                    addr, s->data[addr], val, s->pc,
+                    (unsigned long long)(s->a & 0xFFFFFFULL), s->insn_count);
+    }
     if (addr == 0x3fcd || addr == 0x3fce || addr == 0x3fcf) {
         static unsigned f3=0;
         if (f3++ < 40)
@@ -5303,13 +5330,18 @@ static int c54x_exec_one(C54xState *s)
          * Symmetric with c54x_interrupt_ex push order. */
         if (op == 0xF4EB) {
             uint16_t prev_xpc = s->xpc;
-            /* IT return : pop XPC (top, poussé en 2e par l'entrée IT) PUIS PC.
-             * Inconditionnel (APTS == AVIS). Miroir entrée-IT / FRETED. */
-            uint16_t nx = data_read(s, s->sp); s->sp++;   /* pop XPC */
-            if (nx > 2)
-                C54_DBG("XPC-OOR", "RETE xpc=0x%04x PC=0x%04x SP=0x%04x insn=%u",
-                        nx, s->pc, s->sp, s->insn_count);
-            s->xpc = nx & 3;
+            /* [2026-07-23] IT return SYMETRIQUE : l'entree IT (level_check l.4229 /
+             * interrupt_ex) pousse XPC SEULEMENT si xpc!=0 (mode etendu). Un XPC
+             * pousse vaut 0..3 ; un PC (0x0080+) est >3. Donc RETE ne depile XPC
+             * QUE si le sommet est un XPC valide (<=3) -> pop 1 quand PC seul pousse
+             * (xpc=0), pop 2 en mode etendu. Corrige le drift SP +1/IT (over-pop) qui
+             * faisait deriver SP -> RETE @0x0107 lisait PC-comme-XPC + garbage-comme-PC
+             * -> PC=0 (derail go-live cycle). L'ancien pop-2-inconditionnel supposait
+             * push-2 toujours, faux depuis le fix push-XPC-conditionnel (l.4219). */
+            uint16_t top = data_read(s, s->sp);
+            if (top <= 3) {                 /* XPC valide au sommet -> il a ete pousse */
+                s->xpc = top & 3; s->sp++;  /* pop XPC */
+            }
             uint16_t ra = data_read(s, s->sp); s->sp++;   /* pop PC */
             s->st1 &= ~ST1_INTM;
                 if (g_vec28_tracing) {
@@ -7667,8 +7699,18 @@ static int c54x_exec_one(C54xState *s)
             int dst = (op >> 8) & 1;
             uint8_t k = op & 0xFF;
             int64_t v = (s->st1 & ST1_SXM) ? (int64_t)(int8_t)k : (int64_t)k;
-            if (dst) s->b = sext40(v << 16);
-            else     s->a = sext40(v << 16);
+            /* [2026-07-23] FIX ISA : LD #k8u charge l'immediat dans les bits BAS (sext40(v)),
+             * PAS v<<16. Le <<16 mettait 0x39 en bits 16-23 -> au terminal mask-ROM :
+             * 0xb408 LD #0x39 + 0xb409 ADD #0x4387 donnait A=0x394387 -> STLM AR7=0x4387
+             * (slot IDLE data[0x4387]=0xab38) au lieu de 0x0039+0x4387=0x43C0 (slot go-live
+             * data[0x43c0]=0xa4c7). => terminal 0xb40f BACC vers idle 0xab38 = LE STORM.
+             * Verifie runtime (TERM-TRACE). Correct c54x SPRU172C : LD #k8 -> low bits.
+             * Env CALYPSO_LDK8_SHIFT16=1 restaure l'ancien comportement (A/B). */
+            static int _ldk8sh = -1;
+            if (_ldk8sh < 0) _ldk8sh = getenv("CALYPSO_LDK8_SHIFT16") ? 1 : 0;
+            int64_t _ldv = _ldk8sh ? (v << 16) : v;
+            if (dst) s->b = sext40(_ldv);
+            else     s->a = sext40(_ldv);
             return consumed + s->lk_used;
         }
         if (hi8 == 0xE1) {
@@ -7957,6 +7999,21 @@ static int c54x_exec_one(C54xState *s)
                             s->insn_count);
             }
             (void)pa; (void)addr;
+            consumed = 2;
+            return consumed + s->lk_used;
+        }
+
+        /* [2026-07-23] 0x73xx: MVMD MMR, dmad — MMR -> data[dmad] (2-word, direction SAVE).
+         * BUG REEL (SP-CORRUPT watchpoint) : 0xa4f8 op=0x7318 = MVMD SP,0x3f6e = SAUVE SP.
+         * Le fallthrough STL generique CHARGEAIT SP depuis data[0x3f6e]=garbage -> SP=0xc905
+         * etc. -> derails eparpilles (0xa58d...) post-POPD. ISA-correct : lit le MMR
+         * (SP=0x18 alias data 0x0018) et ecrit data[dmad] ; SP/MMR INCHANGE. On ne fixe
+         * QUE 0x73 (MVMD, sens save, inoffensif) ; 0x72 (MVDM, sens charge) GARDE le revert
+         * documente (regression AR3-hors-buffer @0xee38, REVERT_MVMD_KNOWLEDGE.md). */
+        if ((op & 0xFF00) == 0x7300) {
+            int mmr = op & 0x7F;
+            uint16_t dmad = prog_fetch(s, s->pc + 1);
+            data_write(s, dmad, data_read(s, mmr));
             consumed = 2;
             return consumed + s->lk_used;
         }
@@ -8957,6 +9014,20 @@ static int c54x_exec_one(C54xState *s)
             uint16_t val = src ? (uint16_t)(s->b & 0xFFFF)
                                : (uint16_t)(s->a & 0xFFFF);
             data_write(s, (uint16_t)mmr, val);  /* MMRs alias addr 0x00..0x1F */
+            return consumed + s->lk_used;
+        }
+        /* [2026-07-23] 0x8Bxx: POPD Smem — pop top-of-stack into data memory.
+         * Symetrique de PSHD (0x4B) : PSHM/POPM = 0x4A/0x8A ; PSHD/POPD = 0x4B/0x8B.
+         * ETAIT MANQUANT -> tombait en NOP 1-mot. Bug reel : l'overlay handler frame
+         * 0x013b fait `POPD *(0x3fcd)` (depile le retour du CALL 0x013b), PSHM x24,
+         * `PSHD *(0x3fcd)` (repush le retour), RET. Sans POPD : retour enterre sous
+         * les saves, data[0x3fcd]=0, RET->0 -> DERAIL-ZERO from=0x0157 (go-live cycle).
+         * resolve_smem pose lk_used pour le mode abs (0xf8) -> 2-mots correct. */
+        if (hi8 == 0x8B) {
+            addr = resolve_smem(s, op, &ind);
+            uint16_t val = data_read(s, s->sp);
+            s->sp = (s->sp + 1) & 0xFFFF;
+            data_write(s, addr, val);
             return consumed + s->lk_used;
         }
         if (hi8 == 0x80) {
@@ -12091,17 +12162,104 @@ int c54x_run(C54xState *s, int n_insns)
          * derail au RET 0x0157 (pile vide). Trace pc/op/sp du 1er passage + dump du
          * contenu overlay pour decoder ou est le desequilibre (PSHM non d-POPM /
          * branche prise a tort avant les POPM). One-shot (1 frame). */
-        if (exec_pc >= 0x0138 && exec_pc <= 0x0160) {
+        if (exec_pc >= 0x0100 && exec_pc <= 0x0160) {
             static unsigned ot = 0; static int dumped = 0;
             if (!dumped) {
                 dumped = 1;
-                fprintf(stderr, "[c54x] OVLY-DUMP data[0x0138..0x0160]:");
-                for (int a = 0x0138; a <= 0x0160; a++) fprintf(stderr, " %04x", s->data[a]);
+                fprintf(stderr, "[c54x] OVLY-DUMP data[0x0100..0x0160]:");
+                for (int a = 0x0100; a <= 0x0160; a++) fprintf(stderr, " %04x", s->data[a]);
                 fprintf(stderr, "\n");
             }
-            if (ot++ < 48)
+            /* [2026-07-23] TEST gated CALYPSO_TEST_3FCD : le RET@0x0157 saute a
+             * data[0x3fcd]=0 (jamais ecrit). Le firmware installe un handler a
+             * data[0x3fce]=0xdf82 (voisin +1). Test : au PSHD (0x0154), si
+             * data[0x3fcd]==0, le derive de data[0x3fce] -> RET saute au handler.
+             * Prouve/refute que 0xdf82 est la bonne cible (table vecteurs decalee). */
+            if (exec_pc == 0x0154) {
+                static int t3 = -1;
+                if (t3 < 0) t3 = getenv("CALYPSO_TEST_3FCD") ? 1 : 0;
+                if (t3 && s->data[0x3fcd] == 0 && s->data[0x3fce] != 0) {
+                    static unsigned tn3 = 0;
+                    if (tn3++ < 4)
+                        fprintf(stderr, "[c54x] TEST-3FCD: data[0x3fcd] 0x0000 -> 0x%04x (=data[0x3fce]) insn=%u\n",
+                                s->data[0x3fce], s->insn_count);
+                    s->data[0x3fcd] = s->data[0x3fce];
+                }
+            }
+            if (ot++ < 90)
                 fprintf(stderr, "[c54x] OVLY-TRACE pc=0x%04x op=0x%04x sp=0x%04x A=0x%06llx insn=%u\n",
                         exec_pc, prog_fetch(s, exec_pc), s->sp,
+                        (unsigned long long)(s->a & 0xFFFFFFULL), s->insn_count);
+        }
+        /* [2026-07-23] FIX-DPAGE (test, gate CALYPSO_FIX_DPAGE defaut ON) : la ROM
+         * lit d_dsp_page @0x08d4 (0xa51c SM go-live + 0xc8ea dispatcher trame) mais
+         * l ARM/shunt postent la tache a 0x08E2 (offset +0x0E systematique, cf
+         * dsp_shunt.c:392). data[0x08d4]=0xf600 garbage -> la tache 0x0003 (@0x08E2)
+         * jamais vue -> corr jamais dispatche. On aligne : miroir 0x08E2->0x08d4
+         * avant le read ROM (pas de patch firmware). Prouve/refute que l offset EST
+         * le mur : si le DSP dispatche le corr apres -> confirme. */
+        if (exec_pc == 0xa51c || exec_pc == 0xc8ea) {
+            static int fd = -1;
+            if (fd < 0) fd = getenv("CALYPSO_FIX_DPAGE_OFF") ? 0 : 1;
+            if (fd && s->data[0x08d4] != s->data[0x08E2]) {
+                static unsigned fm = 0;
+                if (fm++ < 8)
+                    fprintf(stderr, "[c54x] FIX-DPAGE @0x%04x data[0x08d4] 0x%04x -> 0x%04x (=data[0x08E2]) insn=%u\n",
+                            exec_pc, s->data[0x08d4], s->data[0x08E2], s->insn_count);
+                s->data[0x08d4] = s->data[0x08E2];
+            }
+        }
+        /* [2026-07-23] TEST INIT-435B (gate CALYPSO_INIT_435B defaut ON) : data[0x435b]
+         * = shadow IMR (les handlers tache OR/AND-ent des bits dedans : corr 0xbd3c
+         * ORM 0x10, etc.), et la SM go-live 0xa501/0xa582 le propage dans IMR. Il n est
+         * JAMAIS initialise en QEMU (STATE435B-WR vide) -> IMR=0 -> deadlock. On l amorce
+         * au masque IMR reset 0x52fd (comme le boot DSP reel devrait) une fois. Si ca
+         * arme IMR=0x52fd -> frame IT prise -> corr tourne -> self-sustain -> PROUVE. */
+        if (exec_pc == 0xa4e4) {
+            static int i435 = -1;
+            if (i435 < 0) i435 = getenv("CALYPSO_INIT_435B_OFF") ? 0 : 1;
+            if (i435 && s->data[0x435b] == 0) {
+                static unsigned in = 0;
+                if (in++ < 4)
+                    fprintf(stderr, "[c54x] INIT-435B: data[0x435b] 0x0000 -> 0x52ed (masque IMR reset SANS bit4/clobber) insn=%u\n", s->insn_count);
+                s->data[0x435b] = 0x52ed;   /* 0x52fd & ~0x10 : masque IMR reset, bit4 retire (bit4 SET -> detour clobber 0xa509 qui strippe bit12 AVANT le AND 0xa582 IMR=IMR&d[435b]) */
+            }
+        }
+        /* [2026-07-23] SM-TRACE : chemin complet de la SM go-live 0xa4e4-0xa5b5
+         * avec d_dsp_page aligne -> ou branche/reboucle-t-elle ? flags decisifs :
+         * d_dsp_page(0x3fb0), data[0x09bc](flag ARM), A(target dispatch). */
+        if (exec_pc >= 0xa4e4 && exec_pc <= 0xa5b8) {
+            static unsigned st = 0;
+            if (st++ < 70)
+                fprintf(stderr, "[c54x] SM-TRACE pc=0x%04x op=0x%04x A=0x%06llx TC=%d "
+                        "d[3fb0]=%04x d[09bc]=%04x d[3fe0]=%04x d[435b]=%04x insn=%u\n",
+                        exec_pc, prog_fetch(s, exec_pc), (unsigned long long)(s->a & 0xFFFFFFULL),
+                        (s->st0 & ST0_TC) ? 1 : 0, s->data[0x3fb0], s->data[0x09bc],
+                        s->data[0x3fe0], s->data[0x435b], s->insn_count);
+        }
+        /* [2026-07-23] TERM-TRACE : calcul d'index AR7 au terminal mask-ROM 0xb405-0xb412.
+         * Question : AR7 devient 0x4387 (idle) au lieu de 0x43c0 (go-live) ? le calcul
+         * LD#0x39 (0xb408) + ADD#0x4387 (0xb409) -> A=0x43c0 est-il perdu / mal-range dans AR7 ?
+         * Logge A + AR0-7 a CHAQUE insn de la zone. Gate CALYPSO_TERM_TRACE_OFF. */
+        {
+            static int _tt = -1;
+            if (_tt < 0) _tt = getenv("CALYPSO_TERM_TRACE_OFF") ? 0 : 1;
+            if (_tt && exec_pc >= 0xb400 && exec_pc <= 0xb414) {
+                static unsigned _ttn = 0;
+                if (_ttn++ < 60)
+                    fprintf(stderr, "[c54x] TERM-TRACE pc=0x%04x op=0x%04x A=0x%06llx "
+                            "AR[0..7]=%04x %04x %04x %04x %04x %04x %04x %04x insn=%u\n",
+                            exec_pc, prog_fetch(s, exec_pc), (unsigned long long)(s->a & 0xFFFFFFULL),
+                            s->ar[0], s->ar[1], s->ar[2], s->ar[3], s->ar[4], s->ar[5], s->ar[6], s->ar[7],
+                            s->insn_count);
+            }
+        }
+        if (exec_pc == 0xa51c) {   /* SM go-live lit d_dsp_page @0x08d4 (faux ?) */
+            static unsigned dp=0;
+            if (dp++ < 12)
+                fprintf(stderr, "[c54x] SM-DPAGE @0xa51c data[0x08d4]=0x%04x data[0x08E2]=0x%04x "
+                        "data[0x435b]=0x%04x A=0x%06llx insn=%u\n",
+                        s->data[0x08d4], s->data[0x08E2], s->data[0x435b],
                         (unsigned long long)(s->a & 0xFFFFFFULL), s->insn_count);
         }
         if (exec_pc == 0xa4cd) {   /* [2026-07-23] BC AEQ (0xf845) : pourquoi A==0 -> skip RSBX INTM (0xa4d0) ?
@@ -13753,6 +13911,51 @@ int c54x_run(C54xState *s, int n_insns)
             s->pc += consumed;
         s->pc &= 0xFFFF;  /* C54x has 16-bit PC (23-bit with XPC, but wrap at 16-bit) */
         /* consumed == 0 means PC was set by branch */
+
+        /* [2026-07-23] SP-CORRUPT watchpoint : quelle instruction sort SP de la
+         * plage pile valide [0x5900,0x5c00] ? (derail 0xa58d SP=0xc905 post-POPD).
+         * Logge la 1ere transition dedans->dehors avec pc/op = le coupable. */
+        {
+            static uint16_t g_wp_prev_sp = 0x5ac8;
+            if ((s->sp < 0x5900 || s->sp > 0x5c00) &&
+                (g_wp_prev_sp >= 0x5900 && g_wp_prev_sp <= 0x5c00)) {
+                static unsigned wpn = 0;
+                if (wpn++ < 20)
+                    fprintf(stderr, "[c54x] SP-CORRUPT pc=0x%04x op=0x%04x sp 0x%04x -> 0x%04x insn=%u\n",
+                            exec_pc, exec_op, g_wp_prev_sp, s->sp, s->insn_count);
+            }
+            g_wp_prev_sp = s->sp;
+        }
+
+        /* [2026-07-23] c54x on-chip TIMER0 tick — HORLOGE MANQUANTE (diag horloges +
+         * intuition user "tick TINT"). Le go-live arme IMR bit4 (TINT vec20) et ATTEND
+         * le timer, mais c etait une facade morte (registres TIM/PRD/TCR OK, mais AUCUN
+         * decrement -> jamais de TINT). On tick TIM (avec prescaler TDDR) par instruction ;
+         * a l underflow -> reload TIM=PRD + fire TINT vec20/bit4. Gate CALYPSO_DSP_TIMER_OFF
+         * (A/B), defaut ON. Le firmware demarre le timer (clear TSS) + configure PRD/TDDR. */
+        {
+            static int _tmr = -1;
+            if (_tmr < 0) _tmr = getenv("CALYPSO_DSP_TIMER_OFF") ? 0 : 1;
+            if (_tmr && !(s->data[TCR_ADDR] & TCR_TSS)) {
+                if (s->timer_psc == 0) {
+                    s->timer_psc = s->data[TCR_ADDR] & TCR_TDDR_MASK;
+                    if (s->data[TIM_ADDR] == 0) {
+                        s->data[TIM_ADDR] = s->data[PRD_ADDR];
+                        static unsigned _tn = 0;
+                        if (_tn++ < 8)
+                            fprintf(stderr, "[c54x] DSP-TIMER TINT fire (vec20/bit4) "
+                                    "PRD=0x%04x TDDR=%u IMR=0x%04x INTM=%d insn=%u\n",
+                                    s->data[PRD_ADDR], (unsigned)(s->data[TCR_ADDR] & TCR_TDDR_MASK),
+                                    s->imr, (s->st1 & ST1_INTM) ? 1 : 0, s->insn_count);
+                        c54x_interrupt_ex(s, 20, 4);   /* TINT : vec20, IMR bit4 */
+                    } else {
+                        s->data[TIM_ADDR]--;
+                    }
+                } else {
+                    s->timer_psc--;
+                }
+            }
+        }
 
         /* === BRANCH-TRACE (2026-06-24, sonde amont event-starvation) ==========
          * consumed==0 <=> PC pose par une branche/call/ret PRISE (sinon s->pc +=
