@@ -428,6 +428,13 @@ static void shunt_route_to_c54x(uint8_t page_idx)
             c54x_interrupt_ex(dsp, 28, 12);   /* scheduler frame IT, tick propre */
         else
             c54x_interrupt_ex(dsp, C54X_INT_FRAME_VEC, C54X_INT_FRAME_BIT);
+        /* [2026-07-23] TINT0 MASTER CLOCK sync frame : fire TINT0 vec20/bit4 au
+         * MEME tick TDMA (pas per-2000-insn). Handler 0x72d3 = driver slots op. */
+        {
+            static int _t0m = -1;
+            if (_t0m < 0) _t0m = getenv("CALYPSO_TINT0_MASTER") ? 1 : 0;
+            if (_t0m) c54x_interrupt_ex(dsp, 20, 4);   /* TINT0 : vec20, IMR bit4 */
+        }
     }
     c54x_wake(dsp);
     /* revive: c54x_run loop gate = (running && !idle). c54x_wake ne clear que
