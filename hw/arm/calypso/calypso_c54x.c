@@ -3334,7 +3334,21 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
                  * firmware ecrit (fidele) ; le timer0 fidele respecte l'IMR au take. */
             }
             s->imr = val; return;
-        case MMR_IFR:  s->ifr &= ~val; return;  /* write 1 to clear */
+        case MMR_IFR: {
+            /* [2026-07-23] IFR-CLEAR-W probe (unconditional, capped) : est-ce
+             * que le code go-live ecrit directement IFR (write-1-to-clear) sur
+             * bit5(BRINT0)/bit12(frame) SANS jamais dispatcher -- acquittement
+             * logiciel qui jette le pending au lieu de le servir ? */
+            static unsigned _ifrw = 0;
+            if ((val & 0x1020) && _ifrw < 100) {
+                _ifrw++;
+                fprintf(stderr, "[c54x] IFR-CLEAR-W #%u val=0x%04x (clears bit5=%d bit12=%d) "
+                        "ifr_before=0x%04x -> after=0x%04x PC=0x%04x insn=%u\n",
+                        _ifrw, val, !!(val & 0x20), !!(val & 0x1000),
+                        s->ifr, (uint16_t)(s->ifr & ~val), s->pc, s->insn_count);
+            }
+            s->ifr &= ~val; return;  /* write 1 to clear */
+        }
         case MMR_ST0:  s->st0 = val;
             /* DISP-ENTRY : trace restauration ST0 entière (POPM ST0/STLM) =
              * chemin NON-LDP qui change DP. C'est ICI que DP devient 0x087. */
@@ -4300,15 +4314,26 @@ static bool c54x_irq_level_check(C54xState *s)
      * it statically (this session has been burned by that repeatedly). */
     {
         static unsigned _lcn = 0;
+        static uint32_t _last_insn = 0xFFFFFFFFu;
         bool _intm = !!(s->st1 & ST1_INTM);
         bool _delay = s->delay_slots != 0;
         uint16_t _iptr = (s->pmst >> PMST_IPTR_SHIFT) & 0x1FF;
         uint16_t _pend = (uint16_t)(s->ifr & s->imr);
-        if (_pend && _iptr != 0x1FF && _lcn < 3000) {
+        /* [2026-07-23] DEDUP : RPT re-executes the same instruction (same PC,
+         * same insn_count) hundreds/thousands of times without advancing --
+         * confirmed via s->rpt_active/rpt_count (calypso_c54x.c ~14371: "RPT:
+         * after executing an instruction while repeat is active, re-execute
+         * the SAME instruction... continue" -- skips insn_count++). That was
+         * exhausting our cap on ONE repeat loop. Only log on a NEW insn_count
+         * so the cap covers distinct instructions, not RPT spin. */
+        if (_pend && _iptr != 0x1FF && _lcn < 5000 && s->insn_count != _last_insn) {
+            _last_insn = s->insn_count;
             _lcn++;
             fprintf(stderr, "[c54x] LEVELCHK-EMPIRICAL #%u PC=0x%04x INTM=%d delay=%d "
-                    "IPTR=0x%03x IFR=0x%04x IMR=0x%04x pend=0x%04x insn=%u -> %s\n",
-                    _lcn, s->pc, _intm, _delay, _iptr, s->ifr, s->imr, _pend, s->insn_count,
+                    "IPTR=0x%03x IFR=0x%04x IMR=0x%04x pend=0x%04x insn=%u idle=%d "
+                    "rpt_active=%d rpt_count=%u -> %s\n",
+                    _lcn, s->pc, _intm, _delay, _iptr, s->ifr, s->imr, _pend, s->insn_count, s->idle,
+                    s->rpt_active, s->rpt_count,
                     _intm ? "BLOCKED:INTM=1" : _delay ? "BLOCKED:delay_slots" :
                     (_iptr == 0x1FF) ? "BLOCKED:IPTR=0x1FF" : "WOULD-DISPATCH");
         }
@@ -11319,6 +11344,7 @@ int c54x_run(C54xState *s, int n_insns)
             if (_cyc < 0) { const char *_e = getenv("CALYPSO_D247_TRACE_OFF"); _cyc = (_e && atoi(_e)) ? 0 : 1; }
             if (_cyc) {
                 static unsigned n51c=0,n537=0,n53c=0,n53f=0,n544=0,n549=0,n71d3=0;
+                unsigned _cap = 20000;
                 if (s->pc==0xa51c && n51c++<80)
                     fprintf(stderr, "[c54x] CYCLE-TRACE #%u ENTRY-a51c d[3f92]=0x%04x d[5a00]=0x%04x "
                             "d[435b]=0x%04x IMR=0x%04x insn=%u\n", n51c, s->data[0x3f92], s->data[0x5a00],
@@ -11326,10 +11352,10 @@ int c54x_run(C54xState *s, int n_insns)
                 if (s->pc==0xa537 && n537++<80)
                     fprintf(stderr, "[c54x] CYCLE-TRACE #%u a537(CMPM d5a00,0x88) TC=%d d[5a00]=0x%04x insn=%u\n",
                             n537, !!(s->st0 & ST0_TC), s->data[0x5a00], s->insn_count);
-                if (s->pc==0xa53c && n53c++<80)
+                if (s->pc==0xa53c && n53c++<_cap)
                     fprintf(stderr, "[c54x] CYCLE-TRACE #%u a53c(BITF AR1+10,0x8000) AR1=0x%04x d[3f92]=0x%04x insn=%u\n",
                             n53c, s->ar[1], s->data[0x3f92], s->insn_count);
-                if (s->pc==0xa53f && n53f++<80)
+                if (s->pc==0xa53f && n53f++<_cap)
                     fprintf(stderr, "[c54x] CYCLE-TRACE #%u a53f(BC a575 if NTC) TC=%d insn=%u\n",
                             n53f, !!(s->st0 & ST0_TC), s->insn_count);
                 if (s->pc==0xa544 && n544++<80)
@@ -15116,6 +15142,27 @@ void c54x_interrupt_ex(C54xState *s, int vec, int imr_bit)
 
     bool unmasked = (s->imr & (1 << imr_bit)) != 0;
     if (frame_force) unmasked = true;   /* VEC28-EXP : ligne frame cablee -> vectorise */
+
+    /* [2026-07-23] SYNC-DISPATCH-PROBE (unconditional, capped) : c54x_interrupt_ex
+     * fait un dispatch SYNCHRONE ici (au moment de la levee) si INTM=0 -- sans
+     * log dedie contrairement a c54x_irq_level_check's "IRQ-LEVEL take". On veut
+     * savoir si BRINT0 (vec21) est en fait servi PAR CE CHEMIN, silencieusement,
+     * a chaque levee -- ce qui expliquerait "pend jamais vu par le poller" sans
+     * bug : les deux mecanismes ne se chevauchent simplement jamais dans le temps
+     * observe par LEVELCHK-EMPIRICAL. */
+    if (vec == 21) {
+        static unsigned _sd = 0;
+        if (_sd < 100) {
+            _sd++;
+            fprintf(stderr, "[c54x] SYNC-DISPATCH-PROBE #%u vec=21(BRINT0) imr_bit=%d "
+                    "INTM=%d unmasked=%d idle=%d ifr_before=0x%04x PC=0x%04x insn=%u -> %s\n",
+                    _sd, imr_bit, !!(s->st1 & ST1_INTM), unmasked, s->idle, s->ifr, s->pc,
+                    s->insn_count,
+                    s->idle ? (unmasked ? "DISPATCH(idle-wake)" : "STAYS-PENDING(idle,masked)") :
+                    (!(s->st1 & ST1_INTM) && unmasked && s->delay_slots == 0) ? "DISPATCH(normal)" :
+                    !unmasked ? "STAYS-PENDING(masked)" : "STAYS-PENDING(INTM=1-or-delay)");
+        }
+    }
 
     /* Per SPRU131: IDLE exits on ANY interrupt (masked or unmasked).
      * - Unmasked: branch to vector, set INTM=1
