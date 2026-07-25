@@ -435,7 +435,13 @@ static void bsp_trxd_readable(void *opaque)
         static int bsp_revive = -1;
         if (bsp_revive < 0) {
             const char *e = getenv("CALYPSO_DSP_RUN_C54X");
-            bsp_revive = (calypso_dsp_shunt_route_c54x_active() && e && *e == '1') ? 1 : 0;
+            /* [2026-07-25] read-path diag : sous shunt le buffer I/Q DARAM 0x2a00
+             * n'etait ecrit que 2x (route_c54x_active=faux) -> correlateur affame.
+             * CALYPSO_BSP_DARAM_FORCE=1 force le revive (ecrit 0x2a00) quand le vrai
+             * c54x tourne (RUN_C54X=1), independamment de route_c54x_active. */
+            bsp_revive = (e && *e == '1'
+                          && (calypso_dsp_shunt_route_c54x_active()
+                              || getenv("CALYPSO_BSP_DARAM_FORCE"))) ? 1 : 0;
         }
         if (calypso_dsp_shunt_active() && !bsp_revive)
             return;
@@ -950,7 +956,11 @@ void calypso_bsp_rx_burst(uint8_t tn, uint32_t fn,
         static int rb_revive = -1;
         if (rb_revive < 0) {
             const char *e = getenv("CALYPSO_DSP_RUN_C54X");
-            rb_revive = (calypso_dsp_shunt_route_c54x_active() && e && *e == '1') ? 1 : 0;
+            /* [2026-07-25] idem bsp_revive : CALYPSO_BSP_DARAM_FORCE force l'ecriture
+             * DARAM 0x2a00 (buffer correlateur) sous shunt quand RUN_C54X=1. */
+            rb_revive = (e && *e == '1'
+                         && (calypso_dsp_shunt_route_c54x_active()
+                             || getenv("CALYPSO_BSP_DARAM_FORCE"))) ? 1 : 0;
         }
         if (calypso_dsp_shunt_active() && !rb_revive) {
             if (bsp.bursts_seen <= 3)
@@ -1059,15 +1069,18 @@ void calypso_bsp_rx_burst(uint8_t tn, uint32_t fn,
      * dynamique par burst -- PAS un pin statique) + on leve IMR bit9 (route
      * scheduler 0x7234->0x8341). Au prochain BACC(0xb40f)/CALA(0xb01e) le DSP
      * tombe dans le correlateur. Gate CALYPSO_BSP_DISPATCH_FB (defaut OFF). */
-    { static int _di = -1; static uint16_t _tgt = 0;
+    { static int _di = -1; static uint16_t _tgt = 0; static int _os = -1; static int _done = 0;
       if (_di < 0) { _di = getenv("CALYPSO_BSP_DISPATCH_FB") ? 1 : 0;
         const char *_t = getenv("CALYPSO_BSP_DISPATCH_FB_TGT");
-        _tgt = (_t && *_t) ? (uint16_t)strtoul(_t, NULL, 0) : 0x8d00; } /* REVERT :
-        * cible = 0x8d00 (le correlateur atteint + calcule, 306k COEFFS-WR). Le
-        * detour par 0x8341 a ete retire. Override CALYPSO_BSP_DISPATCH_FB_TGT. */
+        _tgt = (_t && *_t) ? (uint16_t)strtoul(_t, NULL, 0) : 0x8d00;
+        _os = getenv("CALYPSO_BSP_DISPATCH_ONESHOT") ? 1 : 0; } /* cible 0x8d00.
+        * ONESHOT (diag user "pulse") : n'installe+leve BRINT0 qu'UNE fois, au lieu
+        * de re-dispatcher chaque trame (= la congestion : correlateur re-entre en
+        * boucle sans finir). Le pulse laisse le correlateur derouler une passe. */
       uint16_t _md2 = calypso_dsp_shunt_get_task_md();
       int _fb2 = (_md2 == 5 || _md2 == 6 || _md2 == 8 || _md2 == 9);
-      if (_di && _fb2 && bsp.dsp && bsp.dsp->running) {
+      if (_di && _fb2 && bsp.dsp && bsp.dsp->running && !(_os && _done)) {
+        _done = 1;
         bsp.dsp->data[0x43c0] = _tgt;   /* slot terminal BACC 0xb40f (etait 0xa4c7 go-live) */
         bsp.dsp->data[0x4387] = _tgt;   /* slot idle/CALA 0xb01e (etait stub 0xab38) */
         bsp.dsp->data[0x43d8] = _tgt;   /* slot reseed (etait stub 0xab38) */

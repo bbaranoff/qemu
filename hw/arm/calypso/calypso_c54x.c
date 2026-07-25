@@ -2327,6 +2327,29 @@ static void stkw_rec(C54xState *s, uint16_t addr, uint16_t val)
 
 static void data_write(C54xState *s, uint16_t addr, uint16_t val)
 {
+    /* [2026-07-25] RANK1b FIX (workflow overlay, context-safe) : le prologue ISR
+     * overlay 0x013b fait POPD *(0x3fcd) = depile l'adresse de retour HW 0x72d5
+     * dans data[0x3fcd], puis 23 PSHM (sauvegarde contexte), puis PSHD *(0x3fcd)
+     * + RET qui DEPILE data[0x3fcd] = retourne a 0x72d5 -> reboucle sur le
+     * scheduler 0x7234 (self-loop). Le chemin NATIF doit retourner a 0xa4e4
+     * (init lineaire ORM/RSBX/IMR -> dispatcher 0x8341 -> LUT FB -> correlateur
+     * AR3=0x2a00). On substitue la valeur ecrite par 0x013b UNIQUEMENT (pas
+     * l'epilogue 0x011e qui ecrit aussi 0x3fcd) : les 23 PSHM s'executent, SP
+     * reste equilibre, le RET depile 0xa4e4 -> chemin natif SANS storm (vs le
+     * PC-redirect qui sautait le contexte). Gate CALYPSO_FIX_3FCD (def off). */
+    if (addr == 0x3fcd && s->pc == 0x013b) {
+        static int f3f = -1;
+        if (f3f < 0) f3f = getenv("CALYPSO_FIX_3FCD") ? 1 : 0;
+        if (f3f && val != 0xa4e4) {
+            static unsigned f3n = 0;
+            if (f3n++ < 8)
+                fprintf(stderr, "[c54x] FIX-3FCD : data[0x3fcd] 0x%04x -> 0xa4e4 "
+                        "(retour natif go-live, pas 0x72d5 self-loop) PC=0x013b insn=%u\n",
+                        val, s->insn_count);
+            val = 0xa4e4;
+        }
+    }
+
     /* WRITE-WATCH (2026-06-24, RO) : qui ECRIT 0x434f (FIFO write ptr),
      * 0x434e (FIFO read ptr), 0x3f6d (soft-vector go-live) — avec quel PC.
      * Tranche empiriquement ECRITURE-ACTIVE (par un chemin) vs residu/defaut :
@@ -13260,6 +13283,26 @@ int c54x_run(C54xState *s, int n_insns)
                     fprintf(stderr, "[c54x] WAIT-TEST PC=0xa4d4 data[0x3f70]=0x%04x bit1=%d "
                             "insn=%u\n", fl, !!(fl & 2), s->insn_count);
                 last = fl;
+            }
+        }
+
+        /* [2026-07-25] RANK1 : route frame ISR 0x013b -> 0x8341 (LUT FB native,
+         * setup COMPLET du correlateur : BRC/BK/data-ptr, que l'entree forcee
+         * 0x8d00 court-circuite -> boucle morte MAC diag). Le frame IT vectorise
+         * 0x00f0 -> 0x7234 (B 0x013b) -> prologue 0x013b qui deraille et n'atteint
+         * jamais 0x8341. On redirige le prologue vers 0x8341 quand l'IT vient du
+         * frame scheduler (g_prev_pc==0x7234). Gate CALYPSO_ISR_TO_8341 (def off). */
+        if (exec_pc == 0x013b) {
+            static int r8 = -1;
+            if (r8 < 0) r8 = getenv("CALYPSO_ISR_TO_8341") ? 1 : 0;
+            if (r8 && g_prev_pc == 0x7234) {
+                static unsigned r8n = 0;
+                if (r8n++ < 8)
+                    fprintf(stderr, "[c54x] ISR-TO-8341 : frame ISR 0x013b -> 0x8341 "
+                            "(LUT FB setup complet) prev=0x%04x insn=%u\n",
+                            g_prev_pc, s->insn_count);
+                s->pc = 0x8341;
+                return 0;
             }
         }
 

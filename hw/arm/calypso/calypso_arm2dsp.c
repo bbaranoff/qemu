@@ -79,6 +79,21 @@ static int          a2d_bgen_oneshot = -1; /* 1 = one transition only (default) 
 static int          a2d_bgen_done;       /* one-shot latch                        */
 static unsigned     a2d_bgen_posts;      /* how many background-enable posts       */
 
+/* ---- CTRLSYS wire (RANK1): ARM->DSP d_ctrl_system 0x0810 bit15 ----------------
+ * The go-live gate at DSP 0xa53c is BITF *(AR1+0x10),0x8000 with AR1=0x0800, i.e.
+ * it tests data[0x0810] (d_ctrl_system, dsp_api.h "Control Register RESET/RESUME").
+ * bit15 SET  -> a541..a544..0x09bc..0xd247 = bootstrap/operational path (reaches
+ *               the FB dispatch we need).
+ * bit15 CLEAR-> BC 0xa575 = short-circuit, never bootstrap (current: data[0x0810]=0
+ *               -> DSP loops the go-live init -> double IMR, correlator never set up).
+ * The real ARM asserts this bit in l1s_reset(), but the emulated ARM->DSP API bridge
+ * never propagates it. We model that write HERE (ARM side), not as a DSP-core poke. */
+static int          a2d_ctrlsys = -1;    /* -1 unresolved, 0/1 disabled/enabled   */
+static uint16_t     a2d_ctrlsys_cell;    /* d_ctrl_system cell      (0x0810)      */
+static uint16_t     a2d_ctrlsys_bit;     /* bit to assert           (0x8000)      */
+static uint16_t     a2d_ctrlsys_pollpc;  /* DSP PC just before gate (0xa537)      */
+static unsigned     a2d_ctrlsys_posts;   /* how many asserts (log cap)            */
+
 static uint16_t a2d_env_u16(const char *name, uint16_t def)
 {
     const char *e = getenv(name);
@@ -108,6 +123,16 @@ static void a2d_resolve(void)
     const char *eo  = getenv("CALYPSO_ARM2DSP_BGEN_ONESHOT");
     a2d_bgen_oneshot = (eo && *eo) ? (atoi(eo) > 0 ? 1 : 0) : 1;
 
+    /* CTRLSYS wire (RANK1): model the ARM's l1s_reset() write of d_ctrl_system
+     * bit15 so the DSP go-live gate 0xa53c (BITF data[0x0810],#0x8000) falls
+     * through to the bootstrap/FB-dispatch path instead of short-circuiting to
+     * 0xa575. Cross-validated: minimal correct value is exactly 0x8000. */
+    const char *ec  = getenv("CALYPSO_ARM2DSP_CTRLSYS");
+    a2d_ctrlsys        = (ec && atoi(ec) > 0) ? 1 : 0;
+    a2d_ctrlsys_cell   = a2d_env_u16("CALYPSO_ARM2DSP_CTRLSYS_CELL",   0x0810);
+    a2d_ctrlsys_bit    = a2d_env_u16("CALYPSO_ARM2DSP_CTRLSYS_VAL",    0x8000);
+    a2d_ctrlsys_pollpc = a2d_env_u16("CALYPSO_ARM2DSP_CTRLSYS_POLLPC", 0xa537);
+
     if (a2d_on) {
         fprintf(stderr,
                 "[arm2dsp] enabled (faithful task-post): d_dsp_page(0x%04x) bit1 "
@@ -121,6 +146,12 @@ static void a2d_resolve(void)
                 "-> DSP phase-SM reaches 0xde9c, raises d[0x3f70] bit1\n",
                 a2d_bgen_a, a2d_bgen_c, a2d_bgen_val, a2d_bgen_pollpc,
                 a2d_bgen_oneshot);
+    }
+    if (a2d_ctrlsys) {
+        fprintf(stderr,
+                "[arm2dsp] CTRLSYS enabled (RANK1): assert data[0x%04x] |= 0x%04x "
+                "@DSP-PC=0x%04x -> go-live gate 0xa53c falls through to bootstrap/FB\n",
+                a2d_ctrlsys_cell, a2d_ctrlsys_bit, a2d_ctrlsys_pollpc);
     }
 }
 
@@ -144,8 +175,28 @@ void calypso_arm2dsp_on_arm_write(uint16_t offset, uint16_t value)
 void calypso_arm2dsp_on_dsp_step(C54xState *s, uint16_t exec_pc)
 {
     a2d_resolve();
-    if (!a2d_on && !a2d_bgen) {
+    if (!a2d_on && !a2d_bgen && !a2d_ctrlsys) {
         return;
+    }
+
+    /* ---- CTRLSYS: assert d_ctrl_system bit15 at the go-live gate --------------
+     * When the DSP reaches the instruction just before the 0xa53c BITF gate, make
+     * sure data[0x0810] bit15 is set so BITF sets TC and the DSP falls through to
+     * the bootstrap/FB-dispatch path (else BC NTC 0xa575 short-circuits). Modeled
+     * as the ARM's write; re-asserted each pass (persists — nothing clears it, but
+     * this is robust if the DSP ever does). */
+    if (a2d_ctrlsys && exec_pc == a2d_ctrlsys_pollpc &&
+        !(s->data[a2d_ctrlsys_cell] & a2d_ctrlsys_bit)) {
+        s->data[a2d_ctrlsys_cell] |= a2d_ctrlsys_bit;
+        if (a2d_ctrlsys_cell >= A2D_API_BASE && s->api_ram) {
+            s->api_ram[a2d_ctrlsys_cell - A2D_API_BASE] |= a2d_ctrlsys_bit;
+        }
+        if (a2d_ctrlsys_posts++ < 8) {
+            fprintf(stderr,
+                    "[arm2dsp] CTRLSYS: data[0x%04x] |= 0x%04x (go-live gate "
+                    "0xa53c bit15 SET -> bootstrap path) @DSP-PC=0x%04x insn=%u\n",
+                    a2d_ctrlsys_cell, a2d_ctrlsys_bit, exec_pc, s->insn_count);
+        }
     }
 
     /* ---- Fix A: faithful background-enable handshake --------------------------
