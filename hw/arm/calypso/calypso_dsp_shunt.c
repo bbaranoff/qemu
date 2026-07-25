@@ -375,7 +375,24 @@ static inline uint16_t shunt_c54x_api_rd(C54xState *dsp, uint32_t arm_addr)
     return dsp->data[((arm_addr - 0xFFD00000UL) >> 1) + 0x0800];
 }
 
-static void shunt_route_to_c54x(uint8_t page_idx)
+/* [2026-07-24] CADENCE SPLIT : shunt_route_to_c54x() etait appelee UNIQUEMENT
+ * quand g_shunt.pending (= l'ARM vient de poster un NOUVEAU d_dsp_page), soit
+ * ~1 fois toutes les ~12 trames reelles en pratique (mesure runtime : 708 insn
+ * DSP/tour mais ~57ms reels/tour -- le go-live retry loop du DSP n'a donc
+ * qu'une fraction de son temps reel pour attraper la fenetre de survie de
+ * data[0x0810]/d_ctrl_system, contrairement au natif ou c54x_run tourne a
+ * chaque trame SANS gate sur un dispatch ARM frais). Le natif ne connait pas
+ * ce probleme : calypso_tdma_tick() appelle c54x_run() inconditionnellement
+ * (gate uniquement sur running/idle/shunt_active), jamais sur "tache neuve".
+ *
+ * Fix : separer le header (partie A, a besoin de page_idx/d_fn FRAIS, donc
+ * reste gate sur pending -- cf le fix staleness du meme jour juste au-dessus)
+ * du wake+run (partie B, ne depend pas d'un dispatch frais : rejoue le
+ * dernier IQ connu, tire l'IT frame, tourne le budget DSP -- exactement ce
+ * que native fait a chaque trame). Partie B devient appelable a CHAQUE trame,
+ * pending ou pas, pour retrouver une cadence proche du natif (~217Hz au lieu
+ * de ~17Hz). */
+static void shunt_route_to_c54x_header(uint8_t page_idx)
 {
     C54xState *dsp = g_shunt.c54x;
     if (!dsp)
@@ -389,15 +406,21 @@ static void shunt_route_to_c54x(uint8_t page_idx)
     {
         uint32_t wbase    = wp_base(page_idx);
         fprintf(stderr, "[c54x-route] a1 wbase=0x%08x\n", wbase);
-        /* [2026-07-22] FIX offset ARM->DSP : d_dsp_page est a l'offset 0 du NDB
-         * -> DSP-word data[0x08E2] (= NDB_D_DSP_PAGE). L'ancien
-         * `BASE_API_NDB + NDB_D_DSP_PAGE` = 0xFFD001A8 + 0x08E2 melangeait
-         * adresse ARM et DSP-word -> lisait data[0x0D3E]=garbage(0xf600) puis
-         * clobbait la vraie valeur ARM. On lit data[0x08E2] DIRECTEMENT. */
-        uint16_t dsp_page = dsp->data[NDB_D_DSP_PAGE];
-        fprintf(stderr, "[c54x-route] a2 dsp_page=0x%04x (data[0x08E2]) "
-                "[ancien buggy data[0x0D3E]=0x%04x] api_ram=%p\n",
-                dsp_page, dsp->data[0x0D3E], (void*)dsp->api_ram);
+        /* [2026-07-24] FIX RACE : l'ancien lisait dsp->data[NDB_D_DSP_PAGE]=data[0x08E2]
+         * ICI-MEME (mid-frame), une cellule que data[0x08E2] toggle entre ce
+         * moment et le FRAME-IT qui suit dans CETTE MEME invocation (confirme
+         * runtime : a2 voit 186/186 fois 0x0000, FRAME-IT# voit 559/559 fois
+         * 0x0003, sur la MEME cellule -- pas un bug d'adresse, un bug de
+         * timing/staleness). page_idx (parametre) est DEJA la valeur fraiche,
+         * capturee au moment de l'ecriture ARM (cf ligne ~135 :
+         * page_idx = (new_d_dsp_page & B_GSM_PAGE) ? 1 : 0). On reconstruit
+         * dsp_page depuis cette valeur connue-fraiche au lieu de relire une
+         * cellule sujette a race, evitant de repropager du perime dans
+         * data[0x0584]/api_ram[0x08E2] ci-dessous. */
+        uint16_t dsp_page = B_GSM_TASK | page_idx;
+        fprintf(stderr, "[c54x-route] a2 dsp_page=0x%04x (from page_idx=%u, was: data[0x08E2]=0x%04x) "
+                "api_ram=%p\n",
+                dsp_page, (unsigned)page_idx, dsp->data[NDB_D_DSP_PAGE], (void*)dsp->api_ram);
         dsp->data[0x0584] = dsp_page;
         dsp->data[0x0585] = (uint16_t)(g_shunt.d_fn & 0xFFFF);
         fprintf(stderr, "[c54x-route] a3 data-hdr-ok\n");
@@ -408,8 +431,15 @@ static void shunt_route_to_c54x(uint8_t page_idx)
         if (dsp->api_ram)
             dsp->api_ram[0x08E2 - C54X_API_BASE] = dsp_page;
     }
-
     fprintf(stderr, "[c54x-route] a-daram-ok\n");
+}
+
+static void shunt_route_to_c54x_run(void)
+{
+    C54xState *dsp = g_shunt.c54x;
+    if (!dsp)
+        return;
+
     /* (b) rejoue le dernier burst I/Q (cs16 entrelace I,Q) dans bsp_buf. */
     if (g_shunt.last_iq_valid && g_shunt.last_iq_n > 0)
         c54x_bsp_load(dsp, (const uint16_t *)g_shunt.last_iq, g_shunt.last_iq_n);
@@ -464,6 +494,26 @@ void calypso_dsp_shunt_on_frame_tick(void)
         return;
     shunt_poll_si_shm();   /* gr-gsm a-t-il ecrit un nouveau SI dans le shm ? */
     calypso_tch_dl_poll(); /* nouvelle trame FR DL dans le sideband ? (toujours, hors gate pending) */
+
+    /* [2026-07-24] CADENCE FIX : le run C54x (wake+IT-frame+c54x_run) ne
+     * depend d'AUCUNE donnee fraiche de dispatch (page_idx/d_fn) -- seul le
+     * header ci-dessous en a besoin. On le sort du gate pending pour tourner
+     * a CHAQUE trame reelle, comme le fait calypso_tdma_tick() en natif (qui
+     * appelle c54x_run() inconditionnellement, jamais sur "tache neuve").
+     * Avant ce fix : c54x_run() ne tournait qu'aux ~1/12 trames ou l'ARM
+     * venait de poster un d_dsp_page frais (mesure : 708 insn DSP/tour mais
+     * ~57ms reels/tour) -- le DSP n'avait donc qu'une fraction de son temps
+     * reel pour attraper la fenetre de survie de data[0x0810]/d_ctrl_system. */
+    if (g_shunt.c54x && shunt_route_c54x()) {
+        static int run_c54x = -1;
+        if (run_c54x < 0) {
+            const char *e = getenv("CALYPSO_DSP_RUN_C54X");
+            run_c54x = (e && *e == '1') ? 1 : 0;
+        }
+        if (run_c54x)
+            shunt_route_to_c54x_run();
+    }
+
     if (!g_shunt.pending) {
         return;
     }
@@ -491,7 +541,7 @@ void calypso_dsp_shunt_on_frame_tick(void)
                         getenv("CALYPSO_C54X_CRASHPC") ? getenv("CALYPSO_C54X_CRASHPC") : "(null)",
                         getenv("CALYPSO_DSP") ? getenv("CALYPSO_DSP") : "(null)", run_c54x);
             }
-            if (run_c54x) shunt_route_to_c54x(page);
+            if (run_c54x) shunt_route_to_c54x_header(page);
         }
         if (md == PM_DSP_TASK)                          do { static int nf_pm=-1; if(nf_pm<0){const char*e=getenv("CALYPSO_SHUNT_NO_FAKE_PM");nf_pm=(e&&*e=='1')?1:0;} if(!nf_pm) shunt_dispatch_pm(page); } while(0);
         else if (md == FB_DSP_TASK) {
@@ -836,6 +886,23 @@ static void shunt_sch_read(void *opaque)
                     "(ncc=%d bcc=%d) FN=%d TOA=%d%s\n", (int)g_shunt.sb_bsic,
                     (g_shunt.sb_bsic >> 3) & 7, g_shunt.sb_bsic & 7,
                     (int)fn, (int)g_shunt.sb_toa, first ? " [1er]" : "");
+
+        /* [2026-07-25] FN-ALIGN probe : mesure PROPRE de l'offset horloge.
+         * Le DSP suit s->fn (calypso_trx_get_fn) ; le SCH porte la FN REELLE du
+         * BTS. delta = sch_fn - trx_fn = l'offset a recaler (un vrai mobile cale
+         * son horloge sur le SCH ; ici le DSP garde l'horloge TRX offset).
+         * delta constant sur les SCH -> offset fixe pose a l'init (fix 1 ligne).
+         * toa = offset residuel intra-burst en qbits (23 = on-time). */
+        {
+            uint32_t trx_fn = calypso_trx_get_fn();
+            int32_t d = (int32_t)((uint32_t)fn - trx_fn);
+            static unsigned an = 0;
+            if (an++ < 60 || (an % 200) == 0)
+                fprintf(stderr, "[dsp-shunt] FN-ALIGN sch_fn=%u trx_fn=%u "
+                        "delta=%d sch%%51=%u toa=%d\n",
+                        (unsigned)fn, trx_fn, d, (unsigned)((uint32_t)fn % 51),
+                        (int)g_shunt.sb_toa);
+        }
     }
 }
 
@@ -1371,6 +1438,15 @@ void calypso_dsp_shunt_feed_si(const uint8_t *l2, int len)
 bool calypso_dsp_shunt_active(void)
 {
     return g_shunt.active;
+}
+
+/* Public getter — mission courante du DSP (d_task_md, lu du write-page ARM).
+ * Sert a gater les wires inter-blocs (BSP BRINT0 / TPU DSP_INT_PG) sur la
+ * mission FB/SB reelle. Valeurs (osmo l1_environment.h) : FB_DSP_TASK=5,
+ * SB_DSP_TASK=6, TCH_FB=8, TCH_SB=9. 0 = pas de tache. */
+uint16_t calypso_dsp_shunt_get_task_md(void)
+{
+    return g_shunt.d_task_md;
 }
 
 /* CALYPSO_DSP=c54x : relie le handle du VRAI DSP (depuis calypso_mb.c). */

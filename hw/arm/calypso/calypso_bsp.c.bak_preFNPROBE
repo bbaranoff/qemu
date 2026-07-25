@@ -272,41 +272,18 @@ static BspBurstSlot *bsp_take_for_fn(uint8_t tn, uint32_t current_fn)
     BspBurstQueue *qq = &bsp.q[tn];
     BspBurstSlot *match = NULL;
     int32_t best_abs = INT32_MAX;
-    /* FN-PROBE (2026-07-24) : suit le burst le PLUS PROCHE, fenêtre ignorée, pour
-     * exposer l'offset/dérive burst_fn vs dispatcher_fn même quand tout est stale. */
-    uint32_t near_fn = 0; int32_t near_d = 0; int32_t near_ad = INT32_MAX; int n_valid = 0;
 
     for (int i = 0; i < BSP_QUEUE_LEN; i++) {
         BspBurstSlot *s = &qq->slot[i];
         if (!s->valid) continue;
         int32_t d = bsp_fn_delta(s->fn, current_fn);
         int32_t ad = d < 0 ? -d : d;
-        n_valid++;
-        if (ad < near_ad) { near_ad = ad; near_d = d; near_fn = s->fn; }
         if (d < -BSP_FN_MATCH_WINDOW) {
             s->valid = false;
             bsp.bursts_dropped_stale++;
         } else if (ad <= BSP_FN_MATCH_WINDOW && ad < best_abs) {
             match = s;
             best_abs = ad;
-        }
-    }
-    /* FN-PROBE (gated CALYPSO_BSP_FN_PROBE) : la FN portée par le burst le plus
-     * proche (posée à bsp_enqueue) vs la FN que le dispatcher teste ici
-     * (current_fn = calypso_trx_get_fn), côte à côte. delta CONSTANT = offset
-     * (fix = une ligne) ; delta qui DÉRIVE = problème d'horloge. Cap 300 + 1/500. */
-    {
-        static int fp = -1;
-        if (fp < 0) fp = getenv("CALYPSO_BSP_FN_PROBE") ? 1 : 0;
-        if (fp && n_valid > 0) {
-            static unsigned fpn = 0;
-            if (fpn < 300 || (fpn % 500) == 0)
-                BSP_LOG("FN-PROBE tn=%u dispatcher_fn=%u burst_fn=%u delta=%d "
-                        "n_valid=%d verdict=%s window=%d",
-                        tn, current_fn, near_fn, near_d, n_valid,
-                        match ? "MATCH" : (near_d > BSP_FN_MATCH_WINDOW ? "FUTURE" : "STALE"),
-                        BSP_FN_MATCH_WINDOW);
-            fpn++;
         }
     }
     /* Periodic stale ratio summary: a runaway ratio (e.g. 7000:1) is the
@@ -1027,26 +1004,6 @@ void calypso_bsp_rx_burst(uint8_t tn, uint32_t fn,
     { static int _nat = -1; if (_nat < 0) _nat = (getenv("CALYPSO_FRAME_IT_NATIVE") || getenv("CALYPSO_DSP_FRAME_VEC28")) ? 1 : 0; int _fb = _nat ? 12 : 3;
       if (bsp.dsp && bsp.dsp->running && !(bsp.dsp->ifr & (1 << _fb))) {
         c54x_interrupt_ex(bsp.dsp, 19, 3);
-        if (bsp.dsp->idle) bsp.dsp->idle = false;
-      } }
-
-    /* [2026-07-25] WIRE BSP->DSP BRINT0 (direct-feed) : le chemin direct-feed
-     * (CALYPSO_BSP_DIRECT_FEED=1) livre l'I/Q en DARAM 0x2a00 mais ne levait QUE
-     * INT3 (vec19/bit3, frame). Le chemin buffered, lui, leve BRINT0 (vec21/bit5)
-     * = l'IT "buffer recu" qui reveille le handler FB-det correlateur (ISR
-     * PROM1[0xFFD4]->CALL 0xf310). Sans BRINT0 le correlateur 0x8d00 n'est JAMAIS
-     * dispatche (0 hit confirme). On le leve comme deliver_buffered (meme
-     * anti-stack gate IFR bit5). Gate CALYPSO_BSP_DIRECT_BRINT0 (defaut OFF pour
-     * tester une variable a la fois). */
-    { static int _db = -1; if (_db < 0) _db = getenv("CALYPSO_BSP_DIRECT_BRINT0") ? 1 : 0;
-      /* MISSION-GATE : ne lever BRINT0 que si le DSP est reellement sur la
-       * mission FB/SB (d_task_md), pas hors-mission -> le reveil correlateur
-       * arrive au bon moment, comme le vrai "buffer recu" du silicium.
-       * FB=5 SB=6 TCH_FB=8 TCH_SB=9 (osmo l1_environment.h). */
-      uint16_t _md = calypso_dsp_shunt_get_task_md();
-      int _fbsb = (_md == 5 || _md == 6 || _md == 8 || _md == 9);
-      if (_db && _fbsb && bsp.dsp && bsp.dsp->running && !(bsp.dsp->ifr & (1 << 5))) {
-        c54x_interrupt_ex(bsp.dsp, 21, 5);
         if (bsp.dsp->idle) bsp.dsp->idle = false;
       } }
 

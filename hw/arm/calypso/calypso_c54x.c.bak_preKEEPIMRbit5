@@ -3330,12 +3330,8 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
                 }
             }
             {
-                /* [2026-07-25] Le toggle IMR bit9 (0xddf9 ANDM / 0xde84 ORM) est
-                 * PILOTE PAR LE TPU (masquage dynamique par fenetre burst), PAS a
-                 * figer statiquement -> tentative PIN-IMR retiree (diag user).
-                 * IMR = ce que le firmware/TPU ecrit (fidele). Le seul re-arm
-                 * conserve est le fix bit5/BRINT0 dynamique (voir KEEP-IMR bloc
-                 * ~13230) qui restaure bit5 uniquement quand il TOMBE. */
+                /* [2026-07-23] preservation bit12 RETIREE (hacky). IMR = ce que le
+                 * firmware ecrit (fidele) ; le timer0 fidele respecte l'IMR au take. */
             }
             s->imr = val; return;
         case MMR_IFR: {
@@ -13217,33 +13213,21 @@ int c54x_run(C54xState *s, int n_insns)
                         s->prog[(uint16_t)(exec_pc + 1)],
                         (s->st1 & ST1_INTM) ? 1 : 0, s->insn_count);
         }
-        /* [2026-07-22] KEEP-IMR (gated CALYPSO_KEEP_IMR) : 0xb37e (STM #0,IMR)
-         * efface IMR ~47 insns apres que le go-live l'a arme -> la wait-loop
-         * tourne avec IMR sans les bits d'IT -> l'IT jamais prise.
-         * [2026-07-25 FIX BIT5 — diag video user] : l'ancienne version re-armait
-         * IMR=0x3000 (bits 12/13, vec28/29) mais SANS bit5 (BRINT0/vec21). Or
-         * BRINT0 = l'IT "buffer BSP recu" qui reveille le correlateur. Resultat
-         * mesure : IMR=0x52fd (bit5=1) arme 178x par le go-live puis ECRASE par
-         * 0xb37e, KEEP_IMR restaurait 0x3050/0x0050 (bit5=0) -> BRINT0 masque a
-         * vie -> IFR bit5 pending eternel -> correlateur jamais dispatche.
-         * FIX : re-armer la VRAIE image = le shadow d[0x435b] (=0x52fd, bit5
-         * inclus), et le faire des que bit5 TOMBE (pas seulement quand imr==0),
-         * sur toute la region go-live+background [0xa4ca..0xdea0]. Valeur de
-         * repli / override : CALYPSO_KEEP_IMR_VAL (defaut 0x52fd). */
+        /* [2026-07-22] KEEP-IMR (gated CALYPSO_KEEP_IMR) : 0xb37e efface IMR ~47
+         * insns apres que POKE l'a arme -> la wait-loop tourne avec IMR=0 -> l'IT
+         * frame native jamais prise. On re-arme IMR=0x3000 (bit12/vec28) tant que
+         * le DSP est dans la wait-loop go-live [0xa4ca..0xa4e2]. Casse le chicken/
+         * egg : le frame IT native (pend=ifr&imr) peut alors etre pris, atteindre
+         * 0xa582 qui arme IMR=0x52fd nativement -> self-sustain. */
         {
-            static int ki = -1; static uint16_t kiv = 0;
-            if (ki < 0) { ki = getenv("CALYPSO_KEEP_IMR") ? 1 : 0;
-                const char *e = getenv("CALYPSO_KEEP_IMR_VAL");
-                kiv = (e && *e) ? (uint16_t)strtoul(e, NULL, 0) : 0x52fd; }
-            if (ki && exec_pc >= 0xa4ca && exec_pc <= 0xdea0 && !(s->imr & 0x0020)) {
-                uint16_t img = s->data[0x435b];            /* shadow IMR (=0x52fd) */
-                if (!(img & 0x0020)) img = kiv;            /* shadow sans bit5 -> repli */
-                s->imr = img;
+            static int ki = -1;
+            if (ki < 0) ki = getenv("CALYPSO_KEEP_IMR") ? 1 : 0;
+            if (ki && exec_pc >= 0xa4ca && exec_pc <= 0xa4e2 && s->imr == 0) {
+                s->imr = 0x3000;
                 static unsigned kil = 0;
                 if (kil++ < 8)
-                    fprintf(stderr, "[c54x] KEEP-IMR re-arme IMR=0x%04x (bit5/BRINT0 preserve, "
-                            "shadow d[435b]=0x%04x) @PC=0x%04x insn=%u\n",
-                            s->imr, s->data[0x435b], exec_pc, s->insn_count);
+                    fprintf(stderr, "[c54x] KEEP-IMR re-arme IMR=0x3000 @PC=0x%04x insn=%u\n",
+                            exec_pc, s->insn_count);
             }
         }
         if (exec_pc == 0xa4d4) {

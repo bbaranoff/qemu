@@ -1030,26 +1030,6 @@ void calypso_bsp_rx_burst(uint8_t tn, uint32_t fn,
         if (bsp.dsp->idle) bsp.dsp->idle = false;
       } }
 
-    /* [2026-07-25] WIRE BSP->DSP BRINT0 (direct-feed) : le chemin direct-feed
-     * (CALYPSO_BSP_DIRECT_FEED=1) livre l'I/Q en DARAM 0x2a00 mais ne levait QUE
-     * INT3 (vec19/bit3, frame). Le chemin buffered, lui, leve BRINT0 (vec21/bit5)
-     * = l'IT "buffer recu" qui reveille le handler FB-det correlateur (ISR
-     * PROM1[0xFFD4]->CALL 0xf310). Sans BRINT0 le correlateur 0x8d00 n'est JAMAIS
-     * dispatche (0 hit confirme). On le leve comme deliver_buffered (meme
-     * anti-stack gate IFR bit5). Gate CALYPSO_BSP_DIRECT_BRINT0 (defaut OFF pour
-     * tester une variable a la fois). */
-    { static int _db = -1; if (_db < 0) _db = getenv("CALYPSO_BSP_DIRECT_BRINT0") ? 1 : 0;
-      /* MISSION-GATE : ne lever BRINT0 que si le DSP est reellement sur la
-       * mission FB/SB (d_task_md), pas hors-mission -> le reveil correlateur
-       * arrive au bon moment, comme le vrai "buffer recu" du silicium.
-       * FB=5 SB=6 TCH_FB=8 TCH_SB=9 (osmo l1_environment.h). */
-      uint16_t _md = calypso_dsp_shunt_get_task_md();
-      int _fbsb = (_md == 5 || _md == 6 || _md == 8 || _md == 9);
-      if (_db && _fbsb && bsp.dsp && bsp.dsp->running && !(bsp.dsp->ifr & (1 << 5))) {
-        c54x_interrupt_ex(bsp.dsp, 21, 5);
-        if (bsp.dsp->idle) bsp.dsp->idle = false;
-      } }
-
     int n = n_int16 < (int)bsp.daram_len ? n_int16 : (int)bsp.daram_len;
 
     /* Load samples into BSP serial port buffer (PORTR PA=0x0034).
