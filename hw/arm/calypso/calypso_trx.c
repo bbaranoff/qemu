@@ -147,7 +147,26 @@ extern uint16_t g_arm_taskmd5_ea;
  * re-introducing a firmware patch.
  */
 
-uint32_t calypso_trx_get_fn(void) { return g_trx ? g_trx->fn : 0; }
+uint32_t calypso_trx_get_fn(void)
+{
+    if (!g_trx) {
+        return 0;
+    }
+    /* RANK4 recale FN (gate CALYPSO_DL_FN_OFFSET, DEFAUT 0 = inerte -> identique
+     * au clean). Offset signe applique a la reference FN de tous les consumers
+     * (shunt feed, BSP match, FN-ALIGN) pour caler la FN DSP sur la SCH BTS. A
+     * -556, la FCCH tombe dans la bonne trame. NB : trop large (touche aussi la
+     * FN UL/DATA_IND) -> a n'activer que pour l'alignement correlateur. */
+    static int off = 0, off_init = 0;
+    if (!off_init) {
+        off_init = 1;
+        const char *e = getenv("CALYPSO_DL_FN_OFFSET");
+        if (e && *e) {
+            off = atoi(e);
+        }
+    }
+    return (uint32_t)((int64_t)g_trx->fn + off);
+}
 
 /* ---- DSP API RAM ---- */
 static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)

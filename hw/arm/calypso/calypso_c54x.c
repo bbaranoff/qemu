@@ -9,6 +9,7 @@
 
 #include "calypso_c54x.h"
 #include "calypso_arm2dsp.h"
+#include "hw/arm/calypso/calypso_invariants.h"
 #include "hw/arm/calypso/calypso_full_pcb.h"  /* daram_lock, api_ram_lock */
 #include <stdio.h>
 #include <stdlib.h>
@@ -2957,6 +2958,29 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
     {
         static WatchWriteState wws_coeffs;
         watch_write_zone_check(s, addr, val, "COEFFS", 0x2bc0, 0x2bff, &wws_coeffs);
+    }
+    /* INVARIANT (gate CALYPSO_INVARIANTS, defaut off) : pointeurs du correlateur.
+     * AR4 = write ptr -> doit prendre >2 valeurs distinctes (sinon boucle 2-mots).
+     * AR5 = read ptr I/Q -> doit vivre dans le buffer [0x2a00..0x2b27] (sinon le
+     * correlateur lit hors buffer = kernel 0xa076 jamais atteint, AR5=0xdb7b). */
+    if (addr >= 0x2bc0 && addr <= 0x2bff) {
+        static uint32_t pw;
+        static uint16_t ar4_seen[8];
+        static int ar4_n;
+        uint16_t a4 = s->ar[4], a5 = s->ar[5];
+        if (ar4_n < 8) {
+            int f = 0;
+            for (int i = 0; i < ar4_n; i++) { if (ar4_seen[i] == a4) { f = 1; break; } }
+            if (!f) ar4_seen[ar4_n++] = a4;
+        }
+        if (++pw == 2000) {
+            calypso_invariant("correlator_ar4_sweeps", ar4_n > 2,
+                              "AR4 (write ptr) : %d valeur(s) distincte(s) sur %u writes",
+                              ar4_n, pw);
+        }
+        calypso_invariant("correlator_ar5_in_iq_buffer",
+                          a5 >= 0x2a00 && a5 <= 0x2b27,
+                          "AR5 (read ptr I/Q) = 0x%04x HORS buffer [0x2a00..0x2b27]", a5);
     }
     /* A_CD-WR : a_cd[15] in NDB starts at DSP word 0x09D0 (= API byte 0x03A0,
      * = NDB byte offset 0x1F8). 15 words = [0x09D0..0x09DE].
@@ -13431,31 +13455,28 @@ int c54x_run(C54xState *s, int n_insns)
                             exec_pc, f98v, s->insn_count);
             }
         }
-        /* FORCE-GATE (2026-07-25, TEST) : la boucle reject go-live a53c<->a575 relit
-         * son gate a CHAQUE iteration ; les setters a539/a566 sont HORS boucle (jamais
-         * repasses) -> poker une fois ne persiste pas. On force donc a CHAQUE pas tant
-         * que le PC est dans la region go-live [0xa4ca..0xa575].
-         *   CALYPSO_FORCE_3F92=0xC000 -> d[0x3f92]   (hypothese scheduler-state)
-         *   CALYPSO_FORCE_0810=0xC000 -> data[0x0810] (operande reel du BITF *+AR1(0x10))
-         * Objectif : casser la branche a575 et voir si BRINT0 (0x8d00) se dispatche.
-         * =1 -> 0xC000 (bits14+15). Reversible, gate defaut OFF. */
+        /* GO-LIVE FB-task hold (2026-07-25) — INTEGRATION NATIVE, remplace l'ancien
+         * FORCE poke (=0xC000, overwrite, mauvais bit). Le firmware efface d[0x3f92]
+         * par ST #0 @0xa4c4 puis DEVRAIT le re-armer par ORM #0x0800 @0xa539 — mais
+         * ce setter natif est skippe (d[5a00]==0x88), donc le bit tache-FB (0x0800)
+         * reste 0 a vie et le scheduler DSP ne dispatche jamais le correlateur. On
+         * REJOUE ici exactement ce que ferait l'ORM 0xa539, mais SEULEMENT quand l'ARM
+         * a effectivement commande le go-live (d[0x0810] bit15, pose par le wire
+         * CTRLSYS) : causalite correcte ARM->DSP, bon bit (0x0800, PAS 0xC000), OR (pas
+         * d'overwrite des autres bits scheduler). Gate CALYPSO_GOLIVE_TASKW, defaut OFF.
+         * 0x0810 est deja gere par le wire CTRLSYS (arm2dsp) -> plus de FORCE_0810. */
         if (exec_pc >= 0xa4ca && exec_pc <= 0xa575) {
-            static int f3 = -1; static uint16_t f3v = 0;
-            if (f3 < 0) { const char *e = getenv("CALYPSO_FORCE_3F92");
-                if (e && *e) { unsigned long v = strtoul(e, NULL, 0);
-                               f3v = (v <= 1) ? 0xC000 : (uint16_t)v; f3 = 1; } else f3 = 0; }
-            if (f3) s->data[0x3f92] = f3v;
-
-            static int f8 = -1; static uint16_t f8v = 0;
-            if (f8 < 0) { const char *e = getenv("CALYPSO_FORCE_0810");
-                if (e && *e) { unsigned long v = strtoul(e, NULL, 0);
-                               f8v = (v <= 1) ? 0xC000 : (uint16_t)v; f8 = 1; } else f8 = 0; }
-            if (f8) s->data[0x0810] |= f8v;
-
-            static unsigned flg = 0;
-            if ((f3 || f8) && flg++ < 8)
-                fprintf(stderr, "[c54x] FORCE-GATE @0x%04x d[3f92]=0x%04x data[0810]=0x%04x insn=%u\n",
-                        exec_pc, s->data[0x3f92], s->data[0x0810], s->insn_count);
+            static int gt = -1;
+            if (gt < 0) { const char *e = getenv("CALYPSO_GOLIVE_TASKW");
+                          gt = (e && *e == '1') ? 1 : 0; }
+            if (gt && (s->data[0x0810] & 0x8000)) {
+                s->data[0x3f92] |= 0x0800;   /* rejoue ORM #0x0800 @0xa539 */
+                static unsigned glg = 0;
+                if (glg++ < 8)
+                    fprintf(stderr, "[c54x] GO-LIVE-TASKW @0x%04x d[3f92]=0x%04x "
+                            "(ORM 0xa539 rejoue, ARM 0810 bit15 set) insn=%u\n",
+                            exec_pc, s->data[0x3f92], s->insn_count);
+            }
         }
         /* SM-TRACE (gated CALYPSO_SM_TRACE) : trace instruction-par-instruction
          * l'etat-machine handshake 0xdde0-0xde9f (route reclear 0xde8b vs setter
