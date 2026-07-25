@@ -2328,6 +2328,23 @@ static void stkw_rec(C54xState *s, uint16_t addr, uint16_t val)
 
 static void data_write(C54xState *s, uint16_t addr, uint16_t val)
 {
+    /* [2026-07-25] WATCH-0810 (gated CALYPSO_WATCH_0810) : trace toute ecriture
+     * DSP-side a data[0x0810] (d_ctrl_system / B_TASK_ABORT bit15) avec le PC
+     * auteur. Complete ARM-WRITE-0810 (cote trx). Ensemble : QUI repose bit15
+     * apres le clear ARM ? (self-clear DSP @0xa549 attendu ; le wire CTRLSYS
+     * ecrit s->data[] directement, hors data_write -> invisible ici = c'est LUI
+     * le re-setter s'il n'apparait pas). Cap 200. */
+    if (addr == 0x0810) {
+        static int w810 = -1;
+        if (w810 < 0) w810 = getenv("CALYPSO_WATCH_0810") ? 1 : 0;
+        if (w810) {
+            static unsigned n810 = 0;
+            if (n810++ < 200)
+                fprintf(stderr, "[c54x] WATCH-0810 DSP-write data[0x0810]=0x%04x "
+                        "(was 0x%04x) PC=0x%04x insn=%u\n",
+                        val, s->data[0x0810], s->pc, s->insn_count);
+        }
+    }
     /* [2026-07-25] RANK1b FIX (workflow overlay, context-safe) : le prologue ISR
      * overlay 0x013b fait POPD *(0x3fcd) = depile l'adresse de retour HW 0x72d5
      * dans data[0x3fcd], puis 23 PSHM (sauvegarde contexte), puis PSHD *(0x3fcd)
@@ -4331,11 +4348,42 @@ static bool c54x_cond_true(C54xState *s, uint8_t cc)
  * IFR bit latched while INTM=1 is never taken later. Real C54x re-checks pending
  * unmasked interrupts at each instruction boundary. This restores that, so an
  * armed frame IT (INT3/bit3) fires once INTM drops -> native frame ISR runs. */
+/* === Frame-IT LEVEL hold + PRIO (2026-07-25) ============================
+ * La frame-IT (bit12/vec28, scheduler 0x7234 -> kernel FB) est posee en EDGE par
+ * c54x_interrupt_ex a chaque trame. Mesure : INTM=1 ~permanent (wait-loop 0xdde6
+ * + sections critiques 0xb52x) -> la fenetre INTM=0 de 5 insns coincide rarement
+ * avec bit12 pendant -> vec28 dispatchee 80x sur ~36000 trames -> kernel FB affame
+ * (AR5 jamais 0x2a00, fb0_att=0). Deux correctifs GATES :
+ *  - LEVEL : maintenir bit12 asserte dans l IFR jusqu a ce que vec28 VECTORISE
+ *            (re-assert chaque insn), pour que la prochaine transition INTM 1->0
+ *            l attrape a coup sur (= "vectoriser a la transition, sinon garder").
+ *  - PRIO  : quand bit12 ET un bit de priorite plus basse (ex bit5/BRINT0) pendent
+ *            dans la meme fenetre, prendre bit12 (frame) en 1er au lieu du ctz brut,
+ *            sinon BRINT0 vole la fenetre rare et re-masque (INTM=1). */
+static bool g_frame_it_level = false;
+static bool frame_it_level_on(void)
+{
+    static int c = -1;
+    if (c < 0) { const char *e = getenv("CALYPSO_FRAME_IT_LEVEL"); c = (e && *e == '1') ? 1 : 0; }
+    return c;
+}
+static bool frame_it_prio_on(void)
+{
+    static int c = -1;
+    if (c < 0) { const char *e = getenv("CALYPSO_FRAME_IT_PRIO"); c = (e && *e == '1') ? 1 : 0; }
+    return c;
+}
+
 static bool c54x_irq_level_check(C54xState *s)
 {
     static int en = -1;
     if (en < 0) { const char *_d = getenv("CALYPSO_DSP"); en = (getenv("CALYPSO_C54X_IRQ_LEVEL") || (_d && !strcmp(_d, "c54x"))) ? 1 : 0; }  /* natif revive */
     if (!en) return false;
+    /* LEVEL hold : tant que la frame-IT n a pas ete vectorisee (vec28), garder
+     * bit12 pendant dans l IFR -> la prochaine fenetre INTM=0 la prend. */
+    if (g_frame_it_level && frame_it_level_on()) {
+        s->ifr |= (1u << 12);
+    }
     /* [2026-07-22] LEVELCHK-DBG (gated CALYPSO_AR0_DEBUG) : quand IMR!=0 (fenetre
      * armee), pourquoi l'IT frame n'est-elle pas prise ? Tranche INTM vs IPTR vs
      * pend=0. C'est le verrou du mur terminal Frontiere A. */
@@ -4396,6 +4444,11 @@ static bool c54x_irq_level_check(C54xState *s)
     uint16_t pend = (uint16_t)(s->ifr & s->imr);
     if (!pend) return false;
     int b = __builtin_ctz(pend);          /* lowest set bit = highest priority */
+    /* PRIO : la frame (bit12/vec28) prime sur les bits plus bas (BRINT0 bit5) qui
+     * voleraient la fenetre rare et re-masqueraient INTM. Gate CALYPSO_FRAME_IT_PRIO. */
+    if (frame_it_prio_on() && (pend & (1u << 12))) {
+        b = 12;
+    }
     int vec = b + 16;                     /* C54x: maskable IMR bit b -> vector b+16 */
     /* VEC28 remap (comme c54x_interrupt_ex/VEC28-EXP) : la frame IT tape sur
      * vec19/bit3 = stub RETE ; le VRAI scheduler frame est vec28 (data[0xf0]->0x7234).
@@ -4406,6 +4459,7 @@ static bool c54x_irq_level_check(C54xState *s)
         if (lv28 && b == 3) vec = 28;
     }
     s->ifr &= ~(1u << b);
+    if (b == 12) g_frame_it_level = false;   /* frame-IT vectorisee -> relache le LEVEL hold */
     s->sp--; data_write(s, s->sp, (uint16_t)s->pc);
     /* [2026-07-22] FIX DRIFT SP (racine du storm bootstub) : pousser XPC SEULEMENT
      * en mode etendu (xpc!=0). Le firmware sort l ISR via POPM ST1 + RCD (pop 1w=PC),
@@ -15247,6 +15301,7 @@ void c54x_interrupt_ex(C54xState *s, int vec, int imr_bit)
         }
     }
     s->ifr |= (1 << imr_bit);
+    if (imr_bit == 12 && frame_it_level_on()) g_frame_it_level = true;  /* arme le LEVEL hold frame */
 
     /* SONDE INT3-RATE (2026-06-24 diag sur-delivrance) : chaque dispatch INT3
      * (vec 19 = FRAME) avec le delta insn depuis le precedent. delta ~130 =
@@ -15349,6 +15404,22 @@ void c54x_interrupt_ex(C54xState *s, int vec, int imr_bit)
          * mauvais contexte → over-pop SP → DP garbage → self-CALA 0x70c3.
          * IFR reste set (non clearé) → l'IT est servie au prochain appel,
          * delay_slots étant retombé à 0 (max ~2 insns plus tard). */
+        /* FRAME-IT PRIO (gated CALYPSO_FRAME_IT_PRIO) : si la frame-IT (bit12/vec28)
+         * est latchee ET demasquee mais qu on s apprete a servir une IT de priorite
+         * plus basse (ex BRINT0 vec21, sur-livree par le BSP a chaque burst -> noie
+         * la frame), servir la FRAME d abord sur cette fenetre INTM=0. Le bit de l IT
+         * demandee reste pendant (non cleare, imr_bit ecrase) -> servie au prochain
+         * edge. Draine la frame-IT affamee (5908x pendante, 1x prise) -> vec28 ->
+         * scheduler 0x7234 -> dispatcher -> kernel FB. */
+        if (vec != 28 && frame_it_prio_on() &&
+            (s->ifr & (1u << 12)) && (s->imr & (1u << 12))) {
+            static unsigned _fp = 0;
+            if (_fp++ < 30)
+                fprintf(stderr, "[c54x] FRAME-IT-PRIO override vec=%d->28 (frame latchee) "
+                        "IFR=0x%04x IMR=0x%04x PC=0x%04x insn=%u\n",
+                        vec, s->ifr, s->imr, s->pc, s->insn_count);
+            vec = 28; imr_bit = 12;
+        }
         s->ifr &= ~(1 << imr_bit);
         s->sp--;
         data_write(s, s->sp, (uint16_t)s->pc);
