@@ -13262,6 +13262,32 @@ int c54x_run(C54xState *s, int n_insns)
                 last = fl;
             }
         }
+
+        /* [2026-07-25] CORR-SETUP (diag user "setup AR/BK a l'entree 0x8d00,
+         * meme patch avec les constantes") : le correlateur 0x8d00 est atteint
+         * (via BSP-DISPATCH-FB) mais SANS le setup que la LUT native 0x8341 pose
+         * juste avant : STM #0x2f22,AR1 / #0x2be4,AR4 / #0x0060,AR5 (desassemble
+         * PROM0 0x8347/0x8349/0x834b). Sans ces pointeurs le MAC boucle a
+         * 0x8e8b/0x8e8c sans conclure. On INJECTE ces constantes a l'entree
+         * 0x8d00. Gate CALYPSO_CORR_SETUP ; override _AR1/_AR4/_AR5. */
+        if (exec_pc == 0x8d00) {
+            static int cs = -1; static uint16_t a1 = 0, a4 = 0, a5 = 0;
+            if (cs < 0) {
+                cs = getenv("CALYPSO_CORR_SETUP") ? 1 : 0;
+                const char *e;
+                a1 = (e = getenv("CALYPSO_CORR_AR1")) && *e ? (uint16_t)strtoul(e,0,0) : 0x2f22;
+                a4 = (e = getenv("CALYPSO_CORR_AR4")) && *e ? (uint16_t)strtoul(e,0,0) : 0x2be4;
+                a5 = (e = getenv("CALYPSO_CORR_AR5")) && *e ? (uint16_t)strtoul(e,0,0) : 0x0060;
+            }
+            if (cs) {
+                s->ar[1] = a1; s->ar[4] = a4; s->ar[5] = a5;
+                static unsigned csn = 0;
+                if (csn++ < 8)
+                    fprintf(stderr, "[c54x] CORR-SETUP @0x8d00 : AR1=0x%04x AR4=0x%04x "
+                            "AR5=0x%04x (setup LUT 0x8341 injecte) insn=%u\n",
+                            a1, a4, a5, s->insn_count);
+            }
+        }
         calypso_arm2dsp_on_dsp_step(s, exec_pc);
 
         /* POKE-A4C7-ONCE (2026-07-03, gated CALYPSO_POKE_A4C7_ONCE, DIAGNOSTIC

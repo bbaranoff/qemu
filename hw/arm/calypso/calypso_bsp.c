@@ -1050,6 +1050,35 @@ void calypso_bsp_rx_burst(uint8_t tn, uint32_t fn,
         if (bsp.dsp->idle) bsp.dsp->idle = false;
       } }
 
+    /* [2026-07-25] TEST RANK3 (WF1 boot->correlator) : le handler FB-det 0x8d00
+     * n'est JAMAIS installe dans un slot de dispatch -> le BACC/CALA calcule
+     * resout toujours vers le stub 0xab38 (le go-live arm 0xa4c7 sinon), et la
+     * LUT native 0x8341 qui l'installerait est inatteignable (0x7234 deraille
+     * vers l'overlay 0x013b via d_dsp_page garbage). Ici on INSTALLE 0x8d00
+     * dans les slots de dispatch POUR LA TRAME du burst FB/SB (mission-gate,
+     * dynamique par burst -- PAS un pin statique) + on leve IMR bit9 (route
+     * scheduler 0x7234->0x8341). Au prochain BACC(0xb40f)/CALA(0xb01e) le DSP
+     * tombe dans le correlateur. Gate CALYPSO_BSP_DISPATCH_FB (defaut OFF). */
+    { static int _di = -1; static uint16_t _tgt = 0;
+      if (_di < 0) { _di = getenv("CALYPSO_BSP_DISPATCH_FB") ? 1 : 0;
+        const char *_t = getenv("CALYPSO_BSP_DISPATCH_FB_TGT");
+        _tgt = (_t && *_t) ? (uint16_t)strtoul(_t, NULL, 0) : 0x8d00; } /* REVERT :
+        * cible = 0x8d00 (le correlateur atteint + calcule, 306k COEFFS-WR). Le
+        * detour par 0x8341 a ete retire. Override CALYPSO_BSP_DISPATCH_FB_TGT. */
+      uint16_t _md2 = calypso_dsp_shunt_get_task_md();
+      int _fb2 = (_md2 == 5 || _md2 == 6 || _md2 == 8 || _md2 == 9);
+      if (_di && _fb2 && bsp.dsp && bsp.dsp->running) {
+        bsp.dsp->data[0x43c0] = _tgt;   /* slot terminal BACC 0xb40f (etait 0xa4c7 go-live) */
+        bsp.dsp->data[0x4387] = _tgt;   /* slot idle/CALA 0xb01e (etait stub 0xab38) */
+        bsp.dsp->data[0x43d8] = _tgt;   /* slot reseed (etait stub 0xab38) */
+        bsp.dsp->imr |= 0x0200;         /* bit9 : route frame scheduler */
+        static unsigned _dl = 0;
+        if (_dl++ < 8)
+            fprintf(stderr, "[c54x] BSP-DISPATCH-FB : install 0x%04x (LUT setup FB) "
+                    "-> slots 0x43c0/0x4387/0x43d8 + IMR|=bit9 (task_md=%u fn=%u) insn=%u\n",
+                    _tgt, _md2, (unsigned)fn, bsp.dsp->insn_count);
+      } }
+
     int n = n_int16 < (int)bsp.daram_len ? n_int16 : (int)bsp.daram_len;
 
     /* Load samples into BSP serial port buffer (PORTR PA=0x0034).
