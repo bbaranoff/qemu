@@ -29,6 +29,7 @@ arm_ss.add(when: 'CONFIG_CALYPSO', if_true: [
     'calypso_debug.c',
     'calypso_dsp_shunt.c',
     'calypso_dsp_helper.c',
+    'calypso_invariants.c',
   ),
   osmocoding,
 ])

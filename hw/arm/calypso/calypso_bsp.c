@@ -31,6 +31,7 @@
 #include "hw/arm/calypso/calypso_bsp.h"
 #include "hw/arm/calypso/calypso_c54x.h"
 #include "hw/arm/calypso/calypso_iota.h"
+#include "hw/arm/calypso/calypso_invariants.h"
 #include "hw/arm/calypso/calypso_twl3025.h"
 #include "hw/arm/calypso/calypso_trx.h"
 #include "calypso_tint0.h"  /* GSM_HYPERFRAME */
@@ -797,6 +798,7 @@ static size_t bsp_replay_load(const char *path)
 void calypso_bsp_init(C54xState *dsp)
 {
     bsp.dsp = dsp;
+    calypso_manifest_once();   /* dump forcages actifs (gate CALYPSO_INVARIANTS, defaut off) */
     /* 2026-05-28 : ancien commentaire "DSP reads I/Q at 0x3fb3-0x3fbe"
      * obsolete. Discovery par CALYPSO_BSP_INJECT_CANARY a confirme que
      * le vrai buffer cote DSP est 0x2a00 (PC=0x93a5 consumer, AR3 post-inc
