@@ -4491,6 +4491,25 @@ static int c54x_exec_one(C54xState *s)
         return 1;   /* per-instruction IRQ vectoring consumed this step */
     }
     uint16_t op = prog_fetch(s, s->pc);
+    /* [2026-07-25] CORR-FLOW (gated CALYPSO_CORR_FLOW) : trace FACTUELLE du flux du
+     * handler FB en banc0 (0x8d00..0xa200, XPC=0) — PC/opcode BRUT + flags ST0(TC,C)
+     * + A + AR0/AR4/AR5. Permet de VERIFIER nous-memes (contre SPRU172) OU/POURQUOI le
+     * flux quitte le kernel MAC 0xa076 (lit 0x2a00). Marque 0xa076/0x9a80. Cap 8000. */
+    {
+        static int cf = -1; static unsigned cfn = 0;
+        if (cf < 0) cf = getenv("CALYPSO_CORR_FLOW") ? 1 : 0;
+        if (cf && s->xpc == 0 && s->pc >= 0x8d00 && s->pc <= 0xa200 && cfn < 8000) {
+            cfn++;
+            const char *mk = (s->pc==0xa076) ? " <<<KERNEL-a076"
+                           : (s->pc==0x9a80) ? " <<<KERNEL-9a80"
+                           : (s->pc==0x8d00) ? " [handler-entry]" : "";
+            fprintf(stderr, "[c54x] CORR-FLOW PC=0x%04x op=%04x TC=%d C=%d "
+                    "A=0x%010llx AR0=%04x AR4=%04x AR5=%04x%s insn=%u\n",
+                    s->pc, op, !!(s->st0 & ST0_TC), !!(s->st0 & ST0_C),
+                    (unsigned long long)(s->a & 0xFFFFFFFFFFULL),
+                    s->ar[0], s->ar[4], s->ar[5], mk, s->insn_count);
+        }
+    }
     uint16_t op2;
     bool ind;
     uint16_t addr;
@@ -6834,6 +6853,20 @@ static int c54x_exec_one(C54xState *s)
                 int64_t acc_signed = (s->a & 0x8000000000LL)
                                      ? (s->a | ~0xFFFFFFFFFFLL) : s->a;
                 bool take = false;
+                /* [2026-07-25] §4-G FIX (gated CALYPSO_C54X_FIX_BC, def OFF) : decode
+                 * BC 0xF8 par le VRAI champ cond 8-bit (c54x_cond_true, ISA-fidele)
+                 * au lieu de l heuristique ACC dialectale. F820=cc0x20(NTC),
+                 * F830=cc0x30(TC). Corrige le flux du handler FB (branches 0x9062-
+                 * 0x90f0) qui n atteint jamais le kernel MAC 0xa076. Gate OFF car le
+                 * fix strict a casse 2x avant (TC/BITF) -> valider via chaine de tests. */
+                {
+                    static int fixbc = -1;
+                    if (fixbc < 0) fixbc = getenv("CALYPSO_C54X_FIX_BC") ? 1 : 0;
+                    if (fixbc) {
+                        if (c54x_cond_true(s, op & 0xFF)) { s->pc = op2; return 0; }
+                        return consumed + s->lk_used;
+                    }
+                }
                 /* FIX 2026-06-23 (deblocage bacc bootloader) : F820=bc ntc /
                  * F830=bc tc (SPRU172C cc=0x20 NTC, 0x30 TC). L'ancienne
                  * heuristique ACC (take=A!=0) gelait le poll @0xb427 (bc ntc

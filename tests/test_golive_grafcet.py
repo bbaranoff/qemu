@@ -103,13 +103,13 @@ GRAFCET = [
     ("S80", "FB0_SEARCH lancé (real DSP path)", r"FB0_SEARCH .real DSP", "CALYPSO_FORCE_DEMOD_BRIDGE", True),
     # --- LE MUR : dispatch du corrélateur --------------------------------
     ("S90", "IT frame BRINT0 pending (IFR bit5)", r"IFR=0x1020|SYNC-DISPATCH-PROBE.*BRINT0", "-", True),
-    ("S91", "BRINT0 bloqué par INTM=1 (STAYS-PENDING)", r"STAYS-PENDING", "CALYPSO_INTM_TRANS", True),
+    ("S91", "frame-IT prise via vec28 (INTM levé, FRAME-IT-PRIO)", r"FRAME-IT-PRIO override vec=21->28|vec28=1", "CALYPSO_FRAME_IT_PRIO", True),
     ("S92", "boucle rejet go-live a53c->a575 (TC=0)", r"a53f.BC a575 if NTC. TC=0", "-", True),
     # --- Goals encore NON atteints (détecteurs de progrès) ---------------
     ("G1", "corrélateur 0x8d00 ENTRÉ", r"PC=0x8d00|pc=0x8d00|CORRELATOR-TRACE", "CALYPSO_CORRELATOR_TRACE", False),
     ("G2", "FB tenté (fb0_att>0)", r"fb0_att=[1-9]", "-", False),
     ("G3", "d_fb_det DÉTECTÉ (!=0)", r"d_fb_det.*=.*0x0*[1-9a-f]|rx_fb_det=1", "-", False),
-    ("G4", "IT servie (RETE depuis ISR)", r"\bRETE\b.*served|DISPATCHED", "-", False),
+    ("G4", "IT frame servie via vec28 (FRAME-IT-PRIO)", r"FRAME-IT-PRIO override vec=21->28|IMR-ARM.*vec28=1", "CALYPSO_FRAME_IT_PRIO", True),
 ]
 
 
@@ -143,14 +143,24 @@ def test_goal_not_yet(reached, gid, label):
     if reached[gid] > 0:
         pytest.fail(f"🎯 PROGRÈS: {gid} '{label}' ATTEINT ({reached[gid]} hits) — "
                     f"le mur corrélateur est tombé, mettre à jour le grafcet !")
-    pytest.xfail(f"mur attendu: {gid} '{label}' pas encore atteint (corrélateur non dispatché)")
+    reasons = {
+        "G1": "handler 0x8d00 installé/dispatché mais kernel FB 0xa076 jamais atteint",
+        "G2": "fb0_att reste 0 : kernel FB 0xa076 jamais exécuté",
+        "G3": "d_fb_det=0 : kernel FB 0xa076 jamais atteint (aucune détection FB)",
+    }
+    pytest.xfail(reasons.get(gid,
+                 f"mur attendu: {gid} '{label}' pas encore atteint (kernel FB 0xa076 non atteint)"))
 
 
-def test_wall_is_correlator_dispatch(reached):
-    """Invariant de diagnostic : go-live franchi (FB0_SEARCH) MAIS corrélateur non entré."""
+def test_wall_is_correlator_dispatch(reached, loglines):
+    """Invariant de diagnostic : le handler corrélateur FB 0x8d00 est installé/dispatché
+    MAIS le kernel FB 0xa076 n'est jamais exécuté (nouveau mur ; INTM levé, vec28 servi)."""
     assert reached["S80"] > 0, "FB0_SEARCH devrait tourner (go-live débloqué)"
-    assert reached["G1"] == 0, "0x8d00 ne devrait pas être atteint (mur BRINT0/INTM)"
-    assert reached["S91"] > 0, "le blocage BRINT0/INTM=1 (STAYS-PENDING) devrait être visible"
+    assert _count(loglines, r"install 0x8d00|BSP-DISPATCH-FB") > 0, \
+        "le handler corrélateur 0x8d00 devrait être installé/dispatché (INTM levé)"
+    assert _count(loglines, r"0xa076|pc=0xa076|PC=0xa076|FB-KERNEL") == 0, \
+        "le kernel FB 0xa076 ne devrait PAS être atteint (mur aval du corrélateur)"
+    assert reached["G2"] == 0, "fb0_att devrait rester 0 (kernel FB 0xa076 jamais exécuté)"
 
 
 # ---------------------------------------------------------------------------
