@@ -496,6 +496,40 @@ static void shunt_route_to_c54x_run(void)
 static double g_rx_raw_hz = 0.0;
 static int    g_rx_raw_valid = 0;
 
+/* [DECAN PM 2026-07-26] rxlev a_pm depuis la VRAIE magnitude MAV (last_pm) au lieu
+ * de la cible -60 figee : rf_dbm = 20*log10(last_pm/MAV_REF)+RF_REF, puis apm_for_rf
+ * (modele trf6151). Ancrage MAV_REF->RF_REF (def 20929->-60 = niveau courant) faute
+ * de reference hardware ; la valeur SUIT desormais le signal reel (fading/niveau).
+ * Gate CALYPSO_DECAN_PM (ou master CALYPSO_DECAN). OFF -> apm_for_rf(fallback). */
+static uint16_t shunt_pm_decan_apm(int fallback_target)
+{
+    static int dc = -1;
+    static double mav_ref = 20929.0, rf_ref = -60.0;
+    if (dc < 0) {
+        /* PM sous le master DECAN (LU accept valide avec PM decan en shunt_legit
+         * 2026-07-26) : plancher -75 + seuil last_pm>1000 gardent le camp. */
+        const char *M = getenv("CALYPSO_DECAN");
+        const char *p = getenv("CALYPSO_DECAN_PM");
+        dc = ((M && M[0] == '1') || (p && p[0] == '1')) ? 1 : 0;
+        const char *mr = getenv("CALYPSO_DECAN_PM_MAV_REF"); if (mr && *mr) mav_ref = atof(mr);
+        const char *rr = getenv("CALYPSO_DECAN_PM_RF_REF");  if (rr && *rr) rf_ref = atof(rr);
+        if (mav_ref < 1.0) mav_ref = 1.0;
+    }
+    /* [fix bootstrap 2026-07-26] seuil + plancher : a l'acquisition last_pm peut
+     * etre transitoirement infime -> rf -> -inf -> apm=0 -> rxlev=-138 -> cell
+     * rejetee -> NO_CELL_FOUND -> JAMAIS de camp (chicken-egg : il faut camper
+     * pour avoir un bon last_pm). En dessous du seuil -> fallback -60 (campable) ;
+     * au-dessus -> de-can borne a [-85,-40] dBm (suit le MAV sans jamais rejeter). */
+    if (dc && g_shunt.last_pm > 1000) {
+        double rf = 20.0 * log10((double)g_shunt.last_pm / mav_ref) + rf_ref;
+        if (rf < -75.0) rf = -75.0;
+        if (rf > -40.0) rf = -40.0;
+        int rfi = (int)(rf >= 0 ? rf + 0.5 : rf - 0.5);
+        return calypso_trf6151_apm_for_rf(rfi);
+    }
+    return calypso_trf6151_apm_for_rf(fallback_target);
+}
+
 void calypso_dsp_shunt_on_frame_tick(void)
 {
     if (!g_shunt.active)
@@ -589,7 +623,7 @@ void calypso_dsp_shunt_on_frame_tick(void)
                         if (t && *t) target = atoi(t);
                     }
                     if (trf) {
-                        uint16_t apm = calypso_trf6151_apm_for_rf(target);
+                        uint16_t apm = shunt_pm_decan_apm(target);
                         ar[0x30] = apm; ar[0x31] = apm; ar[0x32] = apm;  /* read page 0 */
                         ar[0x44] = apm; ar[0x45] = apm; ar[0x46] = apm;  /* read page 1 */
                     }
@@ -610,7 +644,15 @@ void calypso_dsp_shunt_on_frame_tick(void)
              * dispatch_allc presente le UA/IMM-ASSIGN dans data[0x9D2] sur son bloc,
              * et l'ecriture SI chaque tick le clobbait -> SABM jamais confirme (T3211
              * retry). En mode dedie le mobile ne lit pas le BCCH -> SI inutile ici. */
-            if (g_shunt.si_valid && !g_shunt.sdcch_valid && !g_shunt.agch_valid
+            /* [no-cell-info fix 2026-07-26] SI camp supprime SEULEMENT si un IMM
+             * ASSIGN (mt 0x3f/0x3a/0x3b) est pending sur l'AGCH (fenetre dediee : ne
+             * pas clobber le grant) -- PAS sur le PAGING de routine (0x21/0x22/0x24)
+             * qui tourne en continu en idle et affamait le SI3 (SI3 livre que pendant
+             * l'acquisition -> moniteur famine -> no-cell-info chaque seconde).
+             * agch_buf[2] = mt du dernier AGCH. LU intact (IMM ASSIGN protege). */
+            if (g_shunt.si_valid && !g_shunt.sdcch_valid
+                && !(g_shunt.agch_valid && (g_shunt.agch_buf[2] == 0x3f
+                     || g_shunt.agch_buf[2] == 0x3a || g_shunt.agch_buf[2] == 0x3b))
                 && g_shunt.c54x && g_shunt.c54x->data) {
                 if ((g_shunt.tick_cnt & 7) == 0) {
                     for (int k = 1; k <= 6; k++) {
@@ -656,7 +698,7 @@ void calypso_dsp_shunt_on_frame_tick(void)
                     }
                     uint16_t pm_c  = calypso_trf6151_apm_for_rf(-60);
                     uint16_t toa_v = (dc_toa && g_shunt.sb_valid) ? (uint16_t)g_shunt.rx_toa : 23;
-                    uint16_t pm_v  = dc_pm  ? g_shunt.last_pm            : pm_c;
+                    uint16_t pm_v  = shunt_pm_decan_apm(-60);
                     uint16_t ang_v = dc_ang ? (uint16_t)g_shunt.rx_afc   : 0;
                     uint16_t snr_v = dc_snr ? g_shunt.rx_snr            : 0x7000;
                     /* page 0 */ d[0x830]=toa_v; d[0x831]=pm_v; d[0x832]=ang_v; d[0x833]=snr_v;
@@ -1268,7 +1310,8 @@ bool calypso_dsp_shunt_real_fb_read(uint32_t off, uint16_t *out)
     static int real_fb = -1;
     if (real_fb < 0) {
         const char *e = getenv("CALYPSO_SHUNT_REAL_FB");
-        real_fb = (e && *e == '1') ? 1 : 0;
+        const char *dm = getenv("CALYPSO_DECAN");  /* master DECAN implique REAL_FB */
+        real_fb = ((e && *e == '1') || (dm && dm[0] == '1')) ? 1 : 0;
         /* [2026-07-26] SHUNT_LEGIT implique l'intercept de lecture : c'est LUI
          * qui livre rx_fb_det/rx_snr (detection gr-gsm) a l'ARM. Sans ca, le
          * feed legit n'atteint jamais la lecture ARM. */
@@ -1311,7 +1354,7 @@ void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
      * + dphi sur la vraie RX -> d_fb_det/AFC/SNR/TOA reels (bypass go-live DSP). */
     {
         static int real_fb = -1;
-        if (real_fb < 0) { const char *e = getenv("CALYPSO_SHUNT_REAL_FB"); real_fb = (e && *e == '1') ? 1 : 0; }
+        if (real_fb < 0) { const char *e = getenv("CALYPSO_SHUNT_REAL_FB"); const char *dm = getenv("CALYPSO_DECAN"); real_fb = ((e && *e == '1') || (dm && dm[0] == '1')) ? 1 : 0; }  /* master DECAN implique REAL_FB */
         if (real_fb) {
             int nc = n / 2;
             if (nc >= 8) {
