@@ -47,6 +47,7 @@
 #include "qemu/main-loop.h"
 #include "calypso_dsp_shunt.h"
 #include "hw/arm/calypso/calypso_trf6151.h"
+#include "hw/arm/calypso/calypso_twl3025.h"
 #include "calypso_c54x.h"   /* C54xState + c54x_bsp_load/run/interrupt_ex/wake (CALYPSO_DSP=c54x route) */
 #include "calypso_layer1.h" /* calypso_l1_c_active() : ungate SB/SI (+FB) sous CALYPSO_L1=c */
 #include "hw/arm/calypso/calypso_dsp_internal.h" /* shared state + NDB-write primitives (split) */
@@ -489,6 +490,12 @@ static void shunt_route_to_c54x_run(void)
 }
 
 /* ---- Service hook : called from calypso_trx frame_irq tick ---- */
+/* [AFC loop-close v2] derniere mesure de frequence BRUTE du FCCH (Hz), pour
+ * recalculer rx_afc = brut - freq_deja_compensee_par_DAC a CHAQUE tick (et pas
+ * seulement quand feed_iq/det re-fire, ce qui cesse une fois le DAC enroule). */
+static double g_rx_raw_hz = 0.0;
+static int    g_rx_raw_valid = 0;
+
 void calypso_dsp_shunt_on_frame_tick(void)
 {
     if (!g_shunt.active)
@@ -528,7 +535,31 @@ void calypso_dsp_shunt_on_frame_tick(void)
              * (0x01F0/0x01FA/0x01F4) qui retourne g_shunt.rx_*. On pose ces
              * champs depuis la detection gr-gsm reelle -> l'ARM voit FB found. */
             g_shunt.rx_fb_det = 1;
-            g_shunt.rx_snr    = 0x7000;   /* SNR eleve : gr-gsm a decode = SNR suffisant */
+            /* [AFC loop-close v2 2026-07-26] recalcule rx_afc CHAQUE tick :
+             * brut(FCCH memorise) - freq DEJA compensee par le DAC courant
+             * (get_afc_hz). Sans ca, feed_iq/det gele rx_afc une fois le DAC
+             * enroule -> le firmware enroule au rail sur une valeur stale. Ici
+             * l'erreur effective DECROIT a mesure que le DAC monte -> converge. */
+            if (g_rx_raw_valid) {
+                double _eff = g_rx_raw_hz - calypso_twl3025_get_afc_hz();
+                double _a = _eff * (65536.0 / 86208.0);
+                if (_a >  32767.0) _a =  32767.0;
+                if (_a < -32768.0) _a = -32768.0;
+                g_shunt.rx_afc = (int16_t)_a;
+                static unsigned _afl = 0;
+                if ((_afl++ % 200) == 0)
+                    fprintf(stderr, "[AFC-LOOP] raw=%.0fHz dac_hz=%.0f eff=%.0fHz -> rx_afc=%d\n",
+                            g_rx_raw_hz, calypso_twl3025_get_afc_hz(), _eff, g_shunt.rx_afc);
+            }
+            /* [DECAN model-fidelity] garder le VRAI rx_snr (coherence feed_iq)
+             * quand DECAN_SNR actif, sinon le de-can SNR est defait ici. */
+            static int dsnr = -1;
+            if (dsnr < 0) {
+                const char *Ms = getenv("CALYPSO_DECAN");
+                const char *ss = getenv("CALYPSO_DECAN_SNR");
+                dsnr = ((Ms && Ms[0] == '1') || (ss && ss[0] == '1'));
+            }
+            if (!dsnr) g_shunt.rx_snr = 0x7000;   /* SNR canne (fallback) */
             g_shunt.rx_toa    = (uint16_t)g_shunt.sb_toa;
             /* [2026-07-26] FORMAT NATIF : ecrire la fenetre api_ram PARTAGEE
              * (c54x->api_ram) EXACTEMENT comme le DSP no-shunt le ferait :
@@ -542,7 +573,7 @@ void calypso_dsp_shunt_on_frame_tick(void)
                 ar[0x08FA - C54X_API_BASE] = (uint16_t)g_shunt.sb_toa; /* a_sync_TOA */
                 ar[0x08FB - C54X_API_BASE] = g_shunt.last_pm;          /* a_sync_PM  */
                 ar[0x08FC - C54X_API_BASE] = (uint16_t)g_shunt.rx_afc; /* a_sync_ANG */
-                ar[0x08FD - C54X_API_BASE] = 0x7000;                   /* a_sync_SNR */
+                ar[0x08FD - C54X_API_BASE] = dsnr ? g_shunt.rx_snr : 0x7000; /* a_sync_SNR (DECAN) */
                 /* [2026-07-26 RANK5] a_pm (rxlev) au format natif : le vrai DSP
                  * ecrit a_pm=0 sur les read pages -> ecrase dispatch_pm. On pose
                  * directement, chaque tick (apres le run DSP), la valeur calibree
@@ -604,9 +635,42 @@ void calypso_dsp_shunt_on_frame_tick(void)
                  * SI casses. On pose D_ANGLE=0 (aucune erreur de freq -> AFC stable),
                  * D_SNR haut (>AFC_SNR_THRESHOLD=2560), D_TOA=23, D_PM = a_pm calibre. */
                 {
-                    uint16_t pm = calypso_trf6151_apm_for_rf(-60);
-                    /* page 0 */ d[0x830]=23; d[0x831]=pm; d[0x832]=0; d[0x833]=0x7000;
-                    /* page 1 */ d[0x844]=23; d[0x845]=pm; d[0x846]=0; d[0x847]=0x7000;
+                    /* [DECAN model-fidelity 2026-07-26] gate par modele (+ master
+                     * CALYPSO_DECAN). OFF par defaut => cannes de stabilisation a
+                     * l'identique (baseline LU-accept intact). ON => vraie sortie du
+                     * modele emule (feed_iq / trf6151 / gr-gsm) pour verifier s'il
+                     * tient le camp. rx_snr/rx_afc exigent CALYPSO_SHUNT_REAL_FB=1
+                     * (sinon rx_snr reste 0x7000 canne et rx_afc reste 0). */
+                    static int dc_toa = -1, dc_pm, dc_snr, dc_ang;
+                    if (dc_toa < 0) {
+                        const char *M = getenv("CALYPSO_DECAN");
+                        int m = (M && M[0] == '1');
+                        const char *t = getenv("CALYPSO_DECAN_TOA");
+                        const char *p = getenv("CALYPSO_DECAN_PM");
+                        const char *s = getenv("CALYPSO_DECAN_SNR");
+                        const char *a = getenv("CALYPSO_DECAN_ANGLE");
+                        dc_toa = m || (t && t[0] == '1');
+                        dc_pm  = m || (p && p[0] == '1');
+                        dc_snr = m || (s && s[0] == '1');
+                        dc_ang = m || (a && a[0] == '1');
+                    }
+                    uint16_t pm_c  = calypso_trf6151_apm_for_rf(-60);
+                    uint16_t toa_v = (dc_toa && g_shunt.sb_valid) ? (uint16_t)g_shunt.rx_toa : 23;
+                    uint16_t pm_v  = dc_pm  ? g_shunt.last_pm            : pm_c;
+                    uint16_t ang_v = dc_ang ? (uint16_t)g_shunt.rx_afc   : 0;
+                    uint16_t snr_v = dc_snr ? g_shunt.rx_snr            : 0x7000;
+                    /* page 0 */ d[0x830]=toa_v; d[0x831]=pm_v; d[0x832]=ang_v; d[0x833]=snr_v;
+                    /* page 1 */ d[0x844]=toa_v; d[0x845]=pm_v; d[0x846]=ang_v; d[0x847]=snr_v;
+                    {
+                        static unsigned _dcl = 0;
+                        if ((dc_toa || dc_pm || dc_snr || dc_ang) && _dcl++ < 24)
+                            fprintf(stderr, "[DECAN] wrote toa=%u(c23) pm=%u(c%u) ang=%d(c0) "
+                                    "snr=0x%x(c0x7000) | model: sb_valid=%d rx_toa=%u last_pm=%u "
+                                    "rx_afc=%d rx_snr=0x%x\n",
+                                    toa_v, pm_v, pm_c, (int16_t)ang_v, snr_v,
+                                    g_shunt.sb_valid, g_shunt.rx_toa, g_shunt.last_pm,
+                                    g_shunt.rx_afc, g_shunt.rx_snr);
+                    }
                 }
                 static unsigned _acd = 0;
                 if (_acd++ < 12)
@@ -1260,15 +1324,50 @@ void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
                 }
                 double coh = (den > 0) ? sqrt(ar*ar + ai*ai) / den : 0;
                 double dphi = atan2(ai, ar);
-                double e1 = fabs(dphi - M_PI/2.0), e8 = fabs(dphi - M_PI/8.0);
-                double best = (e1 < e8) ? M_PI/2.0 : M_PI/8.0;
-                /* [2026-07-22] SERRE : seule la VRAIE FCCH (dphi ~ pi/2 @1SPS ou
-                 * pi/8 @4SPS, coherence tres haute) -> det=1 UNIQUEMENT sur la frame
-                 * FCCH (sinon l'ARM ne peut pas etablir le timing multiframe). */
-                int det = (coh > 0.95) && ((e1 < 0.10) || (e8 < 0.05));
+                /* [DECAN/AFC-fix v2 2026-07-26] IQ @4 SPS (CONSTAT empirique : le
+                 * burst le plus coherent, coh~0.9995, sort dphi~=0.39=pi/8, PAS
+                 * pi/2). A 4 SPS le ton FCCH +fc/4 = +22.5deg = +pi/8 par sample ;
+                 * fs = 4*270833 = 1083333. Nominal FIXE pi/8 (mon pi/2 v1 -> residu
+                 * geant -> Angle=-32kHz hors capture -> FCCH jamais lock). */
+                double resid = dphi - M_PI/8.0;          /* residu de phase/sample (rad) */
+                if (resid >  M_PI) resid -= 2.0*M_PI;
+                if (resid < -M_PI) resid += 2.0*M_PI;
+                /* det = VRAI FCCH : ton pur (coh haute) ET proche du nominal (dans
+                 * la fenetre de capture FB0 +/-20kHz -> |resid|<0.13). On ne met a
+                 * jour l'AFC/SNR QUE sur le FCCH : feed_iq tourne sur CHAQUE burst,
+                 * et un burst DATA a un dphi aleatoire (ex coh=0.96/dphi=0.062, pas
+                 * le FCCH) qu'on injectait avant comme garbage -> AFC divergeait. */
+                int det = (coh > 0.95) && (fabs(resid) < 0.13);
                 g_shunt.rx_fb_det = det;
-                g_shunt.rx_snr    = (uint16_t)(coh * (double)0x7000);
-                g_shunt.rx_afc    = (int16_t)((dphi - best) * 2000.0);
+                if (det) {
+                    /* ANGLE fidele : Df_Hz = resid*fs/(2pi), fs=1083333 ;
+                     * angle = Df*65536/86208 = resid*131072. BTS cale => residu~0
+                     * => angle~0 => AFC converge (ANGLE=0 canne, mais MESURE). */
+                    /* [AFC loop-close 2026-07-26] FERME la boucle : le firmware
+                     * afc_correct enroule d_afc ; le modele twl3025 en deduit la
+                     * frequence DEJA compensee (get_afc_hz) -> on la SOUSTRAIT de la
+                     * mesure brute. Sans ca la mesure reste ~constante et le DAC
+                     * s'enroule sans fin (-700 -> -1800...). Avec, l'erreur effective
+                     * -> 0 => convergence (gain~1, init -700). fs=1083333 (4 SPS). */
+                    double raw_hz = resid * (1083333.0 / (2.0 * M_PI));
+                    g_rx_raw_hz = raw_hz; g_rx_raw_valid = 1; /* memo pour recompute per-tick */
+                    double eff_hz = raw_hz - calypso_twl3025_get_afc_hz();
+                    double a = eff_hz * (65536.0 / 86208.0);
+                    if (a >  32767.0) a =  32767.0;
+                    if (a < -32768.0) a = -32768.0;
+                    g_shunt.rx_afc = (int16_t)a;
+                    /* SNR fx6.10 (word=snr_dB*1024, seuil 2560=2.5dB) depuis M=coh^2. */
+                    double M = coh * coh;
+                    if (M > 0.9999) M = 0.9999;
+                    double snr_db = 10.0 * log10(M / (1.0 - M));
+                    if (snr_db < 0.0)  snr_db = 0.0;
+                    if (snr_db > 30.0) snr_db = 30.0;
+                    int w = (int)(snr_db * 1024.0);
+                    if (w > 0x7FFF) w = 0x7FFF;
+                    g_shunt.rx_snr = (uint16_t)w;
+                }
+                /* det=0 (burst non-FCCH) : on GARDE le dernier rx_afc/rx_snr lockes
+                 * (pas de garbage data). */
                 g_shunt.rx_toa    = 23;
                 /* [2026-07-22] Ecrit d_fb_det+sync dans le NDB PAR FRAME (comme le vrai
                  * DSP qui tourne 12 frames apres 1 dispatch) -> l'ARM lit 1 sur chaque
