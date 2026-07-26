@@ -569,6 +569,44 @@ void calypso_dsp_shunt_on_frame_tick(void)
              * -> l'ARM decode BSIC reel + FN au lieu de BSIC=0/vide. */
             shunt_dispatch_sb(0);
             shunt_dispatch_sb(1);
+            /* [2026-07-26 camp] SI -> a_cd sur le VRAI array data[] (le firmware lit
+             * dsp->data via calypso_trx.c:213, PAS dsp_ram ou vont les shunt_write_w).
+             * a_cd @ NDB_A_CD=0x1FC -> data word 0x9D2 (a_cd[0]), SI3 en a_cd[3]=0x9D5.
+             * Rotation SI1/2/3/4 toutes les 8 ticks (stable sur un bloc de 4 bursts)
+             * -> le mobile collecte tout le set au fil des blocs. Packing = m[i]|(m[i+1]<<8). */
+            if (g_shunt.si_valid && g_shunt.c54x && g_shunt.c54x->data) {
+                if ((g_shunt.tick_cnt & 7) == 0) {
+                    for (int k = 1; k <= 6; k++) {
+                        int si = (g_shunt.si_rr + k) % 6;
+                        if (g_shunt.si_set_have[si]) { g_shunt.si_rr = si; break; }
+                    }
+                }
+                const uint8_t *si = g_shunt.si_set[g_shunt.si_rr];
+                uint16_t *d = g_shunt.c54x->data;
+                d[0x9D2] = 0x0000;   /* a_cd[0] FIRE/CRC = pass    */
+                d[0x9D3] = 0x0000;   /* a_cd[1]                    */
+                d[0x9D4] = 0x0000;   /* a_cd[2] num_biterr = 0     */
+                for (int i = 0; i < 23; i += 2) {   /* a_cd[3..14] = data[0x9D5..0x9E0] */
+                    uint8_t lo = si[i], hi = (i + 1 < 23) ? si[i + 1] : 0x2B;
+                    d[0x9D5 + i / 2] = (uint16_t)(lo | (hi << 8));
+                }
+                /* [2026-07-26 camp] a_serv_demod des READ PAGES du NB (words 8..11) :
+                 * read page0 = data[0x830..0x833], page1 = data[0x844..0x847].
+                 * nb_resp lit ces 4 mots par burst pour l'AFC (afc_input) + rx_level.
+                 * Quand BURST_OFS aligne les 4 bursts, ils sont TOUS traites -> sans
+                 * ces valeurs, afc_input(garbage) fait DERIVER l'AFC -> sync perdue ->
+                 * SI casses. On pose D_ANGLE=0 (aucune erreur de freq -> AFC stable),
+                 * D_SNR haut (>AFC_SNR_THRESHOLD=2560), D_TOA=23, D_PM = a_pm calibre. */
+                {
+                    uint16_t pm = calypso_trf6151_apm_for_rf(-60);
+                    /* page 0 */ d[0x830]=23; d[0x831]=pm; d[0x832]=0; d[0x833]=0x7000;
+                    /* page 1 */ d[0x844]=23; d[0x845]=pm; d[0x846]=0; d[0x847]=0x7000;
+                }
+                static unsigned _acd = 0;
+                if (_acd++ < 12)
+                    SHUNT_LOG("CAMP: a_cd<-SI type_slot=%d (data[0x9D2..], firmware read path) tick=%u",
+                              g_shunt.si_rr, g_shunt.tick_cnt);
+            }
             static unsigned _lg = 0;
             if (_lg++ < 12)
                 SHUNT_LOG("SHUNT_LEGIT: detection gr-gsm reelle (fn=%u bsic=%d toa=%d) "
@@ -1450,7 +1488,9 @@ void calypso_dsp_shunt_feed_si(const uint8_t *l2, int len)
     {
         static int fs = -1;
         if (fs < 0) { const char *e = getenv("CALYPSO_SHUNT_FEED_SI");
-                      fs = (e && *e == '1') ? 1 : 0; }  /* [2026-07-23] DEFAUT OFF (natif) */
+                      fs = (e && *e == '1') ? 1 : 0;
+                      if (!fs) { const char *l = getenv("CALYPSO_SHUNT_LEGIT");  /* option3: SI3 gr-gsm -> a_cd */
+                                 fs = (l && *l == '1') ? 1 : 0; } }  /* [2026-07-26] fire aussi sous SHUNT_LEGIT */
         if (!fs) { g_shunt.si_valid = false; return; }
     }
     int n = len < 23 ? len : 23;
@@ -1521,6 +1561,8 @@ void calypso_dsp_shunt_feed_si(const uint8_t *l2, int len)
 
 /* Public getter — gate condition for BSP/TPU DMA into DARAM. */
 bool calypso_dsp_shunt_sb_valid(void) { return g_shunt.sb_valid; }
+bool calypso_dsp_shunt_si_valid(void) { return g_shunt.si_valid; }
+uint16_t calypso_dsp_shunt_burst_d(void) { return shunt_burst_echo(); }  /* d_burst_d gate (OFS/FN) */
 bool calypso_dsp_shunt_active(void)
 {
     return g_shunt.active;

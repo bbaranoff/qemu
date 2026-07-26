@@ -1,130 +1,82 @@
----
-name: STATUS — état courant Calypso QEMU (FBSB)
-description: État du déblocage DSP, dernier root cause résolu, blocker courant
-type: project
----
+# STATUS - Etat reel du projet Calypso QEMU (2026-07-26)
 
-# STATUS — 2026-05-30
+Reference d'adresses : SHUNT_LEGIT_ADDRESS_MAP.md. Voie qui campe = SHUNT_LEGIT
+(option 3, format natif dans data[]). Toute la pile "dsp_revival" concerne la
+voie NATIVE = le portage restant, pas le camp fonctionnel.
 
-## Dernier acquis (RÉSOLU, vérifié) : SP jamais initialisé → wedge 0x70c3
+## Ce qui MARCHE - camp SHUNT_LEGIT complet
 
-**Root cause.** Le dump PROM ne contient pas le **mask-ROM silicon** du Calypso.
-Sur vrai HW il pose SP=0x5AC8 au reset et saute à l'entrée firmware
-PROM0[0x7120] (= `STM #0x5AC8,SP`, vérifié : `prog[0x7120]=0x7718`,
-`prog[0x7121]=0x5ac8`). L'émulateur modélisait ce ROM par un redirect
-`0xff80→0x7120`, **retiré par erreur** en git `c3ec660` (29/05).
+Le mobile CAMPE de bout en bout. gr-gsm decode le downlink ; le shunt reinjecte
+au FORMAT NATIF dans s->dsp->data[] (fait central : data[off/2 + 0x800], confirme
+par 3 sources : le firmware ARM lit via calypso_dsp_read trx.c:237-245).
 
-Sans le redirect : reset `0xff80(FB)→0xb410→CC→0x76f8`, jamais 0x7120, donc
-**SP coincé à 0x1100** (valeur reset, invalide = aire MMR/AR0) → over-pop boot
-(net_words -1→-57, slots pile [0x1100-0x1140] tous vierges) → return corrompu →
-**self-CALA 0x70c3** → spirale (16M pushes, SP erre sur tout le 16-bit) →
-PMST=0x70C4 fuit en **TOA=28868** côté osmocon → FB figé, jamais de lock.
+Chaine par etage :
+- **FB** : d_fb_det force @ DSP 0x08F8 (ARM 0xFFD001F0) ; a_sync_demod TOA/PM/
+  ANGLE/SNR @ 0x08FA-0x08FD (poser ANGLE=rx_afc ou 0, SNR=0x7000 pour eviter drift
+  AFC). a_sync_demod force.
+- **SB** : BSIC=7, a_sch CRC (bit8 @ word 0x96), a_serv_demod P0 @ 0x0830.
+- **rxlev (RANK5)** : modele TRF6151, a_pm P0 @ 0x0834 recalcule vivant a chaque
+  write TSP REG_RX ; apm_for_rf(target) tient le RF cible quel que soit l'AGC ;
+  reset REG_RX 0x9E00 -> gain total 138.
+- **BCCH** : a_cd[0] @ 0x09D2 (SI a a_cd[3] @ 0x09D5) ; intercept d_task_d /
+  d_burst_d.
+- **SI1-4** decodes -> C3 camped normally -> **Location Update lance**.
 
-**Fix.** Redirect restauré dans `calypso_c54x.c` (top `c54x_run`) :
-```c
-if (s->pc == 0xFF80 && s->sp == 0x1100) { s->pc = 0x7120; }
-```
-Gate `SP==0x1100` = cold-reset seul. **Pas un hack rule#1** : modélise du
-hardware réel absent du dump, route vers l'entrée firmware propre qui fait
-elle-même son `STM #0x5AC8,SP`.
+Config firmware confirmee : DSP=36, CHIPSET=12, ANLG_FAM=2 (Iota),
+W_A_DSP_IDLE3=1. Task IDs coherents : FB=5, SB=6, ALLC(CCCH)=24, RACH=10.
+d_dsp_page=0x08D4 (PAS 0x08E2 = d_dsp_state=3), d_ctrl_system=0x0810.
 
-**Résultat vérifié (run) :**
+Briques terminees :
+- **RANK1** (pont ARM->DSP 0x0810 / IMR shadow) - DONE (cote shunt).
+- **RANK4** (recalage FN -552 dans calypso_trx_get_fn, FN calee sur SCH + LOST
+  timer read-driven) - DONE.
+- **RANK5** (TRF6151 / rxlev) - DONE.
 
-| | Avant | Après |
+Infra : ~50 tests observabilite verts, GDB stub OK, injection NDB 19/19, suite
+pytest ~232 tests d'instrumentation.
+
+## EN COURS
+
+- **Validation d_burst_d au run** : design final = WP-mirror per-page
+  (s_wp_burst_d), CALYPSO_SHUNT_BURST_PERCMD=0, retirer BURST_FN / BURST_OFS /
+  BURST_ECHO. A confirmer au run.
+- **RANK2** (fenetre RX BDLENA / BSP) : gate calypso_iota_take_bdl_pulse() jamais
+  appele, livraison DL inconditionnelle (calypso_bsp.c:977-982). En cours.
+
+## BLOQUE - voie native RANK3 (correlateur)
+
+Le correlateur DSP 0x8d00 n'est jamais atteint (0 hit), meme reseau I/Q propre
+livre (tonale +Fs/4 prouvee dans DARAM 0x2a00, span [0x2a00..0x2b28), 296 int16).
+Mur = data[0x3fae] bit8 jamais ecrit ; handler FB boucle sans jamais atteindre
+le kernel 0xa076 / 0x9a80. Details :
+- Prologue 0xf0 -> 0x7234 -> 0x013b -> 0xa4e4 deraille vers overlay 0x013b au lieu
+  de tomber sur 0x8341 (LUT FB qui installerait 0x8d00). grep 0x8341=0, 0x8d00=0.
+- GATE-1 : BITF data[0x0810] bit15 (d_ctrl_system) reste 0.
+- GATE-2 : d[0x3fde] (FB task-pending) epingle a 1.
+- AR3 @0xee38 pointe 0x2b97 (hors buffer), AR5=0xdb7b staged.
+- IMR=0x0000 tout le run (voie native pure) ; contredit par le build live recent
+  (Fix A BGEN : IMR=0x52ed arme) - a reconcilier.
+
+Fixes deja landes SANS effet sur ce mur : DADST/DSADT famille 0x50-0x5F
+(c54x.c:8232-8305), PORTW 0x75 (c54x.c:7501), CC/CCD + SP-catastrophe (poison
+28868 elimine, 3.19M->628M insn).
+
+## NON COMMENCE
+
+- **Location Update complet** : RACH UL -> IMM ASSIGN -> SDCCH -> LU accept.
+  Blocage RACH UL restant.
+- **Portage natif des hacks vers l'ARM** : rendre le go-live natif (ARM ecrit
+  0x098a/0x098c via calypso_arm2dsp.c) pour sortir du shunt ; api_write_cb declare
+  (calypso_c54x.h:204) jamais assigne (grep=0).
+- **Nettoyage code** : env BURST_* mortes, doublons doc archive, code mort
+  (bsp.fb_valid jamais mis a 1, calypso_orch pub/sub inexistant, etc.).
+
+## Table des RANKs
+
+| RANK | Sujet | Statut |
 |---|---|---|
-| SP | spirale 16-bit | STM@0x7120 pose 0x5AC8 (vérifié) → serial-loader grimpe → stable **0x9008** (4B insns, équilibré) |
-| push/pop | 16M / 697 | équilibré (33M/33M) |
-| wedge 0x70c3 | 3700+ IRQ | **0** |
-| IMR | 0x0000 | 0x52fd (INT3 + BRINT0 démasqués) |
-| INT3 frame ISR | jamais (IMR=0) | **fire par-frame** |
-| TOA=28868 / DSP Error figés | chaque frame | **disparus** |
-| L1CTL_FBSB_REQ flags | — | **0x7** (FB0\|FB1\|SB) |
-
-→ Le « dernier bug 0x70c3 » des sessions précédentes est **résolu** (c'était ce
-root SP, pas un over-pop désapparié). Les 37/40 « ORPHAN » du shadow-stack
-étaient des faux positifs (boot-ROM-stub serial-loader, pc=0x0000, légit).
-
-## Blocker COURANT : FB-dispatch (sur base saine)
-
-`d_fb_det` reste **0x0000** → pas de FB lock. Le DSP boote sain mais **idle
-minimal** (0xe9ac / dispatcher 0xcc62). `task=5` est commandé (`ARM TASK WR
-[0x08]=5 ET [0x30]=5` ×491) MAIS :
-
-- DSP **ne lit jamais `d_task_md`** (sonde D_TASK_MD-RD = 0 hit sous ALL).
-- ISR INT3 @0xffcc : `0x0100` (set TC ?) puis **`RC NTC@0xffcd`** (cond 0x20 =
-  return si TC==0) → early-return (duration=1 ×8088 ; duration=3 court ×7893) →
-  **n'atteint jamais** les CALLs (0xf310/0xffc3/0xf307), ni le flag **0x3DC0**
-  (FBDB-PROBE = 0 r/w), ni le gate **data[0x62]** (reste 0).
-- détecteur FB **0x9ac0 = 0 run** (les 42× au boot d'avant = artefact du boot
-  corrompu, pas une vraie détection).
-
-Chaîne jamais atteinte :
-```
-boot sain → idle 0xcc62 → INT3 → ISR 0xffcc → RC NTC (TC=0) → RETE sec
-  → JAMAIS : read d_task_md, test 0x3DC0 bit4, gate data[0x62] → 0x9ac0 → d_fb_det
-```
-
-## Architecture FB-dispatch CLARIFIÉE (2026-05-30 soir, post-falsification boot-init)
-
-Expérience CC-web « FB = queue boot-init » **FALSIFIÉE** : 2 modèles de boot
-(redirect 0x7120 vs SP-set natural 0xb410), boot-init 0x7000-0x7025 inatteignable
-par les deux, FB-dispatch échoue **identiquement** → FB-dispatch = steady-state
-SÉPARÉ (pas la queue de c3ec660). Bonus : over-pop = 100% artefact SP=0x1100
-(F@0x76f8 tourne propre depuis 0x5AC8).
-
-**Artefact consolidé (table vecteurs IRQ + IMR + disasm idle) tranche l'archi :**
-- `0x08d4 = &d_dsp_page` CONFIRMÉ (NDB base ARM 0xFFD001A8 → DSP 0x08D4). Pas un fantôme.
-- **Aucun vecteur IRQ (0xff80+vec*4) ne lit 0x08d4.** Les ISR lisent les flags
-  `0x3dc0/1/2` (vec19 frame→0x3dc1, vec23→0x3dc0, vec24→0x3dc2). → le dispatch
-  d_dsp_page est **FOREGROUND-pollé, PAS IRQ-driven**.
-- Frame-IRQ vec19 (imr bit3) **ARMÉ dans 0x52fd + fire** 8339× → **B (masquage) MOOT**.
-  (0x52fd masque bits 1/8/10/11/13/15 = vec 17/24/26/27/29/31.)
-- Idle 0xe9ac = **bloc MAC ×9** (0xb398, pas un wait passif). 0xf7b2 (reprise RETE)
-  = `RC NTC` (épilogue). Le **dispatcher 0xcc62 TOURNE** (polle data[0x60-0x70]).
-
-**Le gap LOCALISÉ (pas résolu), avec mécanisme probable :** le per-frame existe et
-s'exécute (dispatcher 0xcc62 polle data[0x60-0x70] chaque frame) — donc PAS une
-ré-entrée structurellement absente. C'est le **slot FB de data[0x60-0x70] / flag
-0x3dc0-2 qui n'est JAMAIS set**, donc la branche foreground vers le FB-processing
-(0x7700 lecture page → 0x9ac0) n'est jamais prise.
-
-**Candidat #1 = C (flag-gate non posé par l'ISR frame).** L'ISR frame @0xffcc
-(`0x0100 ; RC NTC@0xffcd ; LD 0x3dc1 ; STL…`) early-return sur TC=0 **AVANT** de
-poser le flag (0x3dc0-2 / data[0x60-0x70]) que la branche foreground attend
-(= pourquoi 0x3dc0/1 jamais touché, FBDB-PROBE=0). Dispatch foreground + flag-gate
-posé par l'ISR sont compatibles : l'ISR pose le flag, le foreground le polle. Le
-early-return TC=0 casse le maillon « ISR pose le flag ».
-
-**Prochaine sonde (invasif) — UNE capture causale chaînée, pas 3 passes** (même
-réflexe que vecteurs+IMR) : un seul run qui chaîne `TC à l'entrée ISR 0xffcc` →
-`corps post-RC@0xffcd (écrit-il le flag 0x3dc0-2 / data[0x60-0x70] ? oui/non)` →
-`poll dispatcher 0xcc62 (le slot FB reste-t-il clair ?)`. On voit le maillon cassé
-dans le run, pas en recoupant après coup.
-**Root à prioriser = décoder `0x0100@0xffcc`** : « pourquoi TC=0 » est la
-question-mère ; le poll-foreground et le poseur-de-flag orbitent autour.
-**⚠️ NON-VÉRIFIÉ à établir, pas supposer** : « 0x7700 = entrée FB-processing » est
-ASSERTÉ (0x7700 touché 1× = incident, load AR-indexé du sweep RPTB), PAS établi.
-La sonde doit CONFIRMER où le dispatcher branche réellement pour la FB — sinon on
-watch le mauvais PC.
-
-## Brief antérieur CC-web (FB est ARM-commandé, ARM L1 prouvé correct)
-Le FB est une tâche commandée par l'ARM (`d_task_md`=5). L'ARM L1 est la couche
-prouvée correcte end-to-end (L1CTL MITM, faute isolée au DSP) → la commande FB
-est probablement émise correctement, le mur est en **aval (DSP/API)**. Entrée
-haute-leverage = « la commande FB arrive-t-elle, et où se perd-elle entre l'ARM
-(bon) et le test TC », PAS du RE générique « pourquoi le DSP idle ». Arbre :
-
-1. **Décoder ce que `0x0100@0xffcc` teste vraiment** → quel prédicat gate le TC
-   (le early-return `RC NTC@0xffcd`).
-2. **Ce prédicat dérive-t-il de `d_task_md` (commande ARM) ?**
-3. Trois issues :
-   - ARM n'émet pas FB → mur state-machine cell-search ARM (contredirait « L1
-     prouvé » → relire ce que le MITM couvrait vraiment).
-   - ARM émet, DSP lit le **mauvais/périmé** buffer → handshake double-buffer.
-     **`d_dsp_page`** (innocenté du wedge DP) redevient suspect n°1 : c'est
-     l'index « quel buffer de commande est courant cette frame ». Réutiliser le
-     RE déjà fait dessus.
-   - ARM émet, DSP lit le bon buffer, TC échoue quand même → test/décode mal
-     évalué (le thème récurrent : instruction de test mal émulée).
-
-cf `BOOT_TO_FBSB_SEQUENCE.md`, `FBSB_SEQUENCE_TRACE.md`, `TODO.md`.
+| RANK1 | Pont ARM->DSP 0x0810 / IMR shadow | DONE (shunt) ; GAP cote natif |
+| RANK2 | Fenetre RX BDLENA (BSP) | EN COURS |
+| RANK3 | Correlateur natif 0x8d00 / data[0x3fae] bit8 | BLOQUE (mur) |
+| RANK4 | Recalage FN -552 + LOST timer | DONE |
+| RANK5 | TRF6151 / rxlev | DONE |

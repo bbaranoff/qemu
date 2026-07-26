@@ -1,3 +1,4 @@
+<!-- Archive depuis /opt/GSM/qemu-src/doc/DSP_ROM_MAP.md, contenu divergent du canonique /opt/GSM/qemu-src/hw/arm/calypso/doc/DSP_ROM_MAP.md, conserve pour reference (unification 2026-07-26) -->
 # Calypso DSP ROM Map
 
 ## ROM Dump Sections

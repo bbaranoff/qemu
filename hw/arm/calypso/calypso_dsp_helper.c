@@ -262,7 +262,7 @@ void shunt_dispatch_sb(uint8_t page_idx)
 
 void shunt_dispatch_allc(uint8_t page_idx)
 {
-    { static int _ginj = -1; if (_ginj < 0) { const char *_e = getenv("CALYPSO_INJECT_ACD"); _ginj = (_e && *_e == '1') ? 1 : 0; } if (!_ginj) return; }  /* [2026-07-23] HACK injection sortie, DEFAUT OFF (natif) ; =CALYPSO_INJECT_ACD=1 pour reactiver */
+    { static int _ginj = -1; if (_ginj < 0) { const char *_e = getenv("CALYPSO_INJECT_ACD"); _ginj = (_e && *_e == '1') ? 1 : 0; if (!_ginj) { const char *_l = getenv("CALYPSO_SHUNT_LEGIT"); _ginj = (_l && *_l == '1') ? 1 : 0; } } if (!_ginj) return; }  /* [2026-07-26] CALYPSO_INJECT_ACD=1 OU SHUNT_LEGIT=1 (option3: SI3->a_cd) */
     /* a_cd layout (cf osmocom-bb prim_rx_nb.c) :
      *   a_cd[0]   = FIRE status bits (B_FIRE0/B_FIRE1) -> 0x0000 = CRC pass
      *   a_cd[1]   = (reserved / BLUD bit)              -> 0x0000

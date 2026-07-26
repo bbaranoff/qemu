@@ -1,3 +1,4 @@
+<!-- Archive depuis /opt/GSM/qemu-src/doc/SERCOMM_GATE_ARCHITECTURE.md, contenu divergent du canonique /opt/GSM/qemu-src/hw/arm/calypso/doc/SERCOMM_GATE_ARCHITECTURE.md, conserve pour reference (unification 2026-07-26) -->
 # Sercomm Gate Architecture — QEMU Calypso
 
 > ⚠️ **PÉRIMÉ (audit doc↔code 2026-07-01, voir [DOC_CODE_AUDIT.md](DOC_CODE_AUDIT.md)).** Ce doc décrit un état/une API qui ne correspond plus au code. Vérité-terrain : d_fb_det reste 0, DSP déraille, IMR=0x0000 jamais ré-armé, api_write_cb jamais câblé, pas de bus ORCH. En conséquence, même quand `calypso_bsp.c` fait `c54x_interrupt_ex(bsp.dsp, 21, 5)` (BRINT0), l'IRQ n'est **jamais délivré** (IMR=0). Deux corrections principales ci-dessous : (a) le chargement BSP + BRINT0 vit dans **`calypso_bsp.c`**, PAS dans `calypso_trx.c::rx_burst()` (qui est un no-op) ; (b) DLCI 4 = **TRXC intercepté** par le gate, PAS `SC_DLCI_DEBUG` non-utilisé.
