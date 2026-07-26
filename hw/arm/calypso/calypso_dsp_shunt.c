@@ -574,7 +574,13 @@ void calypso_dsp_shunt_on_frame_tick(void)
              * a_cd @ NDB_A_CD=0x1FC -> data word 0x9D2 (a_cd[0]), SI3 en a_cd[3]=0x9D5.
              * Rotation SI1/2/3/4 toutes les 8 ticks (stable sur un bloc de 4 bursts)
              * -> le mobile collecte tout le set au fil des blocs. Packing = m[i]|(m[i+1]<<8). */
-            if (g_shunt.si_valid && g_shunt.c54x && g_shunt.c54x->data) {
+            /* [2026-07-26 LU] NE PAS ecraser a_cd avec le SI du camp quand un DL
+             * DEDIE (SDCCH UA/AUTH/LU-ACCEPT, ou AGCH IMM-ASSIGN) est en attente :
+             * dispatch_allc presente le UA/IMM-ASSIGN dans data[0x9D2] sur son bloc,
+             * et l'ecriture SI chaque tick le clobbait -> SABM jamais confirme (T3211
+             * retry). En mode dedie le mobile ne lit pas le BCCH -> SI inutile ici. */
+            if (g_shunt.si_valid && !g_shunt.sdcch_valid && !g_shunt.agch_valid
+                && g_shunt.c54x && g_shunt.c54x->data) {
                 if ((g_shunt.tick_cnt & 7) == 0) {
                     for (int k = 1; k <= 6; k++) {
                         int si = (g_shunt.si_rr + k) % 6;

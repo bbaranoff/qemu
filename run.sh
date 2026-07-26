@@ -1,4 +1,5 @@
 #!/bin/bash
+rm -f /dev/shm/calypso_kc 2>/dev/null || true  # [LU] purge Kc A5/1 perime (SABM UL en clair pour LU fraiche)
 # run.sh -- Calypso QEMU pipeline.
 #
 # Data path : osmo-bts-trx : osmo-trx-ipc : calypso-ipc-device : QEMU BSP

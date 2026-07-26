@@ -1,3 +1,4 @@
+<!-- Archive depuis /opt/GSM/qemu-src/docs/ (pluriel), contenu divergent du canonique, conserve sans perte -->
 # Calypso QEMU — Architecture & Flow
 
 État post-merge orchestrator. Mobile L23 ↔ QEMU baseband ↔ osmo-bts-trx,

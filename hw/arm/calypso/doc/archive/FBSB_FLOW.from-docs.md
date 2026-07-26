@@ -1,3 +1,4 @@
+<!-- Archive depuis /opt/GSM/qemu-src/docs/ (pluriel), contenu divergent du canonique, conserve sans perte -->
 # FBSB flow — exact reference (osmocom-bb prim_fbsb.c)
 
 Source: `prim_fbsb.ref.c` (verbatim copy of `src/target/firmware/layer1/prim_fbsb.c`).

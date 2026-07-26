@@ -1,3 +1,4 @@
+<!-- Archive depuis /opt/GSM/qemu-src/docs/ (pluriel), contenu divergent du canonique, conserve sans perte -->
 # L1CTL socket flow — QEMU ↔ osmocom-bb layer23
 
 Référence: `hw/arm/calypso/l1ctl_sock.c` (QEMU) et

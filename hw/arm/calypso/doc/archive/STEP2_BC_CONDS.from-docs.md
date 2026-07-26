@@ -1,3 +1,4 @@
+<!-- Archive depuis /opt/GSM/qemu-src/docs/ (pluriel), contenu divergent du canonique, conserve sans perte -->
 # Step 2 — BC group 1 conditions
 
 ## Symptôme

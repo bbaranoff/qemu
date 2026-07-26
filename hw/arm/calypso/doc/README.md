@@ -3,6 +3,12 @@
 > Arbre de doc **CANONIQUE** (a cote du code, `hw/arm/calypso/doc/`).
 > L'ancien arbre `qemu-src/doc/` a ete resorbe ici (aucune perte : uniques
 > deplaces, identiques supprimes, divergents archives sous `archive/`).
+>
+> **2026-07-26** : les docs Calypso de `qemu-src/docs/` (PLURIEL) ont ete
+> integres ici a leur tour ; `qemu-src/docs/` = QEMU vanilla pur desormais
+> (arbre sphinx upstream, INTOUCHABLE). 10 docs traites : 9 divergents archives
+> sous `archive/<nom>.from-docs.md` (le canonique `project/` restant la reference,
+> plus riche), 1 identique (`STEP3_F2_F5_STUBS.md`) deduplique. Aucune perte.
 
 ---
 
@@ -110,7 +116,7 @@ PAS vus par le firmware. Details : **[SHUNT_LEGIT_ADDRESS_MAP.md](SHUNT_LEGIT_AD
 | `datasheets/` | PDF TI (SPRU131G/172C/288, SPRA036/618), dumps ROM DSP (3311/3416/3606), `README.md`. |
 | `opcodes/` | Cartes d'opcodes C54x : `tic54x_hi8_map.md`, `0x68_0x6F.md`, `0xF3.md`. |
 | `project/` | Docs projet resorbes (ARCHITECTURE, BRIDGES, FLOW, STATUS dates, TODO_golive, etc.). |
-| `archive/` | Versions divergentes archivees lors de l'unification (`<nom>.from-src-doc.md`) + docs superseded. |
+| `archive/` | Versions divergentes archivees lors de l'unification (`<nom>.from-src-doc.md` depuis `doc/` singulier ; `<nom>.from-docs.md` depuis `docs/` pluriel) + docs superseded. |
 
 ---
 

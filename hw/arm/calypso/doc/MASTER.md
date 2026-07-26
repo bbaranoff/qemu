@@ -27,6 +27,15 @@ reference pour le portage natif restant.
 Reference d'adresses canonique du camp : **SHUNT_LEGIT_ADDRESS_MAP.md** (a citer
 partout).
 
+> **Unification doc 2026-07-26** : les docs Calypso residuels de `qemu-src/docs/`
+> (PLURIEL) ont ete integres dans ce canonique (`hw/arm/calypso/doc/`).
+> `qemu-src/docs/` ne contient plus que le QEMU vanilla (arbre sphinx upstream,
+> intouchable). 9 divergents archives sous `archive/*.from-docs.md`
+> (ARCHITECTURE, BRIDGES, CALL_FLOW, FBSB_FLOW, FLOW, L1CTL_SOCK_FLOW,
+> REACTIVER_DSP_REEL, STEP1_PROM_LOADER, STEP2_BC_CONDS), le canonique `project/`
+> restant la reference plus riche ; STEP3_F2_F5_STUBS deduplique (identique).
+> Le stub `qemu-src/doc/` (singulier) a ete supprime. Aucune perte.
+
 ---
 
 ## INDEX par theme

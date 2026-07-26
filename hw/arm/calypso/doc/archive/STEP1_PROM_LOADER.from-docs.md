@@ -1,3 +1,4 @@
+<!-- Archive depuis /opt/GSM/qemu-src/docs/ (pluriel), contenu divergent du canonique, conserve sans perte -->
 # Step 1 — PROM loader / READA → 0x0000
 
 ## Symptôme

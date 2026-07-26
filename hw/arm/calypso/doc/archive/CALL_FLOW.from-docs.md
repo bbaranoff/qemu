@@ -1,3 +1,4 @@
+<!-- Archive depuis /opt/GSM/qemu-src/docs/ (pluriel), contenu divergent du canonique, conserve sans perte -->
 # Calypso QEMU — Full call flow (2026-04-08)
 
 End-to-end ordering across all layers, top→bottom, for the mobile↔BTS path.

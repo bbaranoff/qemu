@@ -70,6 +70,7 @@ for mode in $MODES; do
     killall -9 qemu-system-arm osmo-bts-trx mobile osmocon osmo-trx-ipc 2>/dev/null || true
     pkill -9 -f calypso-ipc-device 2>/dev/null || true
     pkill -9 -f "bridge\.py" 2>/dev/null || true
+    rm -f /dev/shm/calypso_kc 2>/dev/null || true  # [LU] purge Kc A5/1 perime -> LU fraiche en clair
     sleep 2
 
     # Launch

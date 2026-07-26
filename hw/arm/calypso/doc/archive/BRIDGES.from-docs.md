@@ -1,3 +1,4 @@
+<!-- Archive depuis /opt/GSM/qemu-src/docs/ (pluriel), contenu divergent du canonique, conserve sans perte -->
 # Bridges & Communication Map — Calypso QEMU
 
 État après merge `l1ctl_sock_init` (2026-04-08).

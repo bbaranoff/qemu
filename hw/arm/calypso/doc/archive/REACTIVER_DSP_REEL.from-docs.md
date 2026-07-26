@@ -1,3 +1,4 @@
+<!-- Archive depuis /opt/GSM/qemu-src/docs/ (pluriel), contenu divergent du canonique, conserve sans perte -->
 # Réactiver le vrai DSP C54x (calypso_c54x.c) — au lieu du shunt
 
 > But : faire tourner le **vrai DSP Calypso émulé** (`calypso_c54x.c` exécutant la ROM TI),
