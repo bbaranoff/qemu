@@ -839,32 +839,18 @@ static void calypso_dsp_shunt_feed_agch(const uint8_t *l2, int len)
  * shunt_dispatch_allc le presentera dans a_cd sur le bloc SDCCH/4 SS0
  * (fn%51 in {22-25}) ; le firmware tague alors chan_nr=0x20 -> lapdm_dcch ->
  * UA/AUTH -> L3 (miroir de feed_agch, SANS la sonde req-ref). */
-static void calypso_dsp_shunt_feed_sdcch(const uint8_t *l2, int len, uint32_t fn)
+static void calypso_dsp_shunt_feed_sdcch(const uint8_t *l2, int len)
 {
-    { static int _ginj = -1; if (_ginj < 0) { const char *_e = getenv("CALYPSO_INJECT_SDCCH"); _ginj = (_e && *_e == '1') ? 1 : 0; if (!_ginj) { const char *_l = getenv("CALYPSO_SHUNT_LEGIT"); _ginj = (_l && *_l == '1') ? 1 : 0; } } if (!_ginj) return; }
+    { static int _ginj = -1; if (_ginj < 0) { const char *_e = getenv("CALYPSO_INJECT_SDCCH"); _ginj = (_e && *_e == '1') ? 1 : 0; if (!_ginj) { const char *_l = getenv("CALYPSO_SHUNT_LEGIT"); _ginj = (_l && *_l == '1') ? 1 : 0; } } if (!_ginj) return; }  /* [2026-07-23] HACK injection sortie, DEFAUT OFF (natif) ; =CALYPSO_INJECT_SDCCH=1 pour reactiver */
     if (!l2 || len < 3) return;
-    static int ring_on = -1;
-    if (ring_on < 0) { const char *e = getenv("CALYPSO_SHUNT_SDCCH_RING"); ring_on = (!e || *e != '0') ? 1 : 0; }
     int n = len < 23 ? len : 23;
-    if (!ring_on) {
-        memcpy(g_shunt.sdcch_buf, l2, n);
-        for (int i = n; i < 23; i++) g_shunt.sdcch_buf[i] = 0x2B;
-        g_shunt.sdcch_valid = true; g_shunt.sdcch_tick = g_shunt.tick_cnt;
-        return;
-    }
-    if (fn && fn == g_shunt.sdcch_last_fn) return;
-    g_shunt.sdcch_last_fn = fn;
-    if (g_shunt.sdcch_ring_tail - g_shunt.sdcch_ring_head >= SDCCH_RING_N) {
-        g_shunt.sdcch_ring[g_shunt.sdcch_ring_head % SDCCH_RING_N].used = false;
-        g_shunt.sdcch_ring_head++;
-    }
-    uint32_t idx = g_shunt.sdcch_ring_tail % SDCCH_RING_N;
-    memcpy(g_shunt.sdcch_ring[idx].l2, l2, n);
-    for (int i = n; i < 23; i++) g_shunt.sdcch_ring[idx].l2[i] = 0x2B;
-    g_shunt.sdcch_ring[idx].fn = fn; g_shunt.sdcch_ring[idx].tick = g_shunt.tick_cnt;
-    g_shunt.sdcch_ring[idx].used = true; g_shunt.sdcch_ring_tail++;
+    memcpy(g_shunt.sdcch_buf, l2, n);
+    for (int i = n; i < 23; i++) g_shunt.sdcch_buf[i] = 0x2B;
+
     g_shunt.sdcch_valid = true;
-    SHUNT_LOG("feed_sdcch: ENQUEUE fn=%u c=0x%02x [depth=%u]\n", fn, l2[1], g_shunt.sdcch_ring_tail - g_shunt.sdcch_ring_head);
+    g_shunt.sdcch_tick  = g_shunt.tick_cnt;
+    SHUNT_LOG("feed_sdcch: SDCCH/4 SS0 DL a0=0x%02x c=0x%02x "
+            "-> sdcch_buf (a presenter sur bloc fn%%51 22-25)\n", l2[0], l2[1]);
 }
 
 /* SACCH SS0 DL REELLE : SI5(0x1d)/SI6(0x1e) decodes par grgsm, forwardes par
@@ -944,8 +930,7 @@ static void shunt_gsmtap_read(void *opaque)
             /* (#2) SDCCH/4 SS0 DL (UA/AUTH) -> sdcch_buf (presente sur le bloc
              * SDCCH/4 SS0, fn%51 in {22-25}). LAPDm : aucun filtre message-type
              * (le gate canal = le FN cote si_bridge + le dispatch). */
-            uint32_t sd_fn = ((uint32_t)buf[8] << 24) | ((uint32_t)buf[9] << 16) | ((uint32_t)buf[10] << 8) | (uint32_t)buf[11];
-            calypso_dsp_shunt_feed_sdcch(buf + GSMTAP_HDR_LEN, (int)n - GSMTAP_HDR_LEN, sd_fn);
+            calypso_dsp_shunt_feed_sdcch(buf + GSMTAP_HDR_LEN, (int)n - GSMTAP_HDR_LEN);
         } else if (sub_type == GSMTAP_CHANNEL_SACCH) {
             /* SACCH SS0 DL : SI5/SI6 REELS (si_bridge fn%51 {42-45}) -> sacch_buf
              * REEL (presente fn%51 {42-45}). Remplace la fabrication SI3->SI6. */

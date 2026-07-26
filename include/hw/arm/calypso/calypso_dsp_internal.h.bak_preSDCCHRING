@@ -144,15 +144,9 @@ struct dsp_shunt_state {
     /* SDCCH/4 SS0 DL (#2) : UA/AUTH forwardes par si_bridge (GSMTAP 0x07).
      * Distinct des SI/AGCH ; presente dans a_cd sur le bloc SDCCH/4 SS0
      * (fn%51 in {22-25}) -> firmware tague chan_nr=0x20 -> LAPDm dediee. */
-    /* SDCCH/4 SS0 DL (#2) : FIFO FN-indexee (fix intermittence LU). */
-#define SDCCH_RING_N 32
-    struct { uint8_t l2[23]; uint32_t fn; uint32_t tick; bool used; } sdcch_ring[SDCCH_RING_N];
-    uint32_t   sdcch_ring_head;
-    uint32_t   sdcch_ring_tail;
-    uint32_t   sdcch_last_fn;
     uint8_t    sdcch_buf[23];
     bool       sdcch_valid;
-    uint32_t   sdcch_tick;           /* legacy single-slot */
+    uint32_t   sdcch_tick;           /* tick_cnt a l'arrivee (TTL anti-stale) */
     /* PM REEL (no-hardcode) : magnitude moyenne du dernier burst DL (feed_iq).
      * Remplace le canned 0x7000 / le 0=-110 : le firmware en derive le vrai rxlev. */
     uint16_t   last_pm;
