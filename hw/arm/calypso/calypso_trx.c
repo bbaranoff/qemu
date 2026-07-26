@@ -174,7 +174,16 @@ uint32_t calypso_trx_get_fn(void)
  * page : [0]=write off 0x0002 (wp p0), [1]=off 0x002A (wp p1). resp(b) (prio -4)
  * lit AVANT cmd(b+2) (prio 0) dans la meme trame -> le latch tient le burst
  * courant -> echo 0,1,2,3 exact, sans jitter, sans OFS. */
-static uint16_t s_wp_burst_d[2] = { 0, 0 };
+uint32_t shunt_l1s_fn(void);   /* decl (calypso_dsp_internal.h) */
+/* [2026-07-26 camp] FIFO des burst_id commandes par l'ARM (db_w->d_burst_d) :
+ * push sur write WP (calypso_dsp_write), pop sur lecture d_task_d (1x/nb_resp),
+ * reset au debut de bloc BCCH (gap shunt_l1s_fn). Distingue burst 0 de burst 2
+ * (une latch/parite ne le peut pas) + immunise le double-read (pop 1x/nb_resp,
+ * valeur figee s_burst_cur). Deterministe, sans OFS/FN/ECHO. */
+static uint8_t  s_bd_ring[8];
+static unsigned s_bd_w = 0, s_bd_r = 0;
+static uint16_t s_burst_cur = 0;
+static uint32_t s_bd_last_wfn = 0xFFFFFFFF;
 
 static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
 {
@@ -264,9 +273,9 @@ static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
         static int _cl = -1;
         if (_cl < 0) { const char *l = getenv("CALYPSO_SHUNT_LEGIT"); _cl = (l && *l=='1') ? 1 : 0; }
         if (_cl && calypso_dsp_shunt_si_valid()) {
-            /* d_task_d != 0 -> l1s_nb_resp ne bail pas "EMPTY". AUCUNE horloge
-             * derivee de s->fn : le burst_id vient du latch per-page WP (voir
-             * l'intercept d_burst_d ci-dessous). */
+            /* d_task_d lu 1x/nb_resp (prim_rx_nb.c:77) -> POP le prochain burst_id
+             * du FIFO. Stable pour les 1-2 lectures d_burst_d du meme nb_resp. */
+            s_burst_cur = s_bd_ring[s_bd_r++ & 7u];
             if (val == 0) val = 24;   /* ALLC_DSP_TASK : evite EMPTY */
         }
     }
@@ -289,7 +298,9 @@ static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
             /* r_page = !(burst&1) (verifie runtime : resp(b) lit la read-page de
              * PARITE OPPOSEE au burst) -> lire le latch de parite inverse a l'offset :
              * read 0x0052 (RP0) -> latch[1] ; read 0x007A (RP1) -> latch[0]. */
-            val = s_wp_burst_d[(offset == 0x0052) ? 1 : 0];
+            /* -1 : le reset FIFO se cale sur le 1er cmd du bloc (souvent burst 1,
+             * burst 0=valeur 0), d'ou un offset de phase constant +1 -> on corrige. */
+            val = (uint16_t)((s_burst_cur + 3) & 3);   /* FIFO -1 (phase) */
         }
     }
     if (!real_fb_hit && size == 2) {
@@ -436,11 +447,17 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
     if (offset >= CALYPSO_DSP_SIZE) return;
     /* [2026-07-22] de-alias burst-ID : mirror d_burst_d par commande */
     calypso_dsp_shunt_wp_burst_write((uint32_t)offset, (uint16_t)value);
-    /* [2026-07-26 camp] Latch per-page pour BURST_ECHO=2.
-     * db_w->d_burst_d = word1 : page0 @0x0002 / page1 @0x002A. */
-    if (size == 2) {
-        if ((uint32_t)offset == 0x0002)      s_wp_burst_d[0] = (uint16_t)(value & 3);
-        else if ((uint32_t)offset == 0x002A) s_wp_burst_d[1] = (uint16_t)(value & 3);
+    /* [2026-07-26 camp] PUSH FIFO du burst_id commande (db_w->d_burst_d, word1 :
+     * page0 @0x0002 / page1 @0x002A). Reset au debut d'un bloc BCCH : les cmd0..3
+     * sont a frames L1 CONSECUTIVES (shunt_l1s_fn +1) ; gros trou avant cmd0 du
+     * bloc suivant -> fn != last+1 => reset FIFO -> alignement 0,1,2,3 sans OFS. */
+    if (size == 2 && ((uint32_t)offset == 0x0002 || (uint32_t)offset == 0x002A)) {
+        if (calypso_dsp_shunt_si_valid()) {
+            uint32_t wfn = shunt_l1s_fn();
+            if (wfn != s_bd_last_wfn + 1) { s_bd_w = 0; s_bd_r = 0; }  /* nouveau bloc */
+            s_bd_last_wfn = wfn;
+            s_bd_ring[s_bd_w++ & 7u] = (uint8_t)(value & 3);
+        }
     }
 
     /* [2026-07-22] WR-RAW (ungated, cap 60) : voir TOUS les writes ARM qui
