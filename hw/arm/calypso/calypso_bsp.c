@@ -562,8 +562,11 @@ static void bsp_trxd_readable(void *opaque)
     static int iq_pt_mode = -1;
     if (iq_pt_mode < 0) {
         const char *e = getenv("CALYPSO_BSP_IQ_PASSTHROUGH");
-        iq_pt_mode = (e && *e == '1') ? 1 : 0;
-        BSP_LOG("IQ_PASSTHROUGH=%d", iq_pt_mode);
+        /* [2026-07-25] passthrough par DEFAUT (coherence feed : 0x2a00 = MEME
+         * I/Q que gr-gsm via feed_iq). Synthese cos/sin = tone incoherent ->
+         * opt-out explicite CALYPSO_BSP_IQ_PASSTHROUGH=0 seulement. */
+        iq_pt_mode = (e && *e == '0') ? 0 : 1;
+        BSP_LOG("IQ_PASSTHROUGH=%d (defaut ON ; synthese=opt-out =0)", iq_pt_mode);
     }
     int iq_bytes = (int)n - 8;  /* payload bytes after 8-byte hdr */
     /* Bridge envoie 2 int16 par bit (I,Q interleaved). 4 bytes/bit.
@@ -1446,6 +1449,30 @@ void calypso_bsp_deliver_buffered(uint32_t current_fn)
          * que BSP rate (= GSM 217 Hz wall vs DSP-processed BRINT0). */
         if (bsp.dsp && !(bsp.dsp->ifr & (1 << 5))) {
             c54x_interrupt_ex(bsp.dsp, 21, 5);
+        }
+
+        /* RX-FBFLAGS (gated CALYPSO_RX_FBFLAGS) — GATE DEPUIS LE RX (remplace le
+         * poke c54x CALYPSO_FORCE_3FAE). Sur silicon, l'ISR BRINT0 (0xf310) OR les
+         * bits de handshake FB-det que le handler correlateur poll en boucle :
+         *   data[0x3faa] bit2 (0x0004) + bit8 (0x0100)   @0x886b/0x8885/0x8898
+         *   data[0x3fab] bit8 (0x0100)                   @0x888d
+         *   data[0x3fae] bit8 (0x0100)                   @0x90c8/0x90ed/0x9128
+         * L'ISR emulee ne les pose pas -> le handler boucle 0x90b0-0x9130 sans
+         * jamais atteindre le kernel. On les pose ICI, a la livraison du burst
+         * DARAM 0x2a00 (= "burst pret"), pour que le correlateur deroule. Le
+         * traceur CORR-FLOW dira si un gate SUIVANT apparait. */
+        {
+            static int _fbf = -1;
+            if (_fbf < 0) _fbf = getenv("CALYPSO_RX_FBFLAGS") ? 1 : 0;
+            if (_fbf && bsp.dsp) {
+                bsp.dsp->data[0x3faa] |= 0x0104;   /* bit2 + bit8 */
+                bsp.dsp->data[0x3fab] |= 0x0100;   /* bit8 (cible FBEN) */
+                bsp.dsp->data[0x3fae] |= 0x0100;   /* bit8 (gate confirme 2026-07-25) */
+                static unsigned _fbfn = 0;
+                if (_fbfn++ < 8)
+                    BSP_LOG("RX-FBFLAGS: pose 0x3faa|=0x104 0x3fab|=0x100 0x3fae|=0x100 "
+                            "(handshake FB-det depuis livraison burst)");
+            }
         }
 
         /* RX I/Q tap : si BSP_DUMP_RX_FILE est set, append le burst brut

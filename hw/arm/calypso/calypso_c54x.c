@@ -10,6 +10,8 @@
 #include "calypso_c54x.h"
 #include "calypso_arm2dsp.h"
 #include "hw/arm/calypso/calypso_invariants.h"
+#include "hw/arm/calypso/calypso_dsp_shunt.h"
+#include "hw/arm/calypso/calypso_trf6151.h"
 #include "hw/arm/calypso/calypso_full_pcb.h"  /* daram_lock, api_ram_lock */
 #include <stdio.h>
 #include <stdlib.h>
@@ -1005,6 +1007,9 @@ static void force_intm_oneshot_check(C54xState *s)
 {
     if (g_force_intm_oneshot_enabled < 0) {
         const char *e = getenv("CALYPSO_FORCE_INTM_ONESHOT");
+        /* Gate PROPRE : ON seulement si =1 ; =0 ou unset -> OFF. (NB : ce oneshot
+         * masque le livelock vec28 en clearant INTM 1x ; utile tant que le sur-fire
+         * frame-IT n est pas corrige a la racine BSP.) */
         g_force_intm_oneshot_enabled = (e && *e == '1') ? 1 : 0;
         /* Optional PC gate : si CALYPSO_FORCE_INTM_AT_PC=0xXXXX présent,
          * fire seulement quand PC matche. Permet de départager state-
@@ -2431,6 +2436,40 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
         if (sent < 0) { const char *e = getenv("CALYPSO_FBDET_SENTINEL"); sent = e ? atoi(e) : 0;
             if (sent==1) fprintf(stderr, "[c54x] FBDET-SENTINEL=1 FORCE : data[0x08f8] forcé à 0xDEAD\n");
             else if (sent==2) fprintf(stderr, "[c54x] FBDET-SENTINEL=2 MONITOR : logge la vraie valeur écrite à 0x08f8 (pas de force)\n"); }
+        /* [2026-07-26] SHUNT_LEGIT : override le clobber natif de d_fb_det. Le DSP
+         * natif ecrit 0x08f8=0 (pas de detection, mur RANK3) et ecrase la detection
+         * gr-gsm transportee par le shunt. Quand SHUNT_LEGIT + gr-gsm a decode
+         * (sb_valid), on FORCE la valeur ecrite a 1 -> l ARM lit FB found -> vrai flux. */
+        {
+            static int _lg = -1;
+            if (_lg < 0) { const char *e = getenv("CALYPSO_SHUNT_LEGIT"); _lg = (e && *e=='1') ? 1 : 0; }
+            if (_lg && addr == 0x08f8 && calypso_dsp_shunt_sb_valid()) {
+                val = 1;
+            }
+            /* [2026-07-26 RANK5] force a_pm (rxlev) sur le VRAI array lu par
+             * l'ARM : calypso_trx.c lit s->dsp->data[off/2+0x800], PAS api_ram.
+             * a_pm read page 0 = data[0x830..0x832], page 1 = data[0x844..0x846]
+             * (ARM off 0x60/0x88 -> /2+0x800). Le DSP les ecrit a 0 (pas de vraie
+             * mesure) -> on force la valeur calibree trf6151 -> rxlev stable. */
+            {
+                static int _tp = -1, _tgt = -60;
+                if (_tp < 0) {
+                    const char *d = getenv("CALYPSO_TRF_RXLEV");
+                    const char *l = getenv("CALYPSO_SHUNT_LEGIT");
+                    const char *t = getenv("CALYPSO_TRF_TARGET_RF");
+                    _tp = ((d && *d=='1') || (l && *l=='1')) ? 1 : 0;
+                    if (t && *t) _tgt = atoi(t);
+                }
+                /* DSP 33-36 : db_r = {..d_task_ra(7), a_serv_demod[4](8..11),
+                 * a_pm[3](12..14), a_sch[5](15..19)}. a_pm read page 0 = word 12
+                 * = data[base0x28+12+0x800]=data[0x834..0x836] ; page 1 =
+                 * data[0x3C+12+0x800]=data[0x848..0x84A]. (0x830/0x844 = a_serv_demod!) */
+                if (_tp && ((addr >= 0x0834 && addr <= 0x0836) ||
+                            (addr >= 0x0848 && addr <= 0x084A))) {
+                    val = calypso_trf6151_apm_for_rf(_tgt);
+                }
+            }
+        }
         if (sent && addr == 0x08f8) {
             uint16_t orig = val;
             if (sent == 1) val = 0xDEAD;   /* mode FORCE (test cohérence) */
@@ -4491,6 +4530,34 @@ static int c54x_exec_one(C54xState *s)
         return 1;   /* per-instruction IRQ vectoring consumed this step */
     }
     uint16_t op = prog_fetch(s, s->pc);
+    /* [2026-07-25] TEST-3FAE (gated CALYPSO_FORCE_3FAE) : le handler FB poll
+     * data[0x3fae] bit8 (0x0100) via BITF @0x90c8/0x90ed/0x9128 puis BC TC -> il
+     * attend ce flag "burst pret" que RIEN n ecrit -> boucle infinie, kernel
+     * 0xa076 jamais atteint. On force le flag dans le handler pour confirmer qu il
+     * debloque vers le kernel (=> ensuite wire depuis la chaine RX/BRINT0). */
+    {
+        /* [2026-07-25] CORR-BANK2 (gated) : forcer XPC=2 dans la region corrélateur
+         * -> le handler FB tourne depuis PROM2 (overlay different) au lieu de PROM0.
+         * Test "voir si bank2 debloque". Risque derail (RET/contexte). */
+        static int cbk = -2;
+        if (cbk == -2) { const char *e = getenv("CALYPSO_CORR_BANK");
+                         cbk = (e && *e) ? atoi(e) : -1; }   /* -1=off ; 0..3 = XPC force */
+        if (cbk >= 0 && cbk <= 3 && s->pc >= 0x8d00 && s->pc <= 0xa200 && s->xpc != (uint16_t)cbk) {
+            s->xpc = (uint16_t)cbk;
+        }
+    }
+    {
+        static int f3ae = -1;
+        if (f3ae < 0) f3ae = getenv("CALYPSO_FORCE_3FAE") ? 1 : 0;
+        if (f3ae && s->xpc == 0 && s->pc >= 0x8d00 && s->pc <= 0xa200) {
+            /* TOUTE la handshake FB-det que le handler poll (0x8866 + 0x90xx) :
+             * 0x3faa bit2/bit8, 0x3fab bit8, 0x3fae bit8. Decouple RANK3 du feed
+             * RX mort (RANK2) pour voir si le kernel se debloque. */
+            s->data[0x3faa] |= 0x0104;
+            s->data[0x3fab] |= 0x0100;
+            s->data[0x3fae] |= 0x0100;
+        }
+    }
     /* [2026-07-25] CORR-FLOW (gated CALYPSO_CORR_FLOW) : trace FACTUELLE du flux du
      * handler FB en banc0 (0x8d00..0xa200, XPC=0) — PC/opcode BRUT + flags ST0(TC,C)
      * + A + AR0/AR4/AR5. Permet de VERIFIER nous-memes (contre SPRU172) OU/POURQUOI le
@@ -4498,16 +4565,26 @@ static int c54x_exec_one(C54xState *s)
     {
         static int cf = -1; static unsigned cfn = 0;
         if (cf < 0) cf = getenv("CALYPSO_CORR_FLOW") ? 1 : 0;
-        if (cf && s->xpc == 0 && s->pc >= 0x8d00 && s->pc <= 0xa200 && cfn < 8000) {
+        /* Range ELARGIE : inclut 0x8866 (sous-routine handshake, <0x8d00) + 0xa076.
+         * Trace AUSSI AR3 (ptr CMPS/coeff) et AR1/AR2 pour voir le setup pointeurs. */
+        /* Skip la boucle de copie 0x8866-0x886c (op 8091, ~134x/appel) qui bouffait
+         * tout le budget log -> le cap est reserve au VRAI flux (state-machine +
+         * progression vers 0x93a5). Dedup aussi les PC repetes consecutifs. */
+        static uint16_t cf_lastpc = 0;
+        if (cf && s->xpc == 0 && s->pc >= 0x8600 && s->pc <= 0xa200 && cfn < 20000
+            && !(s->pc >= 0x8866 && s->pc <= 0x886c)
+            && s->pc != cf_lastpc) {
+            cf_lastpc = s->pc;
             cfn++;
             const char *mk = (s->pc==0xa076) ? " <<<KERNEL-a076"
                            : (s->pc==0x9a80) ? " <<<KERNEL-9a80"
-                           : (s->pc==0x8d00) ? " [handler-entry]" : "";
+                           : (s->pc==0x8d00) ? " [handler-entry]"
+                           : (s->pc==0x8866) ? " [subr-8866]"
+                           : (s->ar[5]==0x2a00 || s->ar[3]==0x2a00) ? " <<<PTR=0x2a00!" : "";
             fprintf(stderr, "[c54x] CORR-FLOW PC=0x%04x op=%04x TC=%d C=%d "
-                    "A=0x%010llx AR0=%04x AR4=%04x AR5=%04x%s insn=%u\n",
+                    "AR1=%04x AR2=%04x AR3=%04x AR4=%04x AR5=%04x%s insn=%u\n",
                     s->pc, op, !!(s->st0 & ST0_TC), !!(s->st0 & ST0_C),
-                    (unsigned long long)(s->a & 0xFFFFFFFFFFULL),
-                    s->ar[0], s->ar[4], s->ar[5], mk, s->insn_count);
+                    s->ar[1], s->ar[2], s->ar[3], s->ar[4], s->ar[5], mk, s->insn_count);
         }
     }
     uint16_t op2;
@@ -12831,8 +12908,10 @@ int c54x_run(C54xState *s, int n_insns)
                     bool _in_corr = (_tgt >= CORR_PC_LO && _tgt < CORR_PC_HI);
                     if (_in_corr) {
                         fprintf(stderr, "[c54x] CALA-WIDE *** DANS-CORRELATEUR *** pc=0x%04x op=0x%04x "
-                                "-> target=0x%04x task_md(0804)=%04x d[4357]=%04x insn=%u\n",
-                                exec_pc, _cop, _tgt, s->data[0x0804], s->data[0x4357], s->insn_count);
+                                "-> target=0x%04x task_md p0(0804)=%04x p1(0818)=%04x d_dsp_page(08e2)=%04x "
+                                "d[4357]=%04x insn=%u\n",
+                                exec_pc, _cop, _tgt, s->data[0x0804], s->data[0x0818],
+                                s->data[0x08e2], s->data[0x4357], s->insn_count);
                     } else {
                         static unsigned _ctwn = 0;
                         if (_ctwn++ < 200)
@@ -15452,6 +15531,7 @@ void c54x_interrupt_ex(C54xState *s, int vec, int imr_bit)
                         "IFR=0x%04x IMR=0x%04x PC=0x%04x insn=%u\n",
                         vec, s->ifr, s->imr, s->pc, s->insn_count);
             vec = 28; imr_bit = 12;
+            g_frame_it_level = false;   /* FIX livelock : relache le LEVEL hold (sinon bit12 re-asserte -> vec28 sur-fire 7x/trame -> 139k INTM-TRANS) */
         }
         s->ifr &= ~(1 << imr_bit);
         s->sp--;

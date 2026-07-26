@@ -46,6 +46,7 @@
 #include "sysemu/dma.h"
 #include "qemu/main-loop.h"
 #include "calypso_dsp_shunt.h"
+#include "hw/arm/calypso/calypso_trf6151.h"
 #include "calypso_c54x.h"   /* C54xState + c54x_bsp_load/run/interrupt_ex/wake (CALYPSO_DSP=c54x route) */
 #include "calypso_layer1.h" /* calypso_l1_c_active() : ungate SB/SI (+FB) sous CALYPSO_L1=c */
 #include "hw/arm/calypso/calypso_dsp_internal.h" /* shared state + NDB-write primitives (split) */
@@ -514,6 +515,68 @@ void calypso_dsp_shunt_on_frame_tick(void)
             shunt_route_to_c54x_run();
     }
 
+    /* [2026-07-26] SHUNT_LEGIT (option 3) HORS gate pending : quand gr-gsm a
+     * DETECTE la SCH (sb_valid), transporter la vraie detection vers le DSP
+     * result (d_fb_det=1 + TOA/SNR reels) A CHAQUE trame, independamment du
+     * dispatch natif (qui ne pose jamais d_fb_det -- mur RANK3). L'ARM L1 lit
+     * d_fb_det -> deroule le vrai flux FBSB->SB->BSIC->sysinfo. Thread DSP = safe. */
+    {
+        static int legit = -1;
+        if (legit < 0) { const char *e = getenv("CALYPSO_SHUNT_LEGIT"); legit = (e && *e == '1') ? 1 : 0; }
+        if (legit && g_shunt.c54x && g_shunt.sb_valid) {
+            /* L'ARM lit d_fb_det/snr/toa via calypso_dsp_shunt_real_fb_read
+             * (0x01F0/0x01FA/0x01F4) qui retourne g_shunt.rx_*. On pose ces
+             * champs depuis la detection gr-gsm reelle -> l'ARM voit FB found. */
+            g_shunt.rx_fb_det = 1;
+            g_shunt.rx_snr    = 0x7000;   /* SNR eleve : gr-gsm a decode = SNR suffisant */
+            g_shunt.rx_toa    = (uint16_t)g_shunt.sb_toa;
+            /* [2026-07-26] FORMAT NATIF : ecrire la fenetre api_ram PARTAGEE
+             * (c54x->api_ram) EXACTEMENT comme le DSP no-shunt le ferait :
+             * DSP word W -> api_ram[W - C54X_API_BASE], lu par l'ARM sans intercept.
+             * shunt_dispatch_fb ecrivait BASE_API_NDB+NDB_D_FB_DET => mauvaise
+             * cellule (api_ram[0x550] au lieu de [0xF8]). Ici on pose le VRAI bloc
+             * FB (a_sync_demod) aux offsets natifs, ce que le firmware polle. */
+            if (g_shunt.c54x->api_ram) {
+                uint16_t *ar = g_shunt.c54x->api_ram;
+                ar[0x08F8 - C54X_API_BASE] = 1;                        /* d_fb_det = FOUND */
+                ar[0x08FA - C54X_API_BASE] = (uint16_t)g_shunt.sb_toa; /* a_sync_TOA */
+                ar[0x08FB - C54X_API_BASE] = g_shunt.last_pm;          /* a_sync_PM  */
+                ar[0x08FC - C54X_API_BASE] = (uint16_t)g_shunt.rx_afc; /* a_sync_ANG */
+                ar[0x08FD - C54X_API_BASE] = 0x7000;                   /* a_sync_SNR */
+                /* [2026-07-26 RANK5] a_pm (rxlev) au format natif : le vrai DSP
+                 * ecrit a_pm=0 sur les read pages -> ecrase dispatch_pm. On pose
+                 * directement, chaque tick (apres le run DSP), la valeur calibree
+                 * trf6151 aux offsets read-page exacts (p0 woff 0x30..32, p1 0x44..46)
+                 * lus par l1ddsp_meas_read (dsp_api.db_r->a_pm[i]). */
+                {
+                    static int trf = -1, target = -60;
+                    if (trf < 0) {
+                        const char *d = getenv("CALYPSO_TRF_RXLEV");
+                        const char *l = getenv("CALYPSO_SHUNT_LEGIT");
+                        const char *t = getenv("CALYPSO_TRF_TARGET_RF");
+                        trf = ((d && *d == '1') || (l && *l == '1')) ? 1 : 0;
+                        if (t && *t) target = atoi(t);
+                    }
+                    if (trf) {
+                        uint16_t apm = calypso_trf6151_apm_for_rf(target);
+                        ar[0x30] = apm; ar[0x31] = apm; ar[0x32] = apm;  /* read page 0 */
+                        ar[0x44] = apm; ar[0x45] = apm; ar[0x46] = apm;  /* read page 1 */
+                    }
+                }
+            }
+            shunt_dispatch_fb(0);
+            /* SB : encode le burst SB depuis gr-gsm (BSIC=%d/sb_fn) sur les 2 pages
+             * -> l'ARM decode BSIC reel + FN au lieu de BSIC=0/vide. */
+            shunt_dispatch_sb(0);
+            shunt_dispatch_sb(1);
+            static unsigned _lg = 0;
+            if (_lg++ < 12)
+                SHUNT_LOG("SHUNT_LEGIT: detection gr-gsm reelle (fn=%u bsic=%d toa=%d) "
+                          "-> d_fb_det pose au DSP result (hors pending, MAC court-circuite)",
+                          g_shunt.sb_fn, g_shunt.sb_bsic, (int)g_shunt.sb_toa);
+        }
+    }
+
     if (!g_shunt.pending) {
         return;
     }
@@ -550,7 +613,25 @@ void calypso_dsp_shunt_on_frame_tick(void)
              * produire le resultat (isole le go-live : d_fb_det reste 0 si bloque). */
             static int no_fake_fb = -1;
             if (no_fake_fb < 0) { const char *e = getenv("CALYPSO_SHUNT_NO_FAKE_FB"); no_fake_fb = (e && *e == '1') ? 1 : 0; }
-            if (!no_fake_fb) shunt_dispatch_fb(page);
+            /* [2026-07-26] MODE SHUNT_LEGIT : le MAC natif ne deroule pas (RANK3), mais
+             * gr-gsm DETECTE reellement la SCH. On TRANSPORTE cette vraie detection vers
+             * le DSP result (d_fb_det=1 + TOA/SNR reels) UNIQUEMENT quand sb_valid (=
+             * gr-gsm a decode). Pas de fake : l'ARM L1 deroule alors le VRAI flux
+             * FBSB->SB->BSIC->sysinfo natif, on court-circuite juste l'etage MAC. */
+            static int legit = -1;
+            if (legit < 0) { const char *e = getenv("CALYPSO_SHUNT_LEGIT"); legit = (e && *e == '1') ? 1 : 0; }
+            if (legit) {
+                if (g_shunt.sb_valid) {
+                    shunt_dispatch_fb(page);
+                    static unsigned _lg = 0;
+                    if (_lg++ < 12)
+                        SHUNT_LOG("SHUNT_LEGIT: gr-gsm detecte (sb_fn=%u bsic=%d toa=%d) "
+                                  "-> d_fb_det transporte au DSP result (MAC natif court-circuite)",
+                                  g_shunt.sb_fn, g_shunt.sb_bsic, (int)g_shunt.sb_toa);
+                }
+            } else if (!no_fake_fb) {
+                shunt_dispatch_fb(page);
+            }
         }
         else if (md == SB_DSP_TASK && g_shunt.sb_valid) shunt_dispatch_sb(page);
         if (td == ALLC_DSP_TASK)                        shunt_dispatch_allc(page);
@@ -898,7 +979,7 @@ static void shunt_sch_read(void *opaque)
             int32_t d = (int32_t)((uint32_t)fn - trx_fn);
             static unsigned an = 0;
             if (an++ < 60 || (an % 200) == 0)
-                fprintf(stderr, "[dsp-shunt] FN-ALIGN sch_fn=%u trx_fn=%u "
+                fprintf(stderr, "[feed-daram-dsp] FN-ALIGN sch_fn=%u trx_fn=%u "
                         "delta=%d sch%%51=%u toa=%d\n",
                         (unsigned)fn, trx_fn, d, (unsigned)((uint32_t)fn % 51),
                         (int)g_shunt.sb_toa);
@@ -1065,6 +1146,10 @@ bool calypso_dsp_shunt_real_fb_read(uint32_t off, uint16_t *out)
     if (real_fb < 0) {
         const char *e = getenv("CALYPSO_SHUNT_REAL_FB");
         real_fb = (e && *e == '1') ? 1 : 0;
+        /* [2026-07-26] SHUNT_LEGIT implique l'intercept de lecture : c'est LUI
+         * qui livre rx_fb_det/rx_snr (detection gr-gsm) a l'ARM. Sans ca, le
+         * feed legit n'atteint jamais la lecture ARM. */
+        if (!real_fb) { const char *l = getenv("CALYPSO_SHUNT_LEGIT"); real_fb = (l && *l == '1') ? 1 : 0; }
     }
     if (!real_fb) return false;
     switch (off) {
@@ -1135,7 +1220,7 @@ void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
                  * a_sync_demod TOA=0x08FA PM=0x08FB ANG=0x08FC SNR=0x08FD. */
                 static unsigned _wl = 0;
                 if (_wl++ < 12)
-                    fprintf(stderr, "[shunt] FB-WRITE-DBG det=%d c54x=%p data=%p api=%p\n",
+                    fprintf(stderr, "[feed-daram-dsp] FB-WRITE-DBG det=%d c54x=%p data=%p api=%p\n",
                             det, (void*)g_shunt.c54x,
                             g_shunt.c54x ? (void*)g_shunt.c54x->data : (void*)0,
                             g_shunt.c54x ? (void*)g_shunt.c54x->api_ram : (void*)0);
@@ -1145,7 +1230,7 @@ void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
                  * intra-trame. feed_iq ne fait QUE mettre a jour g_shunt.rx_*. */
                 static unsigned rfl = 0;
                 if (rfl < 20 || (det && rfl < 300)) {
-                    fprintf(stderr, "[shunt] REAL-FB fn=%u nc=%d coh=%.3f dphi=%.3f "
+                    fprintf(stderr, "[feed-daram-dsp] REAL-FB fn=%u nc=%d coh=%.3f dphi=%.3f "
                             "det=%d SNR=0x%04x AFC=%d\n", fn, nc, coh, dphi, det,
                             g_shunt.rx_snr, g_shunt.rx_afc);
                     rfl++;
@@ -1347,10 +1432,10 @@ void calypso_dsp_shunt_wp_burst_write(uint32_t off, uint16_t value)
     shunt_write_w(BASE_API_R_PAGE_1 + RP_D_BURST_D, x);
     { static unsigned n = 0, z = 0;
       if ((value & 3) != 0 && n < 40) { n++;
-        fprintf(stderr, "[shunt] WP-BURST-NONZERO off=0x%04x cmd=%u -> X=%u insn\n",
+        fprintf(stderr, "[feed-daram-dsp] WP-BURST-NONZERO off=0x%04x cmd=%u -> X=%u insn\n",
                 (unsigned)off, value & 3, x); }
       else if ((value & 3) == 0) { z++;
-        if (z % 500 == 1) fprintf(stderr, "[shunt] WP-BURST cmd=0 x%u (aucun non-zero: ARM ne commande QUE burst 0)\n", z); } }
+        if (z % 500 == 1) fprintf(stderr, "[feed-daram-dsp] WP-BURST cmd=0 x%u (aucun non-zero: ARM ne commande QUE burst 0)\n", z); } }
 }
 
 void calypso_dsp_shunt_feed_si(const uint8_t *l2, int len)
@@ -1435,6 +1520,7 @@ void calypso_dsp_shunt_feed_si(const uint8_t *l2, int len)
 }
 
 /* Public getter — gate condition for BSP/TPU DMA into DARAM. */
+bool calypso_dsp_shunt_sb_valid(void) { return g_shunt.sb_valid; }
 bool calypso_dsp_shunt_active(void)
 {
     return g_shunt.active;

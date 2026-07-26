@@ -7,6 +7,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "hw/arm/calypso/calypso_trf6151.h"
 #include "hw/arm/calypso/calypso_dsp_internal.h"
 
 /* CALYPSO_DSP=c54x : route les ordres+I/Q vers le VRAI c54x (pas de mock).
@@ -22,9 +23,9 @@ bool shunt_route_c54x(void)
 }
 
 /* Tag de log : en mode no-shunt/c54x le shunt agit en ASSIST -> ne pas
- * afficher [dsp-shunt] (trompeur). SHUNT_LOG/SHUNT_ERR prefixent le tag runtime. */
+ * afficher [feed-daram-dsp] (trompeur). SHUNT_LOG/SHUNT_ERR prefixent le tag runtime. */
 const char *shunt_tag(void)
-{ return shunt_route_c54x() ? "[dsp/c54x]" : "[dsp-shunt]"; }
+{ return shunt_route_c54x() ? "[dsp/c54x]" : "[feed-daram-dsp]"; }
 
 /* ---- Helpers : read/write API RAM via AddressSpace (16-bit LE) ---- */
 uint16_t shunt_read_w(uint32_t addr)
@@ -198,7 +199,7 @@ void shunt_dispatch_fb(uint8_t page_idx)
 /* ---- DISPATCH : SB writes READ PAGE only ---- */
 void shunt_dispatch_sb(uint8_t page_idx)
 {
-    { static int _ginj = -1; if (_ginj < 0) { const char *_e = getenv("CALYPSO_INJECT_SB"); _ginj = (_e && *_e == '1') ? 1 : 0; } if (!_ginj) return; }  /* [2026-07-23] HACK injection sortie, DEFAUT OFF (natif) ; =CALYPSO_INJECT_SB=1 pour reactiver */
+    { static int _ginj = -1; if (_ginj < 0) { const char *_e = getenv("CALYPSO_INJECT_SB"); _ginj = (_e && *_e == '1') ? 1 : 0; if (!_ginj) { const char *_l = getenv("CALYPSO_SHUNT_LEGIT"); _ginj = (_l && *_l == '1') ? 1 : 0; } } if (!_ginj) return; }  /* [2026-07-23] HACK injection sortie, DEFAUT OFF ; CALYPSO_INJECT_SB=1 OU CALYPSO_SHUNT_LEGIT=1 (option3: ecrit le SB au format db_r read-page natif) */
     uint32_t rp = rp_base(page_idx);
 
     /* gr-gsm (= le DSP) a-t-il poste un vrai SCH (BSIC/FN reels via UDP 4731) ?
@@ -552,10 +553,31 @@ void shunt_dispatch_allc(uint8_t page_idx)
 void shunt_dispatch_pm(uint8_t page_idx)
 {
     uint32_t rp = rp_base(page_idx);
-    static int pm_val = -1;
-    if (pm_val < 0) {
-        const char *e = getenv("CALYPSO_SHUNT_PM");
-        pm_val = (e && *e) ? (int)strtol(e, NULL, 0) : SHUNT_CANNED_PM;
+    int pm_val;
+    {
+        /* [2026-07-26 RANK5] a_pm calibre via le modele trf6151 (gain vivant
+         * suivi par TSP) : a_pm = (rf_cible + system_inherent_gain + trf_gain)*64,
+         * de sorte que le firmware rapporte rf_cible dBm (rxlev fort) quel que
+         * soit le gain que l'AGC programme. CALYPSO_TRF_TARGET_RF (defaut -60).
+         * Legacy : CALYPSO_SHUNT_PM force une valeur brute a_pm (bypass modele). */
+        static int raw = -2;           /* -2 = pas encore lu */
+        if (raw == -2) {
+            const char *e = getenv("CALYPSO_SHUNT_PM");
+            raw = (e && *e) ? (int)strtol(e, NULL, 0) : -1;   /* -1 = utiliser le modele */
+        }
+        if (raw >= 0) {
+            pm_val = raw;
+        } else {
+            static int trf = -1, target = -60;
+            if (trf < 0) {
+                const char *d = getenv("CALYPSO_TRF_RXLEV");
+                const char *t = getenv("CALYPSO_TRF_TARGET_RF");
+                const char *l = getenv("CALYPSO_SHUNT_LEGIT");
+                trf = ((d && *d == '1') || (l && *l == '1')) ? 1 : 0;
+                if (t && *t) target = atoi(t);
+            }
+            pm_val = trf ? calypso_trf6151_apm_for_rf(target) : SHUNT_CANNED_PM;
+        }
     }
     shunt_write_w(rp + RP_A_PM + 0 * 2, (uint16_t)pm_val);
     shunt_write_w(rp + RP_A_PM + 1 * 2, (uint16_t)pm_val);

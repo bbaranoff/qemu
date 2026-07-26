@@ -23,6 +23,7 @@ arm_ss.add(when: 'CONFIG_CALYPSO', if_true: [
     'calypso_tint0.c',
     'calypso_tpu.c',
     'calypso_tsp.c',
+    'calypso_trf6151.c',
     'fw_console.c',
     'calypso_sim.c',
     'calypso_full_pcb.c',
