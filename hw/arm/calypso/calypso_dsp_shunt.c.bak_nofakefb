@@ -776,7 +776,7 @@ void calypso_dsp_shunt_on_frame_tick(void)
              * FBSB->SB->BSIC->sysinfo natif, on court-circuite juste l'etage MAC. */
             static int legit = -1;
             if (legit < 0) { const char *e = getenv("CALYPSO_SHUNT_LEGIT"); legit = (e && *e == '1') ? 1 : 0; }
-            if (legit && !no_fake_fb) {   /* [2026-07-26] NO_FAKE_FB=1 retire le fake FB MEME en shunt_legit (isole le go-live natif) */
+            if (legit) {
                 if (g_shunt.sb_valid) {
                     shunt_dispatch_fb(page);
                     static unsigned _lg = 0;
