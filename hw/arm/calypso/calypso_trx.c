@@ -713,6 +713,18 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
             uint8_t ra = (uint8_t)((value >> 8) & 0xFF);
             calypso_rach_publish(ra, (uint8_t)((value & 0xFF) >> 2), s->fn);
             calypso_dsp_shunt_record_rach(ra);   /* SONDE B : l1s.current_time.fn par RA */
+            /* [2026-07-26 PORT LU] SHUNT_LEGIT avale d_task_ra -> le poll UL natif
+             * ne tire jamais (RACH encode #0). On emet l'access-burst depuis le
+             * signal FIABLE = l'ecriture d_rach. 1 write = 1 burst (pas de sticky). */
+            {
+                static int ulr = -1;
+                if (ulr < 0) {
+                    const char *e = getenv("CALYPSO_UL_RACH_FROM_DRACH");
+                    if (e) ulr = (*e == '1');
+                    else { const char *l = getenv("CALYPSO_SHUNT_LEGIT"); ulr = (l && *l == '1'); }
+                }
+                if (ulr) calypso_bsp_send_rach_ra(ra, (uint8_t)((value & 0xFF) >> 2), s->fn, 0);
+            }
         }
     }
 

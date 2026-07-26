@@ -1730,3 +1730,24 @@ bool calypso_bsp_tx_rach_burst(uint32_t fn, uint8_t bits[148])
     }
     return true;
 }
+
+/* [2026-07-26 PORT LU] Emet un access-burst RACH UL depuis un ra/bsic EXPLICITE
+ * (bypass le read DARAM d_rach). Appele par le hook write-d_rach de calypso_trx.c
+ * sous SHUNT_LEGIT : la tache DSP d_task_ra est avalee par le shunt et
+ * calypso_bsp_tx_rach_burst ne tire jamais. 1 appel = 1 vraie tentative RACH. */
+bool calypso_bsp_send_rach_ra(uint8_t ra, uint8_t bsic, uint32_t fn, uint8_t tn)
+{
+    int forced = rach_force_bsic();
+    if (forced >= 0) bsic = (uint8_t)forced;
+    uint8_t bits[148] = {0};
+    int rc = gsm0503_rach_ext_encode(bits, ra, bsic, false);
+    if (rc < 0) {
+        BSP_LOG("RACH-RA encode fail rc=%d ra=0x%02x bsic=0x%02x", rc, ra, bsic);
+        return false;
+    }
+    static int lg = 0;
+    if (++lg <= 20)
+        BSP_LOG("RACH-RA encode #%d fn=%u ra=0x%02x bsic=0x%02x (hook d_rach)", lg, fn, ra, bsic);
+    calypso_bsp_send_ul(tn, fn, bits);   /* -> 127.0.0.1:5702 -> pont g_bsp_fd */
+    return true;
+}
