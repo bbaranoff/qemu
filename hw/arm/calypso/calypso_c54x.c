@@ -1643,9 +1643,11 @@ static uint16_t data_read(C54xState *s, uint16_t addr)
     if (s->pc >= 0x9f00 && s->pc <= 0x9fb8) {
         static int _r9 = -1;
         if (_r9 < 0) _r9 = getenv("CALYPSO_WATCH_9F00_RD") ? 1 : 0;
-        if (_r9 && !(addr >= 0x2a00 && addr <= 0x2b27)) {
+        if (_r9) {
+            /* Lectures du chemin actif (0x9f00..0x9fb8) SANS exclusion : localise les
+             * cellules SOURCE lues avant le fill workzone 0x2a00 (0x9213/0x9215 IQ ?). */
             static unsigned _n9 = 0;
-            if (_n9++ < 160)
+            if (_n9++ < 200)
                 fprintf(stderr, "[c54x] WATCH-9F00-RD PC=0x%04x reads addr=0x%04x val=0x%04x insn=%u\n",
                         s->pc, addr, s->data[addr], s->insn_count);
         }
@@ -2391,6 +2393,20 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
                 fprintf(stderr, "[c54x] WATCH-2A00 opcode-write data[0x%04x]=0x%04x "
                         "(was 0x%04x) PC=0x%04x s=%p insn=%u\n",
                         addr, val, s->data[addr], s->pc, (void*)s, s->insn_count);
+        }
+    }
+    /* [2026-07-27 golive-mac] WATCH-9200 : les cellules 0x9210-0x9218 / 0x9260-0x9261
+     * sont lues par le demod (0x9fab-0x9fb5) comme source IQ mais restent CONSTANTES
+     * (0xff06/0x04a3) -> workzone 0x2a00 plat. Trace TOUTE ecriture opcode vers cette
+     * region pour voir si qqun l'alimente per-frame (et d'ou). Gate CALYPSO_WATCH_9200. */
+    if ((addr >= 0x9210 && addr <= 0x9220) || (addr >= 0x9260 && addr <= 0x9262)) {
+        static int _w92 = -1;
+        if (_w92 < 0) _w92 = getenv("CALYPSO_WATCH_9200") ? 1 : 0;
+        if (_w92) {
+            static unsigned _n92 = 0;
+            if (_n92++ < 80)
+                fprintf(stderr, "[c54x] WATCH-9200 opcode-write data[0x%04x]=0x%04x (was 0x%04x) PC=0x%04x insn=%u\n",
+                        addr, val, s->data[addr], s->pc, s->insn_count);
         }
     }
     /* [2026-07-26 golive-mac] WATCH-RESULT : trace les ecritures OPCODE vers les

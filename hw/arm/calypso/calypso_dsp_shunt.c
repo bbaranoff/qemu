@@ -1324,28 +1324,6 @@ bool calypso_dsp_shunt_real_fb_read(uint32_t off, uint16_t *out)
         if (!real_fb) { const char *l = getenv("CALYPSO_SHUNT_LEGIT"); real_fb = (l && *l == '1') ? 1 : 0; }
     }
     if (!real_fb) return false;
-    /* [2026-07-26 golive-mac] SHADOW-WIRE (gate CALYPSO_FB_SHADOW_WIRE) : au lieu
-     * de retourner les valeurs host g_shunt.rx_* (gr-gsm/modele), retourne le VRAI
-     * shadow calcule par le correlateur DSP NATIF, lu aux cellules resultat NDB.
-     * Mapping ARM->DSP : data[off/2 + 0x0800] (confirme osmocom : 0x01F0->0x08F8
-     * d_fb_det, 0x01F4/F6/F8/FA -> a_sync_demod[TOA/PM/ANGLE/SNR] 0x08FA..0x08FD).
-     * = le retour DSP->ARM du FBSB, cable sur les adresses shunt_legit. Honnete :
-     * si le DSP n'a rien detecte, l'ARM lit 0 (pas de fake). */
-    {
-        static int _sw = -1;
-        if (_sw < 0) _sw = getenv("CALYPSO_FB_SHADOW_WIRE") ? 1 : 0;
-        if (_sw && g_shunt.c54x && g_shunt.c54x->data &&
-            (off == 0x01F0 || off == 0x01F4 || off == 0x01F6 ||
-             off == 0x01F8 || off == 0x01FA)) {
-            uint16_t v = g_shunt.c54x->data[(off >> 1) + 0x0800];
-            *out = v;
-            static unsigned _swn = 0;
-            if (_swn++ < 40)
-                fprintf(stderr, "[shadow-wire] ARM read off=0x%04x -> DSP data[0x%04x]=0x%04x\n",
-                        off, (unsigned)((off >> 1) + 0x0800), v);
-            return true;
-        }
-    }
     switch (off) {
     case 0x01F0: *out = g_shunt.rx_fb_det ? 1 : 0;    return true; /* d_fb_det */
     case 0x01F4: *out = g_shunt.rx_toa;               return true; /* a_sync TOA */
@@ -1393,6 +1371,11 @@ void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
             if (_decim < 1) _decim = 1;
             const char *f = getenv("CALYPSO_FB_IQ_FCCH_ONLY"); _fcch = (f && atoi(f) > 0) ? 1 : 0;
         }
+        static uint16_t _iqbase = 0;
+        if (_iqbase == 0) {
+            const char *b = getenv("CALYPSO_FB_IQ_BASE");
+            _iqbase = (b && *b) ? (uint16_t)strtol(b, NULL, 0) : 0x2a00;
+        }
         int _p = (int)(fn % 51);
         /* [2026-07-26] FCCH positions {1,11,21,31,41} (offset +1 vs canon 0/10/20/30/40,
          * confirme par FN-ALIGN sch%51=1,21,31,41). */
@@ -1403,7 +1386,7 @@ void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
             /* TEST REACHABILITE : ecrit une RAMPE 0x1000+woff a CHAQUE frame (ignore
              * iq + fcch). Si IQ-READ voit la rampe -> feed_iq atteint bien la vue
              * DARAM du kernel (probleme = contenu iq). Sinon -> mismatch objet/mapping. */
-            uint16_t base = 0x2a00; int dl = 0x128;
+            uint16_t base = _iqbase; int dl = 0x128;
             for (int woff = 0; woff < dl; woff++)
                 g_shunt.c54x->data[base + woff] = (uint16_t)(0x1000 + woff);
             static unsigned _lm = 0;
@@ -1412,7 +1395,7 @@ void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
                         "base[0]=0x%04x base[1]=0x%04x base[2]=0x%04x\n", fn, (void*)g_shunt.c54x,
                         g_shunt.c54x->data[base], g_shunt.c54x->data[base+1], g_shunt.c54x->data[base+2]);
         } else if (_fid && g_shunt.c54x && g_shunt.c54x->data && (!_fcch || _is_fcch)) {
-            uint16_t base = 0x2a00; int dl = 0x128; int woff = 0;
+            uint16_t base = _iqbase; int dl = 0x128; int woff = 0;
             for (int k = 0; 2*(k*_decim)+1 < n && woff < dl; k++) {
                 g_shunt.c54x->data[base + woff++] = (uint16_t)iq[2*(k*_decim)];
                 if (woff < dl)
