@@ -19,6 +19,28 @@ downlink réel et alimente l'API RAM du DSP au format natif.
 
 👉 **[QUICK_START.md](QUICK_START.md)** — build, lancer, modes, vérifications.
 
+## État — TODO / DONE
+
+| # | Objectif | Statut | Détail / preuve |
+|---|---|---|---|
+| 1 | FB/SB (sync) | ✅ DONE | `DISPATCH SB BSIC=7` (gr-gsm réel) |
+| 2 | RXLEV serving | ✅ DONE | `RLA_C -53 dBm`, C1/C2 > 0 |
+| 3 | Camp (C3) | ✅ DONE | `normal service` |
+| 4 | Location Update + registration | ✅ DONE | `LOCATION UPDATING ACCEPT` + `TMSI REALLOC COMPLETE`, `On Network` |
+| 5 | SMS MO | ✅ DONE | passe du 1er coup, `SMS successful` |
+| 6 | SMS MT | ✅ DONE | `SMS from 777` / `SMS from 10002` reçus (bidirectionnel) |
+| 7 | Service tenu post-SMS | ✅ DONE | `MM connection active → MM IDLE, normal service` |
+| 8 | Ctrl-C mobile / re-camp | ✅ DONE | reset L1 câblé (`d_dsp_page=0` API-RAM) |
+| 9 | Union SDCCH SS0-7 (/4 + /8) | ✅ DONE | UA présentée sur toute la région SDCCH → LU quelle que soit la sous-voie |
+| 10 | Reset L1 câblé (`shunt_latch_task`) | ✅ DONE | SI reprend + Ctrl-C recover (`CALYPSO_L1_RESET_WIRE=0` désactive) |
+| 11 | Value-list env (`DSP` / `NO_CANNED`) | ✅ DONE | `CALYPSO_SHUNT_LEGIT=DSP,NO_CANNED` |
+| 12 | FB-STREAM + entrée native `0x9213/0x9215` | ✅ DONE | rampe relue par le démod (prouvé) |
+| 13 | **Voix (TCH/F)** | 🔧 WIP | squelette TCH DL présent (`shunt_dispatch_tch_dl`) ; manque UL FACCH + producteur DL |
+| 14 | SMS MT occasionnel à la trappe | ⬜ TODO | 1 transaction `MMSMS_REL_IND` prématurée résiduelle |
+| 15 | `d_fb_det` natif (corrélateur DSP) | ⬜ TODO | corrélateur = vrai ; entrée inscriptible ; reste completion FBSB + dispatch par-frame |
+
+> Détails : [`QUICK_START.md`](QUICK_START.md) et [`hw/arm/calypso/doc/ETAT_ACTUEL.md`](hw/arm/calypso/doc/ETAT_ACTUEL.md).
+
 ## Documentation
 
 Toute la doc vit sous `hw/arm/calypso/doc/`.

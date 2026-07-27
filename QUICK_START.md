@@ -70,39 +70,44 @@ CALYPSO_NATIVE=1 ./start-direct.sh
 CALYPSO_NATIVE_HELPED=1 ./start-direct.sh
 ```
 
+**Sous-modes (value-list)** — `CALYPSO_SHUNT_LEGIT` et `CALYPSO_SHUNT_NO_LEGIT`
+acceptent une liste de tokens (virgule/espace, casse libre) :
+
+| Valeur | Effet |
+|---|---|
+| `=1` | mode nu |
+| `=DSP` | lance **aussi** le DSP c54x en // (`CALYPSO_DSP_RUN_C54X=1`) |
+| `=NO_CANNED` | mode sans cannes (`CALYPSO_SHUNT_NO_CANNED=1`) |
+| `=DSP,NO_CANNED` | les deux |
+
+```bash
+CALYPSO_SHUNT_LEGIT=DSP,NO_CANNED ./start-direct.sh
+CALYPSO_SHUNT_NO_LEGIT=NO_CANNED ./start-direct.sh
+```
+
 Logs : `/root/qemu.log` (QEMU/DSP), `/root/mobile.log` (mobile Calypso).
 
 ---
 
-## 3. État — ce qui est atteint
+## 3. État — TODO / DONE
 
-### Fonctionnel (chaîne host — base / no-legit)
-| Objectif | État | Preuve |
-|---|---|---|
-| FB/SB (sync) | ✅ | `DISPATCH SB BSIC=7 (gr-gsm REEL)` |
-| RXLEV serving | ✅ | `RLA_C -53 dBm`, C1/C2 > 0 |
-| Camp (C3) | ✅ | `normal service` |
-| **Location Update** | ✅ | `LOCATION UPDATING ACCEPT (lai=001-01-1)` |
-| **MO SMS** | ✅ | `RX SMS RP-ACK` |
-| MT SMS (échange) | ✅ | transaction SDCCH complète, `RP-ACK` reçu |
-| **MT SMS stable** | ⚠️ | échange OK mais re-sync instable après le dédié |
-
-### En cours / non atteint
-| Objectif | État | Verrou identifié |
-|---|---|---|
-| SMS stables (répétés) | ❌ | Go-live pas rejoué sur `L1CTL_RESET_REQ FULL` → re-sync timeout (BGEN one-shot) |
-| Camp maintenu post-dédié | ⚠️ | `no cell info` corrigé (expiry agch) mais re-acquisition FBSB échoue après FULL reset |
-| `d_fb_det` natif | ❌ | Corrélateur DSP = vrai corrélateur ; entrée `0x9213/0x9215` **prouvée inscriptible** (FB-STREAM) ; reste completion FBSB + dispatch par-frame |
-
-### Acquis techniques (buildés)
-| Élément | État |
-|---|---|
-| Entrée FB native `0x9213/0x9215` inscriptible | ✅ prouvé (rampe relue par le démod) |
-| FB-STREAM (feed IQ FCCH → démod) | ✅ |
-| Résolution ELF dynamique (`l1s`/`last_rach`) | ✅ |
-| Fix req-ref SMS (`last_rach`, défaut ON) | ✅ |
-| Expiry agch (fix `no cell info`) | ✅ |
-| Env socle + modes (`:=` overridables CLI) | ✅ |
+| # | Objectif | Statut | Détail / preuve |
+|---|---|---|---|
+| 1 | FB/SB (sync) | ✅ DONE | `DISPATCH SB BSIC=7` (gr-gsm réel) |
+| 2 | RXLEV serving | ✅ DONE | `RLA_C -53 dBm`, C1/C2 > 0 |
+| 3 | Camp (C3) | ✅ DONE | `normal service` |
+| 4 | Location Update + registration | ✅ DONE | `LOCATION UPDATING ACCEPT` + `TMSI REALLOC COMPLETE`, `On Network` |
+| 5 | SMS MO | ✅ DONE | passe du 1er coup, `SMS successful` |
+| 6 | SMS MT | ✅ DONE | `SMS from 777` / `SMS from 10002` reçus (bidirectionnel) |
+| 7 | Service tenu post-SMS | ✅ DONE | `MM connection active → MM IDLE, normal service` |
+| 8 | Ctrl-C mobile / re-camp | ✅ DONE | reset L1 câblé (`d_dsp_page=0` API-RAM) |
+| 9 | Union SDCCH SS0-7 (/4 + /8) | ✅ DONE | UA présentée sur toute la région SDCCH → LU quelle que soit la sous-voie |
+| 10 | Reset L1 câblé (`shunt_latch_task`) | ✅ DONE | SI reprend + Ctrl-C recover (`CALYPSO_L1_RESET_WIRE=0` désactive) |
+| 11 | Value-list env (`DSP` / `NO_CANNED`) | ✅ DONE | `CALYPSO_SHUNT_LEGIT=DSP,NO_CANNED` |
+| 12 | FB-STREAM + entrée native `0x9213/0x9215` | ✅ DONE | rampe relue par le démod (prouvé) |
+| 13 | **Voix (TCH/F)** | 🔧 WIP | squelette TCH DL présent (`shunt_dispatch_tch_dl`) ; manque UL FACCH + producteur DL |
+| 14 | SMS MT occasionnel à la trappe | ⬜ TODO | 1 transaction `MMSMS_REL_IND` prématurée résiduelle |
+| 15 | `d_fb_det` natif (corrélateur DSP) | ⬜ TODO | corrélateur = vrai ; entrée inscriptible ; reste completion FBSB + dispatch par-frame |
 
 ---
 
