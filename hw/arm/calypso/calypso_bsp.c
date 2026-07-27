@@ -47,6 +47,10 @@ static uint32_t d_rach_word_offset(void);
 static int rach_force_bsic(void);
 
 #include "hw/arm/calypso/calypso_debug.h"
+
+/* [2026-07-27] DARAM-FNSTAMP : publiees pour le dump c54x (diag). */
+unsigned calypso_daram_last_fn;
+unsigned calypso_daram_wr_count;
 #define BSP_LOG(fmt, ...) \
     do { if (calypso_debug_enabled("BSP")) \
         fprintf(stderr, "[BSP] " fmt "\n", ##__VA_ARGS__); } while (0)
@@ -1216,13 +1220,26 @@ void calypso_bsp_rx_burst(uint8_t tn, uint32_t fn,
             fprintf(stderr, "[BSP] FB-IQ-DARAM owns 0x2a00 : rx_burst DARAM write SKIP "
                     "(fn=%u tn=%u) -> feed_iq authoritative\n", (unsigned)fn, (unsigned)tn);
     } else {
+        /* [2026-07-27] CALYPSO_BSP_IQ_SHIFT : voir en-tete du patch (instrument). */
+        static int _iqsh = -1;
+        if (_iqsh < 0) {
+            const char *e = getenv("CALYPSO_BSP_IQ_SHIFT");
+            _iqsh = (e && *e) ? atoi(e) : 0;
+            if (_iqsh < 0) _iqsh = 0;
+            if (_iqsh > 12) _iqsh = 12;
+            if (_iqsh) BSP_LOG("IQ_SHIFT=%d (echantillons >>%d avant DARAM : test saturation)", _iqsh, _iqsh);
+        }
         for (int i = 0; i < n; i++) {
             uint16_t a = (uint16_t)(bsp.daram_addr + woff);
-            bsp.dsp->data[a] = (uint16_t)iq[i];
+            bsp.dsp->data[a] = (uint16_t)(int16_t)(_iqsh ? (iq[i] >> _iqsh) : iq[i]);
             bsp_daram_wr_bucket(a);
             woff++;
             if (woff >= bsp.daram_len) woff = 0;
         }
+        /* [2026-07-27] DARAM-FNSTAMP : publie le fn et le nombre d'ecritures
+         * pour que le dump c54x estampille CE QU'IL LIT (voir en-tete patch). */
+        calypso_daram_last_fn = (unsigned)fn;
+        calypso_daram_wr_count++;
     }
     bsp.bursts_written++;
 

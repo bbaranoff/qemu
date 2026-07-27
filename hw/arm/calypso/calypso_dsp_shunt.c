@@ -100,7 +100,13 @@ static void __attribute__((constructor)) shunt_env_value_list(void)
      * de log. Reproductibilite : ce constructeur fait des setenv() AVANT main()
      * -> la config effective differe de celle tapee ; on la trace. */
     {
-        fprintf(stderr, "[calypso-manifest] ===== CALYPSO_* effectives (post value-list) =====\n");
+        /* [2026-07-27] C1 BUILD-STAMP : le 27/07 le binaire vivant a ete rebuilde
+     * PENDANT le run (inode supprime) et des heures ont ete perdues a comparer
+     * des sources disque avec un binaire different. L estampille de compilation
+     * rend la confusion impossible : elle est DANS le binaire qui tourne. */
+    fprintf(stderr, "[calypso-manifest] BUILD-STAMP compile le %s %s\n",
+            __DATE__, __TIME__);
+    fprintf(stderr, "[calypso-manifest] ===== CALYPSO_* effectives (post value-list) =====\n");
         for (char **e = environ; e && *e; e++)
             if (!strncmp(*e, "CALYPSO_", 8))
                 fprintf(stderr, "[calypso-manifest] %s\n", *e);
@@ -1827,6 +1833,12 @@ void calypso_dsp_shunt_feed_fb_result(int found, int16_t toa,
  * recente quel que soit r_page. Gate CALYPSO_SHUNT_BURST_PERCMD (defaut ON). */
 void calypso_dsp_shunt_wp_burst_write(uint32_t off, uint16_t value)
 {
+    /* [2026-07-27] GARDE SHUNT-INACTIF : appele SANS CONDITION depuis
+     * calypso_dsp_write() (calypso_trx.c), y compris en mode NATIF ou le
+     * shunt n est pas arme. Sans cette garde, g_shunt.as == NULL et
+     * shunt_write_w() segfault (backtrace gdb : address_space_write as=0x0).
+     * C est une feature du shunt : hors shunt, elle ne doit rien faire. */
+    if (!g_shunt.active) return;
     static int en = -1;
     if (en < 0) { const char *e = getenv("CALYPSO_SHUNT_BURST_PERCMD");
                   en = (e && *e == '0') ? 0 : 1; }
@@ -2008,10 +2020,14 @@ void calypso_dsp_shunt_set_c54x(C54xState *s)
      * plus (PC persiste) -> le 0x0002 survit -> le 1er wake shunt le consomme ->
      * golive natif (le firmware fait son propre RSBX INTM). Zero FORCE_ : on force
      * le QUAND du boot, aucune valeur de mailbox. One-shot, gate mode revive. */
-    if (s && shunt_route_c54x()) {
+    /* [2026-07-27] DECOUPLE du routage shunt : l ordre de boot du c54x ne
+     * depend pas de CALYPSO_DSP=c54x. Gate sur CALYPSO_DSP_RUN_C54X seul,
+     * sinon le mode natif re-reset le DSP et ecrase la cmd bootloader de
+     * l ARM -> spin eternel a 0xb41c (voir en-tete du patch). */
+    {
         static int rc = -1;
         if (rc < 0) { const char *e = getenv("CALYPSO_DSP_RUN_C54X"); rc = (e && *e == '1') ? 1 : 0; }
-        if (rc) {
+        if (s && rc) {
             uint16_t pc0 = s->pc;
             s->running = true;
             c54x_run(s, 2000);   /* reset(0xff80) -> 0xb419 (pose IDLE) -> park 0xb41c */

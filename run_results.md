@@ -153,8 +153,8 @@ reste 0 (0/55 sur tout le run). Deux faits de plus en sont sortis :
 
 | Fait | Mesure | Fix |
 |---|---|---|
-| feed_iq ne remplissait que **27 %** du buffer | `wrote=80` sur 296 mots | `CALYPSO_BSP_IQ_DECIM=1` → **`wrote=296`** (buffer plein) ✅ |
-| sur-décimage : IQ **déjà à 1 SPS** re-décimée ×4 | `corr_iq.py` : bursts fed `0x2a00` **@1SPS**, N=148 | idem ci-dessus |
+| feed_iq ne remplissait que **27 %** du buffer | `wrote=80` sur 296 mots | ~~`CALYPSO_BSP_IQ_DECIM=1`~~ ❌ **RÉGRESSION** — voir « Mesure de la DESTINATION » ci-dessous |
+| ~~sur-décimage : IQ déjà à 1 SPS~~ | **faux** : la source est à **4 SPS**, la décimation ÷4 est nécessaire | voir ci-dessous |
 
 Avec buffer plein **et** clobber supprimé, `d_fb_det` reste 0 (0/41). **Point de reprise (méthode,
 pas conjecture)** : dumper `data[0x2a00..0x2b28]` en **binaire** pendant le run et le passer dans
@@ -162,9 +162,90 @@ pas conjecture)** : dumper `data[0x2a00..0x2b28]` en **binaire** pendant le run 
 avec l outil déjà validé, au lieu d un jugement à l œil sur 16 paires. Si coh>0.85 ⇒ le problème
 est en aval du buffer ; sinon le remplissage est encore fautif.
 
+### Mesure de la DESTINATION — et deux régressions de ma part (27/07, soir)
+
+Le point de reprise ci-dessus a été exécuté. Il a donné une réponse **et** invalidé deux de mes
+correctifs de la veille. Les deux sont consignés : un appendice qui ne garde que ses succès ne
+vaut rien.
+
+**Instrument.** `CALYPSO_DARAM_DUMP` dumpe `data[0x2a00..0x2b28)` (296 mots) **depuis l intérieur
+de QEMU**, au PC `0x9ac0` (entrée du détecteur), au format IQ16 — donc **atomique**, contrairement
+à une lecture monitor concurrente des écritures DSP. Lu par `tools/corr_iq.py --src ddump`
+(source ajoutée), qui rend un verdict de **conformité kernel** explicite.
+
+| # | Config du remplissage | Contenu mesuré de `data[0x2a00..]` | Verdict |
+|---|---|---|---|
+| D1 | `feed_iq` autoritaire (`FB_IQ_OWNS=1`, `DECIM=1`, `FCCH_ONLY`) | coh 0.964, **dphi +0.210** (+0.13×π/2), 200 records identiques | ❌ **4 SPS** — pas ce que le kernel cherche |
+| D2 | producteur natif rendu (`FB_IQ_OWNS=0`, `DECIM=4`) | coh 0.37–0.51, dphi ±0.14…0.49, **0 FCCH sur 200** | ❌ burst de **données** |
+| réf | ce que le producteur **dépose** (`bursts.cfile` + `iq_rx_*.bin` **frais**) | coh **0.998**, **dphi +1.567** (+1.00×π/2) | ✅ **FCCH @1SPS PROPRE** |
+
+**Preuve du 4 SPS en D1, échantillon par échantillon** — la référence *est* le dump décimé ÷4 :
+
+```
+ddump I : -146  -932  -3381  -8390  -15609  -23132  -28550  -30455  -28403 ...
+réf   I : -146                      -15609                          -28403 ...   = ddump[0::4]
+ddump Q :    0     0      0      0    -146    -932   -3381   -8390  -15877 ...
+réf   Q :    0                          -146                        -15877 ...   = ddump[0::4]
+```
+
+Corroboré par la structure : `Q[n] == I[n-4]` à **55 %** — à 4 SPS un ton Fs/4 tourne de π/8 par
+échantillon, donc la quadrature est à 4 échantillons de distance.
+
+**Deux conclusions antérieures tombent :**
+
+1. **« entrée = DC plat, zéro FCCH » (B2SEQ) est RÉFUTÉ.** Le buffer porte un signal cohérent
+   (`rms 3.2e4`, coh 0.96). La sonde B2SEQ lisait 16 paires à un instant non conditionné.
+2. **« `CALYPSO_BSP_IQ_DECIM=1` = fix ✅ » est RÉFUTÉ — c était une régression.** Je l avais posé
+   pour corriger `wrote=80/296`, sans mesurer la cadence obtenue.
+
+**Les deux réglages fautifs, et pourquoi :**
+
+| Réglage posé | Ce que je croyais corriger | Ce qu il faisait réellement | Statut |
+|---|---|---|---|
+| `CALYPSO_BSP_IQ_DECIM=1` | « buffer à moitié vide » | supprime la décimation ÷4 → `0x2a00` reçoit du **4 SPS** | ❌ annulé (défaut 4) |
+| `CALYPSO_FB_IQ_OWNS=1` | « `feed_iq` a la vraie FCCH » | fait sauter l écriture `rx_burst` (**burst complet, 1 SPS**) au profit de `feed_iq` (`n=320` = **quart de burst @4 SPS**) | ❌ annulé (défaut 0) |
+
+L information qui invalidait les deux était **dans un commentaire du code depuis le 22/07**
+(`calypso_bsp.c:580`) : *« le device envoie 592 I/Q @4SPS (OSR=4). Le corrélateur DSP veut 148
+samples @1SPS. On DÉCIME par CALYPSO_BSP_IQ_DECIM (défaut 4). decim=1 = ancien comportement
+(148 premiers @4SPS = 37 symb, jamais corrélé) »*. Leçon de méthode : **lire le commentaire de la
+ligne qu on override** avant de l overrider.
+
+**Garde-fou posé** (`DARAM-SANITY`, même gate que le dump) : verdict **en run**, qui nomme le
+remède au lieu de laisser le symptôme muet —
+
+```
+[c54x] DARAM-SANITY rec=0 fn=1234 depots_depuis=3 coh=0.964 dphi=+0.210 (+0.13xpi/2)
+       rms=32137 : 4 SPS NON DECIME -> CALYPSO_BSP_IQ_DECIM=4 (et FB_IQ_OWNS=0)
+```
+
+**Anomalie restante, non résolue.** Le producteur est **prouvé correct sur artefacts frais**
+(D2/réf : coh 0.998, dphi +1.567) et dépose bien dans `0x2a00`. Pourtant **aucun** des 200 dumps
+pris à l entrée du détecteur ne contient de FCCH, et **les 200 records sont identiques**. Sur
+~0,45 s (≈100 trames, ≈2 multitrames) on devrait en croiser une dizaine. Deux hypothèses
+mutuellement exclusives, à départager par le `fn` réel et le compteur de dépôts désormais
+estampillés dans chaque record :
+
+- **A — désynchronisation** : le détecteur ne s exécute pas quand le burst FCCH est en mémoire.
+- **B — vue mémoire disjointe** : les écritures `rx_burst` n atteignent pas la mémoire que lit le
+  kernel (les 200 records identiques penchent de ce côté).
+
+**Note d honnêteté sur les artefacts.** La première comparaison s appuyait sur `/tmp/iq_rx_023.bin`
+daté du **24/07** — un artefact périmé de trois jours. Les chiffres « réf » ci-dessus sont ceux du
+**re-run** avec `CALYPSO_IQDUMP=1` après `rm` des anciens fichiers. C est la deuxième fois de la
+soirée qu un artefact périmé faillit fausser une conclusion : **vérifier les mtimes contre l heure
+du run fait désormais partie du protocole.**
+
 ### Reproduire (Run B)
 ```bash
-CALYPSO_NATIVE_HELPED=1 CALYPSO_B2=1 CALYPSO_B2SEQ=1 CALYPSO_B4=1 CALYPSO_B4B=1 CALYPSO_SCAN_08F8=1 ./start-direct.sh
+# mesure de la DESTINATION (recommande) : dump binaire + verdict en run
+rm -f /tmp/iq_rx_*.bin /dev/shm/daram_2a00.cfile /dev/shm/bursts.cfile
+CALYPSO_NATIVE_HELPED=1 CALYPSO_BSP_IQ_DECIM=4 CALYPSO_FB_IQ_OWNS=0 CALYPSO_FB_IQ_DARAM=0 \
+  CALYPSO_DEMOD_NOCLOBBER=1 CALYPSO_DARAM_DUMP=1 CALYPSO_IQDUMP=1 CALYPSO_B4=1 ./start-clean.sh
+grep -m4 "DARAM-SANITY" /root/qemu.log && python3 tools/corr_iq.py --src ddump
+
+# sondes historiques (echantillonnage ponctuel — a lire avec prudence)
+CALYPSO_NATIVE_HELPED=1 CALYPSO_B2=1 CALYPSO_B2SEQ=1 CALYPSO_B4=1 CALYPSO_B4B=1 CALYPSO_SCAN_08F8=1 ./start-clean.sh
 grep -E "B2 @0x9ac0|B2SEQ|B4-DFBDET-WR|B4B-FLOW|SCAN-08F8" /root/qemu.log | head -60
 ```
 Test décisif du signal (dump entrée `0x2a00`) : `grep "B2SEQ" /root/qemu.log | head`.

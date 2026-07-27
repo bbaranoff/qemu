@@ -13,8 +13,11 @@ Sources :
   rxdump : /tmp/iq_rx_*.bin (CALYPSO_IQDUMP) -- bursts FCCH ecrits en DARAM 0x2a00
   bursts : /dev/shm/bursts.cfile (BSP_DUMP_RX_FILE, IQ16) -- idem, avec fn/tn
   daram  : 0x2a00 live via monitor qemu (best-effort, racy)
+  ddump  : /dev/shm/daram_2a00.cfile (CALYPSO_DARAM_DUMP) -- MEME buffer 0x2a00
+           mais dumpe DE L'INTERIEUR de qemu a l'instant ou le detecteur FB le
+           lit : atomique, non-racy. C'est LA mesure de la DESTINATION.
 
-Usage : corr_iq.py [--src auto|shunt|rxdump|bursts|daram] [--fs Hz] [--all]
+Usage : corr_iq.py [--src auto|shunt|rxdump|bursts|daram|ddump|all] [--fs Hz]
 """
 import argparse, os, glob, socket, struct, sys, time
 import numpy as np
@@ -171,11 +174,12 @@ def scan_bursts(recs, fs, label):
 # ---------- main ----------
 def main():
     ap = argparse.ArgumentParser(description="Diag I/Q correlateur DSP")
-    ap.add_argument("--src", choices=["auto", "shunt", "rxdump", "bursts", "daram", "all"], default="auto")
+    ap.add_argument("--src", choices=["auto", "shunt", "rxdump", "bursts", "daram", "ddump", "all"], default="auto")
     ap.add_argument("--shunt", default="/dev/shm/dsp_iq.cfile")
     ap.add_argument("--rxdir", default="/tmp")
     ap.add_argument("--bursts", default="/dev/shm/bursts.cfile")
     ap.add_argument("--mon", default="/tmp/qemu-calypso-mon.sock")
+    ap.add_argument("--ddump", default="/dev/shm/daram_2a00.cfile")
     ap.add_argument("--addr", default="0xFFD04400")
     ap.add_argument("--words", type=int, default=296)   # daram_len = 296 int16 = 148 cplx
     ap.add_argument("--n", type=int, default=40000)
@@ -199,6 +203,30 @@ def main():
             print("bursts: %s absent/vide (BSP_DUMP_RX_FILE=1 + relance, mode direct ok)" % a.bursts); return
         scan_bursts(load_iq16(a.bursts), a.fs or 270833.0, "bursts.cfile (IQ16, fed 0x2a00 @1SPS)")
 
+    def do_ddump():
+        """DESTINATION, non-racy : buffer 0x2a00 dumpe par qemu au moment ou le
+        detecteur FB le lit. Le kernel attend du FCCH @1SPS (dphi = +1.00x pi/2)."""
+        p = a.ddump
+        if not os.path.exists(p) or os.path.getsize(p) < 13:
+            print("ddump: %s absent/vide (CALYPSO_DARAM_DUMP=1 + relance)" % p); return
+        recs = load_iq16(p, maxrec=400)
+        print("\n#### DESTINATION data[0x2a00..0x2b28) -- dump interne qemu (non-racy)")
+        scan_bursts(recs, a.fs or 270833.0, "ddump %s" % p)
+        # verdict de conformite au kernel : il veut du FCCH @1SPS
+        best = None
+        for _n, iq in recs:
+            if len(iq) < 8: continue
+            m = tone_metrics(iq, a.fs or 270833.0)
+            if best is None or m["coh"] > best["coh"]: best = m
+        if best:
+            r = best["dphi"] / PI2
+            ok = best["coh"] > 0.85 and abs(abs(r) - 1.0) < 0.20
+            print("  CONFORMITE KERNEL (attendu FCCH @1SPS, dphi=+1.00x pi/2) : %s"
+                  % ("OK -- le buffer contient ce que le correlateur cherche ; "
+                     "le probleme est EN AVAL du buffer" if ok else
+                     "NON (coh=%.3f dphi=%+.2fx pi/2) -- le REMPLISSAGE est encore fautif "
+                     "(rate/phase/pairing), pas l aval" % (best["coh"], r)))
+
     def do_daram():
         if not os.path.exists(a.mon): print("daram: monitor %s absent (qemu down ?)" % a.mon); return
         iq = read_daram(a.mon, int(a.addr, 16), a.words)
@@ -208,17 +236,19 @@ def main():
 
     src = a.src
     if src == "auto":
-        if os.path.exists(a.bursts) and os.path.getsize(a.bursts) > 13: src = "bursts"
+        if os.path.exists(a.ddump) and os.path.getsize(a.ddump) > 13: src = "ddump"
+        elif os.path.exists(a.bursts) and os.path.getsize(a.bursts) > 13: src = "bursts"
         elif glob.glob(os.path.join(a.rxdir, "iq_rx_*.bin")): src = "rxdump"
         else: src = "shunt"
         print("[auto] source = %s" % src)
 
     if src == "all":
-        for fn in (do_shunt, do_bursts, do_rxdump, do_daram):
+        for fn in (do_shunt, do_bursts, do_rxdump, do_ddump, do_daram):
             try: fn()
             except Exception as e: print("  ERR:", e)
     else:
-        {"shunt": do_shunt, "rxdump": do_rxdump, "bursts": do_bursts, "daram": do_daram}[src]()
+        {"shunt": do_shunt, "rxdump": do_rxdump, "bursts": do_bursts,
+         "daram": do_daram, "ddump": do_ddump}[src]()
 
 
 if __name__ == "__main__":

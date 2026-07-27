@@ -16,6 +16,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>   /* DARAM-SANITY : coherence/dphi du buffer corr */
+/* [2026-07-27] DARAM-FNSTAMP : publiees par calypso_bsp.c. */
+extern unsigned calypso_daram_last_fn;
+extern unsigned calypso_daram_wr_count;
 
 extern int calypso_rxfb_fired;   /* [probe golive] defini dans calypso_bsp.c */
 
@@ -2728,7 +2732,7 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
             static unsigned _ncn = 0;
             if (_ncn++ < 8)
                 fprintf(stderr, "[c54x] DEMOD-NOCLOBBER skip PC=0x%04x data[0x%04x] <- 0x%04x "
-                        "(feed_iq autoritaire)\n", s->pc, addr, val);
+                        "(ecriture demod ignoree ; l alimentation vient de rx_burst sauf si FB_IQ_OWNS=1)\n", s->pc, addr, val);
             return;
         }
     }
@@ -5730,6 +5734,15 @@ static int c54x_exec_one(C54xState *s)
              * chemin AR5=0x2c00 (reference), l IQ 0x2a00 est en AR4/AR1 (PAS AR5).
              * Gate CALYPSO_FB_ENERGY ; entree override CALYPSO_FB_CORR_ENTRY. */
             if (is_call && src_pc == 0xb01e) {
+                /* [2026-07-27] CALA-FB : cible NATIVE du dispatcher + d_task_md,
+                 * loggee AVANT tout reroute (voir en-tete du patch). */
+                { static int _cf = -1; static unsigned _cfn = 0;
+                  if (_cf < 0) _cf = getenv("CALYPSO_CALA_FB") ? 1 : 0;
+                  if (_cf && _cfn < 40) { _cfn++;
+                      fprintf(stderr, "[c54x] CALA-FB tgt=0x%04x task_md=%u "
+                              "(0x7700=routine resultat FB, 0xab38=stub, 0x8d00=corr symbole) "
+                              "A=0x%06llx insn=%u\n", tgt, (unsigned)s->data[0x058a],
+                              (unsigned long long)(s->a & 0xFFFFFFULL), s->insn_count); } }
                 static int _fbe = -1; static uint16_t _fbentry = 0x94f5;
                 if (_fbe < 0) {
                     const char *_e = getenv("CALYPSO_FB_ENERGY"); _fbe = (_e && atoi(_e) > 0) ? 1 : 0;
@@ -14618,6 +14631,35 @@ int c54x_run(C54xState *s, int n_insns)
                 #undef _INB
             }
         }
+        {   /* [2026-07-27] FBROUTE : voir en-tete du patch. */
+            static int _fr = -1;
+            if (_fr < 0) _fr = getenv("CALYPSO_FBROUTE") ? 1 : 0;
+            if (_fr) {
+                static unsigned _in = 0, _hi = 0, _n76fb = 0;
+                if (exec_pc >= 0x7700 && exec_pc <= 0x79f0) {
+                    _in++;
+                    if (exec_pc > _hi) {
+                        _hi = exec_pc;
+                        fprintf(stderr, "[c54x] FBROUTE high-water PC=0x%04x (hits=%u) "
+                                "[0x7725=CALL corr, 0x798c=SNR incond, 0x79e4=ORM d_fb_det]\n",
+                                exec_pc, _in);
+                    }
+                }
+                if (exec_pc == 0x76fb && _n76fb < 10) {
+                    _n76fb++;
+                    fprintf(stderr, "[c54x] FBROUTE ENTER @0x76fb (BD 0x7700) #%u insn=%u\n",
+                            _n76fb, s->insn_count);
+                }
+                static unsigned _ms[5] = {0,0,0,0,0};
+                const uint16_t _mpc[5] = {0x7720, 0x7725, 0x798c, 0x79e3, 0x79e4};
+                for (int _k = 0; _k < 5; _k++) {
+                    if (exec_pc == _mpc[_k] && _ms[_k]++ < 3) {
+                        fprintf(stderr, "[c54x] FBROUTE jalon PC=0x%04x #%u A=0x%06llx insn=%u\n",
+                                exec_pc, _ms[_k], (unsigned long long)(s->a & 0xFFFFFFULL), s->insn_count);
+                    }
+                }
+            }
+        }
         if (exec_pc == 0x93a5) {   /* consommateur DARAM 0x2a00 (AR3 post-inc) = VRAIE entree corr */
             static int _b2c = -1; static unsigned _b2cn = 0;
             if (_b2c < 0) _b2c = getenv("CALYPSO_B2SEQ") ? 1 : 0;
@@ -14626,6 +14668,98 @@ int c54x_run(C54xState *s, int n_insns)
                 for (int _i = 0; _i < 16; _i++)
                     fprintf(stderr, " (%d,%d)", (int)(int16_t)s->data[0x2a00 + 2*_i], (int)(int16_t)s->data[0x2a00 + 2*_i + 1]);
                 fprintf(stderr, "\n"); }
+        }
+        {
+            /* [2026-07-27] DARAM-DUMP (gated CALYPSO_DARAM_DUMP) : voir en-tete.
+             * Ecrit le buffer d entree corr en binaire IQ16 -> mesurable par
+             * tools/corr_iq.py --src bursts (coh/dphi), pas juge a l oeil. */
+            static int _dd = -1; static FILE *_ddf = NULL; static unsigned _ddn = 0;
+            static uint16_t _ddpc = 0x9ac0; static unsigned _ddmax = 200;
+            if (_dd < 0) {
+                const char *e = getenv("CALYPSO_DARAM_DUMP");
+                _dd = (e && *e && strcmp(e, "0")) ? 1 : 0;
+                if (_dd) {
+                    const char *path = (strcmp(e, "1") == 0) ? "/dev/shm/daram_2a00.cfile" : e;
+                    const char *p = getenv("CALYPSO_DARAM_DUMP_PC");
+                    if (p && *p) _ddpc = (uint16_t)strtol(p, NULL, 0);
+                    const char *m = getenv("CALYPSO_DARAM_DUMP_MAX");
+                    if (m && *m) _ddmax = (unsigned)atoi(m);
+                    _ddf = fopen(path, "wb");
+                    fprintf(stderr, "[c54x] DARAM-DUMP armed pc=0x%04x max=%u -> %s (%s)\n",
+                            _ddpc, _ddmax, path, _ddf ? "ok" : "FOPEN FAILED");
+                }
+            }
+            /* [2026-07-27] C2 : ne filmer QUE les passages en recherche FCCH.
+             * Sans ce garde, le cap _ddmax etait consomme des le boot, pendant
+             * que d_fb_mode[0x08f9]==0 -> le dump ne montrait pas la phase FB et
+             * on en concluait a tort « le buffer ne contient jamais de FCCH ».
+             * Override CALYPSO_DARAM_DUMP_ANYMODE=1 pour revenir a l ancien. */
+            static int _ddany = -1;
+            if (_ddany < 0) { const char *e = getenv("CALYPSO_DARAM_DUMP_ANYMODE");
+                              _ddany = (e && atoi(e) > 0) ? 1 : 0; }
+            if (_dd && _ddf && exec_pc == _ddpc && _ddn < _ddmax &&
+                (_ddany || s->data[0x08f9] != 0)) {
+                unsigned char hdr[12];
+                unsigned nw = 296;   /* 0x2a00..0x2b27 = 296 mots = 148 paires I/Q */
+                hdr[0]='I'; hdr[1]='Q'; hdr[2]='1'; hdr[3]='6';
+                unsigned _fnv = calypso_daram_last_fn;   /* fn GSM reel du dernier depot */
+                hdr[4]=(unsigned char)(_fnv & 0xff); hdr[5]=(unsigned char)((_fnv >> 8) & 0xff);
+                hdr[6]=(unsigned char)((_fnv >> 16) & 0xff); hdr[7]=(unsigned char)((_fnv >> 24) & 0xff);
+                hdr[8]=0;
+                hdr[9]=(unsigned char)(nw & 0xff); hdr[10]=(unsigned char)((nw >> 8) & 0xff);
+                hdr[11]=0;
+                fwrite(hdr, 1, 12, _ddf);
+                for (unsigned _k = 0; _k < nw; _k++) {
+                    uint16_t _v = s->data[0x2a00 + _k];
+                    unsigned char _b[2]; _b[0]=(unsigned char)(_v & 0xff); _b[1]=(unsigned char)(_v >> 8);
+                    fwrite(_b, 1, 2, _ddf);
+                }
+                /* [2026-07-27] DARAM-SANITY : verdict en run sur ce qu'on vient
+                 * de dumper. coh = |Sum z[k+1].conj(z[k])| / Sum|z[k+1]||z[k]| ;
+                 * dphi = arg(Sum ...). Le kernel FB veut du FCCH @1SPS => dphi
+                 * = +pi/2 (+1.571). +0.393 = 4 SPS non decime (remede nomme). */
+                if (_ddn == 0 || (_ddn % 50) == 0) {
+                    double ar = 0, ai = 0, dn = 0, en = 0;
+                    unsigned np = nw / 2;
+                    for (unsigned _k = 1; _k < np; _k++) {
+                        double i0 = (int16_t)s->data[0x2a00 + 2*(_k-1)];
+                        double q0 = (int16_t)s->data[0x2a00 + 2*(_k-1) + 1];
+                        double i1 = (int16_t)s->data[0x2a00 + 2*_k];
+                        double q1 = (int16_t)s->data[0x2a00 + 2*_k + 1];
+                        ar += i1*i0 + q1*q0; ai += q1*i0 - i1*q0;
+                        dn += sqrt((i0*i0 + q0*q0) * (i1*i1 + q1*q1));
+                        en += i1*i1 + q1*q1;
+                    }
+                    double coh  = dn > 0 ? sqrt(ar*ar + ai*ai) / dn : 0.0;
+                    double dphi = atan2(ai, ar);
+                    double rms  = np > 1 ? sqrt(en / (double)(np - 1)) : 0.0;
+                    double ad   = fabs(dphi);
+                    const char *v;
+                    if (rms < 1.0)                        v = "VIDE (buffer non alimente)";
+                    else if (coh > 0.90 && ad > 1.37 && ad < 1.77)
+                        v = (dphi > 0) ? "FCCH @1SPS OK -- c est ce que le kernel cherche"
+                                       : "FCCH @1SPS MIROIR -> CALYPSO_DL_IQ_CONJ=1";
+                    else if (coh > 0.90 && ad > 0.29 && ad < 0.49)
+                        v = "4 SPS NON DECIME -> CALYPSO_BSP_IQ_DECIM=4 (et FB_IQ_OWNS=0)";
+                    else if (coh > 0.90 && ad < 0.29)
+                        v = "sur-echantillonne (>4 SPS) ou pas un ton -> verifier la source";
+                    else                                  v = "BRUIT/DATA -- pas un ton FCCH";
+                    static unsigned _prevwr = 0;
+                    unsigned _dwr = calypso_daram_wr_count - _prevwr;
+                    _prevwr = calypso_daram_wr_count;
+                    fprintf(stderr, "[c54x] DARAM-SANITY rec=%u fn=%u depots_depuis=%u coh=%.3f "
+                            "dphi=%+.3f (%+.2fxpi/2) rms=%.0f : %s%s\n", _ddn,
+                            calypso_daram_last_fn, _dwr, coh, dphi, dphi / (M_PI/2), rms, v,
+                            _dwr == 0 ? "  [BUFFER FIGE : aucun depot BSP depuis le dump precedent]" : "");
+                }
+                if (++_ddn >= _ddmax) {
+                    fflush(_ddf); fclose(_ddf); _ddf = NULL;
+                    fprintf(stderr, "[c54x] DARAM-DUMP done : %u records de %u mots\n", _ddn, nw);
+                } else if ((_ddn % 20) == 0) {
+                    fflush(_ddf);
+                    fprintf(stderr, "[c54x] DARAM-DUMP rec=%u\n", _ddn);
+                }
+            }
         }
         if (exec_pc == 0x9ac0) {
             /* [2026-07-27] B2SEQ (gated CALYPSO_B2SEQ) : dump 16 paires (I,Q) de
