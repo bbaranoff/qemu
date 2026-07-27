@@ -1065,7 +1065,7 @@ static void calypso_dsp_shunt_feed_sdcch(const uint8_t *l2, int len, uint32_t fn
     memcpy(g_shunt.sdcch_ring[idx].l2, l2, n);
     for (int i = n; i < 23; i++) g_shunt.sdcch_ring[idx].l2[i] = 0x2B;
     g_shunt.sdcch_ring[idx].fn = fn; g_shunt.sdcch_ring[idx].tick = g_shunt.tick_cnt;
-    g_shunt.sdcch_ring[idx].used = true; g_shunt.sdcch_ring_tail++;
+    g_shunt.sdcch_ring[idx].reps = 0; g_shunt.sdcch_ring[idx].used = true; g_shunt.sdcch_ring_tail++;
     g_shunt.sdcch_valid = true;
     SHUNT_LOG("feed_sdcch: ENQUEUE fn=%u c=0x%02x [depth=%u]\n", fn, l2[1], g_shunt.sdcch_ring_tail - g_shunt.sdcch_ring_head);
 }

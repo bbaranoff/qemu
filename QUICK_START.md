@@ -91,16 +91,18 @@ Logs : `/root/qemu.log` (QEMU/DSP), `/root/mobile.log` (mobile Calypso).
 
 ## 3. État — TODO / DONE
 
+> ⚠️ **Le statut DÉPEND DU MODE.** Le tableau ci-dessous vaut pour la **famille shunt** ; en **natif** (`CALYPSO_NATIVE=1` / `NATIVE_HELPED`) FB/SB, Camp, LU, SMS et Ctrl-C sont WIP/TODO. Vérité-terrain par mode = [matrice statut × mode d'`ETAT_ACTUEL.md`](hw/arm/calypso/doc/ETAT_ACTUEL.md).
+
 | # | Objectif | Statut | Détail / preuve |
 |---|---|---|---|
-| 1 | FB/SB (sync) | ✅ DONE | `DISPATCH SB BSIC=7` (gr-gsm réel) |
+| 1 | FB/SB (sync) | ✅ DONE · natif WIP | `DISPATCH SB BSIC=7` (gr-gsm réel) |
 | 2 | RXLEV serving | ✅ DONE | `RLA_C -53 dBm`, C1/C2 > 0 |
-| 3 | Camp (C3) | ✅ DONE | `normal service` |
-| 4 | Location Update + registration | ✅ DONE | `LOCATION UPDATING ACCEPT` + `TMSI REALLOC COMPLETE`, `On Network` |
-| 5 | SMS MO | ✅ DONE | passe du 1er coup, `SMS successful` |
-| 6 | SMS MT | ✅ DONE | `SMS from 777` / `SMS from 10002` reçus (bidirectionnel) |
+| 3 | Camp (C3) | ✅ DONE · natif TODO | `normal service` |
+| 4 | Location Update + registration | ✅ DONE · natif TODO | `LOCATION UPDATING ACCEPT` + `TMSI REALLOC COMPLETE`, `On Network` |
+| 5 | SMS MO | ✅ DONE · `DSP,NO_CANNED` flaky · natif TODO | passe du 1er coup, `SMS successful` |
+| 6 | SMS MT | ✅ DONE · `DSP,NO_CANNED` WIP · natif TODO | `SMS from 777` / `SMS from 10002` reçus (bidirectionnel) |
 | 7 | Service tenu post-SMS | ✅ DONE | `MM connection active → MM IDLE, normal service` |
-| 8 | Ctrl-C mobile / re-camp | ✅ DONE | reset L1 câblé (`d_dsp_page=0` API-RAM) |
+| 8 | Ctrl-C mobile / re-camp | ✅ DONE · natif TODO | reset L1 câblé (`d_dsp_page=0` API-RAM) |
 | 9 | Union SDCCH SS0-7 (/4 + /8) | ✅ DONE | UA présentée sur toute la région SDCCH → LU quelle que soit la sous-voie |
 | 10 | Reset L1 câblé (`shunt_latch_task`) | ✅ DONE | SI reprend + Ctrl-C recover (`CALYPSO_L1_RESET_WIRE=0` désactive) |
 | 11 | Value-list env (`DSP` / `NO_CANNED`) | ✅ DONE | `CALYPSO_SHUNT_LEGIT=DSP,NO_CANNED` |

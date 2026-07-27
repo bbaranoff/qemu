@@ -146,7 +146,7 @@ struct dsp_shunt_state {
      * (fn%51 in {22-25}) -> firmware tague chan_nr=0x20 -> LAPDm dediee. */
     /* SDCCH/4 SS0 DL (#2) : FIFO FN-indexee (fix intermittence LU). */
 #define SDCCH_RING_N 32
-    struct { uint8_t l2[23]; uint32_t fn; uint32_t tick; bool used; } sdcch_ring[SDCCH_RING_N];
+    struct { uint8_t l2[23]; uint32_t fn; uint32_t tick; uint16_t reps; bool used; } sdcch_ring[SDCCH_RING_N];
     uint32_t   sdcch_ring_head;
     uint32_t   sdcch_ring_tail;
     uint32_t   sdcch_last_fn;
