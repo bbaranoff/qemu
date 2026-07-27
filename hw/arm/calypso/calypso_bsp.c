@@ -1157,7 +1157,14 @@ void calypso_bsp_rx_burst(uint8_t tn, uint32_t fn,
         bsp.dsp->data[0x43c0] = _tgt;   /* slot terminal BACC 0xb40f (etait 0xa4c7 go-live) */
         bsp.dsp->data[0x4387] = _tgt;   /* slot idle/CALA 0xb01e (etait stub 0xab38) */
         bsp.dsp->data[0x43d8] = _tgt;   /* slot reseed (etait stub 0xab38) */
-        bsp.dsp->imr |= 0x0200;         /* bit9 : route frame scheduler */
+        { /* [2026-07-27] NOIMR : le demasquage IMR est separable de l install
+           * du handler — il preempte la routine FB 6 instructions apres son
+           * entree (IT vers vec21/0x00d4). CALYPSO_BSP_DISPATCH_NOIMR=1 pour
+           * installer le handler SANS toucher l IMR. */
+          static int _noimr = -1;
+          if (_noimr < 0) _noimr = getenv("CALYPSO_BSP_DISPATCH_NOIMR") ? 1 : 0;
+          if (!_noimr) bsp.dsp->imr |= 0x0200;   /* bit9 : route frame scheduler */
+        }
         static unsigned _dl = 0;
         if (_dl++ < 8)
             fprintf(stderr, "[c54x] BSP-DISPATCH-FB : install 0x%04x (LUT setup FB) "

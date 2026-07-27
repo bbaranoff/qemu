@@ -252,6 +252,53 @@ Test décisif du signal (dump entrée `0x2a00`) : `grep "B2SEQ" /root/qemu.log |
 
 ---
 
+## Run C — `SHUNT_LEGIT + NO_CANNED + REAL_FB` : BASE DE NON-RÉGRESSION (2026-07-28)
+
+**Le chemin qui produit un résultat vérifiable de bout en bout**, sans canne et sans
+dépendre de gr-gsm : la détection FCCH est **calculée** côté hôte sur l'I/Q réelle
+(`calypso_dsp_shunt.c:1585-1601`), avec la même métrique que `tools/corr_iq.py` —
+cohérence du ton et résidu de phase par rapport au nominal π/8 (4 SPS) :
+
+```c
+coh   = |Σ z[k+1]·conj(z[k])| / Σ|z[k+1]||z[k]|
+resid = arg(Σ …) − π/8
+det   = (coh > 0.95) && (|resid| < 0.13)     /* fenêtre de capture FB0 ±20 kHz */
+```
+
+| Mesure | Valeur |
+|---|---|
+| `REAL-FB` évaluations / détections | **300 / 280** (`coh=0.999`, `dphi=0.387`, `SNR=0x735b`, `AFC=−710`) |
+| BSIC vu par le mobile | **7** (le vrai ; le natif ne voit que 0) |
+| sysinfo décodés | 20 |
+| Séquence MM | IMSI `001010001000001` → **LOCATION UPDATING ACCEPT** (`lai=001-01-1`) → TMSI `0x3dbeb85f` → TMSI REALLOCATION COMPLETE |
+| Radio | `CGI=001-01-1-6001`, `C1=51`, `lev=−56`, `snr=91`, `ber=0`, mesure du voisin ARFCN 516 |
+
+### Reproduire
+```bash
+CALYPSO_SHUNT_LEGIT=1 CALYPSO_SHUNT_NO_CANNED=1 CALYPSO_SHUNT_REAL_FB=1 ./start-clean.sh
+grep -c "REAL-FB.*det=1" /root/qemu.log
+grep -icE "LOCATION UPDATING ACCEPT" /root/mobile.log
+grep -oE "BSIC=[0-9]+" /root/mobile.log | sort | uniq -c
+```
+
+### Non-régression validée pour les changements du 27-28/07
+Ce run porte **les deux modifications de défaut** de la session et campe quand même :
+- `calypso_wire.env` **sorti du chemin par défaut** (opt-in `CALYPSO_WIRE=1`) —
+  vérifié absent du run (`PROFIL WIRE ACTIF` = 0 occurrence) ;
+- **split du gate** `calypso_dsp_shunt_active()` / `calypso_dsp_shunt_substitutes()` —
+  neutre ici par construction (`SHUNT_LEGIT` pose `DSP_SHUNT=1` ⇒ `substitutes()` vrai,
+  et `DSP_RUN_C54X=0` de toute façon).
+
+**En cas de régression future sur ce mode : `CALYPSO_WIRE=1` restaure l'état d'avant à
+l'identique**, et le log l'annonce (`[calypso.env] PROFIL WIRE ACTIF`).
+
+> ⚠️ À ne pas confondre avec le **mode natif** (`RAPPORT_DFBDET.md`), où `d_fb_det` n'est
+> posé par personne et où le passage `FB0_SEARCH → SB_SEARCH` est le chemin de
+> renoncement d'osmocom (`BSIC=0`, `snr=0`) — une fausse synchro, pas un camp.
+
+
+---
+
 ## Acquis contextuels (autres modes, pour situer)
 
 - `SHUNT_LEGIT` : registration (LU ACCEPT + TMSI), SMS MO/MT bidirectionnel, service tenu,

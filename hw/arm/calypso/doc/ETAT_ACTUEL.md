@@ -83,29 +83,108 @@ Preuve cote osmocom : `prim_fbsb.c` pose `d_fb_mode` puis polle `d_fb_det` ; `ds
 
 ## 3. Etat du natif
 
-**Verite terrain 2026-07-27 : le correlateur DSP TOURNE.** Il atteint le handler `0x8d00`,
-passe en DETECTOR-RUN @`0x9ac0`, `d_fb_mode=1`. Le mur a BOUGE : ce n'est plus « jamais
-dispatche / `0x8d00` 0 hit » (ancienne conclusion RANK3 perimee), c'est **`d_fb_det[0x08f8]`
-reste a 0** faute d'entree valide. rxlev natif = DONE (-47 dBm reel).
+> **REECRIT 2026-07-28.** La version precedente affirmait que « le correlateur DSP
+> TOURNE, atteint `0x8d00` » et que « l'etage demod lit ses samples en `data[0x9213]`
+> (I) / `data[0x9215]` (Q) ». **Les deux sont invalides par la mesure** (details plus
+> bas). Rapport complet : `../../../RAPPORT_DFBDET.md` §8 et §9.
 
-**Point d'injection NATIF localise et PROUVE inscriptible :**
-- L'etage demod `0x9f00` lit ses samples en `data[0x9213]` (I) / `data[0x9215]` (Q).
-- RAM inscriptible : une rampe 0x1003/0x1005 y atterrit et est relue par le demod.
-- **C'est la SOURCE a alimenter.**
+### 3.0 Le fait qui recadre tout : le mode natif n'avait JAMAIS tourne
 
-**`0x2a00` = WORKZONE DE SORTIE du demod (PAS l'entree).**
-- Le DSP la remplit lui-meme (0x12ed).
-- Le kernel energie `0xa076` LIT `0x2a00`.
-- **NE JAMAIS feeder `0x2a00`** (ni via rx_burst, ni via feed_iq). Feeder la source `0x9213`/`0x9215`.
+`calypso.env:102` pose `CALYPSO_DSP=c54x` par defaut, ce qui suffit a mettre
+`g_shunt.active = true` **meme avec `CALYPSO_DSP_SHUNT=0`**. Quatre defauts, tous de la
+meme famille — du code emprunte par le chemin natif qui depend d'un etat alimente
+uniquement par le shunt — rendaient le natif inobservable :
 
-**Blocages restants (plomberie/cadence, PAS logique morte) — pourquoi `d_fb_det` reste 0 :**
-- **(a) FENETRE** : feeder un STREAM de samples. Le correlateur batit sa fenetre sur N appels ; 2 cellules figees ne suffisent pas.
-- **(b) DISPATCH par-frame** : le demod ne tourne qu'~1 fois (33 lectures). Il faut le cadencer une fois par trame avec un sample frais.
+| # | Defaut | Symptome | Correctif |
+|---|---|---|---|
+| 1 | `wp_burst_write` appele sans garde depuis le MMIO natif -> `dma_memory_write(g_shunt.as = NULL)` | **SIGSEGV a +0,054 s** : le natif ne demarrait pas | garde `!g_shunt.active` + 4 gardes `!g_shunt.as` |
+| 2 | early-boot c54x gate sur `shunt_route_c54x()` | `c54x_reset()` ecrase la cmd bootloader ARM -> **DSP en boucle de park `0xb41c`, firmware L1 jamais charge** | gate sur `CALYPSO_DSP_RUN_C54X` seul |
+| 3 | `get_task_md()` renvoie un champ shunt-only | 0 en permanence hors shunt -> tous ses appelants morts | fallback API RAM `0x0804`/`0x0818` |
+| 4 | gate unique `active()` confondant *substitut* et *assist* | les 2 `c54x_run` du tick TDMA gates a tort en assist | **split `active()` / `substitutes()`** |
 
-Tant que (a)+(b) ne sont pas resolus, `d_fb_det` natif reste 0 (le correlateur tourne mais
-sur une entree degeneree -> gap = 0). C'est le seul verrou entre NATIF et le camp.
+Le split (4) a un effet mesure : le DSP tourne enfin a la cadence trame
+(`dsp_n_exec_2/5 = 32768`) et le **`DSP Error Status: 2048` (`DSP_ERR_STACK_OV`, pose par
+le firmware DSP lui-meme a chaque trame) DISPARAIT**.
 
-**Regression corrigee (commit becd439 "i should go sleeping")** : un SKIP rx_burst avait ete ajoute (`calypso_bsp.c`, gate `FB_IQ_DARAM`) affamant `0x2a00` -> perte du SHADOW-DADST. Corrige : SKIP decouple sur gate dediee `CALYPSO_FB_IQ_OWNS` (defaut OFF) -> rx_burst nourrit toujours.
+### 3.1 Ce qui est mesure aujourd'hui
+
+- **`d_fb_det` n'est ecrit par PERSONNE en natif.** Verifie des deux cotes du miroir
+  api_ram (sonde `CALYPSO_FBDET_API`) : seul l'**ARM** touche la cellule, **toujours a 0**
+  (`prim_fbsb.c:318` + `dsp.c:406`). Le DSP ne l'ecrit jamais. Cote QEMU, les seuls
+  ecrivains sont shunt (`calypso_dsp_helper.c:240/253`) et HLE (`calypso_layer1.c:161/171`).
+- **Le passage L1 `FB0_SEARCH -> SB_SEARCH` est le chemin de RENONCEMENT** d'osmocom
+  (`attempt >= 12` -> retries -> `L1_COMPL_FB attempt=13`), d'ou `BSIC=0`, `snr=0`,
+  `SB 0x00000000`. **Ce n'est pas une synchro.**
+- **Slot de dispatch = `data[0x43d8]`**, charge en adressage **absolu** (`0xb01c: 10f8 43d8`)
+  — ni `0x4387` ni `0x43c0`. Scan des 4 banks : **un seul ecrivain**, `0xbb00`, qui y met
+  `ST #0xab38` — et `0xab38` commence par `fc00` = **`RET`**. Le handler FB est un stub.
+- **`0x8d00` calcule vraiment** (coefficients -> `0x2bc0`, boucle MAC `0x8e97<->0x8ea8`)
+  **mais aucun de ses registres d'adresse ne pointe jamais dans `[0x2a00..0x2b27]`**
+  (sonde `ARWATCH`) : `AR3=0x4bd0`, `AR4=0x2bc0..`, `AR5=0xdb7b..`. Il ne correle donc
+  **pas** l'IQ. Confirme `calypso_c54x.c:5730`.
+
+### 3.2 ⚠️ Le point d'injection annonce precedemment est FAUX
+
+L'ancienne version affirmait : *« l'etage demod `0x9f00` lit ses samples en `data[0x9213]`
+(I) / `data[0x9215]` (Q) — c'est LA SOURCE a alimenter »*. **Mesure du 2026-07-28** (sonde
+`CALYPSO_DEMODRD`, toutes les lectures du bloc `RPTB` du demod) :
+
+```
+0x9fab/0x9fac/0x9fae : data[0x0012]/[0x0013]/[0x0015]  = AR2/AR3/AR5 via MMR
+0x9fb1/0x9fb2        : data[0x0060]=0x000f, data[0x0061]=0x0010  (coefficients)
+0x9fb5               : data[0x0000], [0x0005], [0x000a]  <- LES ECHANTILLONS
+
+AR4 = 2a00 -> 2a01 -> 2a02 ...   pointeur d ECRITURE (buffer correlateur)
+AR6 = 0000 -> 0000 -> 0000 ...   POINTEUR D ENTREE JAMAIS INITIALISE
+```
+
+**Le demod lit ses echantillons a partir de `data[0x0000]`, par pas de 5** — c'est-a-dire
+dans la zone des registres mappes, qui ne contient que des zeros. Toute l'IQ injectee
+(`0x2a00`, `0x9213/0x9215`, `0x9260/0x9261`) **n'a jamais ete lue**. Ce n'est pas une
+branche manquante : c'est un **pointeur d'entree non pose par l'appelant**.
+
+Cela explique d'un seul coup : `FB-STREAM = 0` malgre une gate correcte, la sortie
+constante du correlateur, les paires `(0000, 52ed)` de la trace de flux, et le fait
+qu'aucun reglage de cellule n'ait jamais rien change.
+
+**Reserve LEVEE (2026-07-28)** : `XPC = 0` sur **toutes** les lectures (10 tirs par PC,
+sonde `CALYPSO_DEMODRD` qui logge desormais `XPC` + opcode). Une seule banque : le code
+execute est bien celui desassemble, et la lecture a `data[0x0000]` est reelle.
+
+### 3.2b Hypothese de travail : on entre au mauvais endroit
+
+`AR6` n'est pas initialise **parce que l'entree utilisee saute sa mise en place** :
+
+- entree **referencee en ROM** : **`0x94f5`** (`@0x87e7 f930 94f5`) — et c'est le defaut
+  du code (`calypso_c54x.c:5737`) ;
+- entree **imposee par `calypso_native_helped.env`** : `0x9500`, qui n'apparait **nulle
+  part** dans les 28 672 mots de PROM ;
+- entre les deux : **11 mots de mise en place** (candidats naturels pour poser `AR6`,
+  `ST1`, `DP`, `ARP`).
+
+C'est exactement la piste S3 du rapport d'enquete, restee non suivie. Meme classe de
+probleme que la bequille qui entrait en `0x7708` sans `DP` : **entrer au milieu d'une
+routine sans le contexte de son appelant**.
+
+Test : `CALYPSO_FB_CORR_ENTRY=0x94f5` (attention, un run precedent l'a recu **tronque a
+`0x94f`** — verifier dans `/proc/<pid>/environ`, pas seulement au manifeste).
+
+### 3.3 Ce qui est definitivement ecarte
+
+| Hypothese | Preuve |
+|---|---|
+| « le scheduler `0x7234` DERAILLE vers `0x013b` » | `0x7234: f074 013b` = **CALL inconditionnel en ROM** ; `0x013b` = routine de sauvegarde de contexte qui **retourne** en `0x7236` |
+| « `0x8341` = la LUT FB a atteindre » | scan des **4 banks** : **0 reference**. Personne ne peut y sauter. **Ne pas refaire le correctif TPU propose par `DOC_PATH_BOOT_TO_CORRELATOR_2026-07-25.md`.** |
+| « writer cache du slot `0x43d8` » | watchpoint dans `data_write_locked` (voit **tous** les modes d'adressage) : uniquement `0xbb00 -> 0xab38` |
+| « le handler vient d'un patch televerse » | osmocom `dsp_bootcode.c` : `dsp_bootcode = NULL`, *« it happily works with its own ROM »* ; `dsp.c:205` = `FIXME: Implement Patch download` |
+
+### 3.4 Profil `wire` : sorti du chemin par defaut
+
+`calypso_wire.env` n'est plus source par defaut (opt-in **`CALYPSO_WIRE=1`**). Ses 12
+bequilles sont **inertes** sur le chemin FB (graphe d'appels identique avec et sans) et
+deux nuisaient : `BSP_DIRECT_BRINT0` faisait lever vec21 par le BSP (c'est **nous** qui
+preemptions la routine FB), et `FORCE_INTM_ONESHOT` etait deja signale « NON-nominal »
+par `run.sh`.
 
 ---
 

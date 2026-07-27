@@ -1,199 +1,218 @@
-# Rapport — cause racine de `d_fb_det = 0` (mode natif)
+# Rapport — `d_fb_det = 0` en mode natif
 
-> **Provenance.** Enquête multi-agents du 2026-07-27 : 5 hypothèses instruites en
-> parallèle sur le code live et le log du run `19:28:40 → 19:57:26`, chacune soumise à
-> un agent **sceptique** chargé de la réfuter, puis synthèse. 11 agents, 368 appels
-> d'outils. **Les 5 hypothèses initiales ont été réfutées** — le rapport ci-dessous est
-> ce qui a survécu au tri, plus deux corrections qui invalident une partie du dossier
-> antérieur (dont une mesure que j'avais moi-même présentée comme un fait établi).
+> **⚠️ RÉVISION MAJEURE du 2026-07-27, soir.** La version précédente de ce rapport
+> (enquête multi-agents, 11 agents) désignait comme cause racine le reroute
+> `CALYPSO_FB_ENERGY`. **Cette conclusion est retirée** : elle reposait sur des
+> mesures prises alors que le DSP **n'exécutait pas son firmware**, et sur un test
+> portant sur une cellule hors API RAM. Le détail de ce qui tombe est au §6.
 >
-> Diagnostic **en lecture seule** : aucun correctif appliqué. Le test décisif du §4 est
-> à lancer avant toute modification.
+> Ce qui suit est établi **par l'exécution** (traces d'instructions, désassemblage
+> PROM, backtrace gdb), pas par lecture de table ni par conjecture.
 >
 > Voir aussi `run_results.md` (mesures chiffrées, règles de décision, reproduction).
 
-## RAPPORT DE SYNTHÈSE — cause racine de `d_fb_det` (data[0x08f8]) = 0
+---
+
+## 1. LE FAIT CENTRAL — le mode natif n'avait jamais tourné
+
+`calypso.env:102` pose `CALYPSO_DSP=c54x` **par défaut**. Or `shunt_route_c54x()`
+teste exactement cette valeur, et suffit à mettre `g_shunt.active = true` — **même
+avec `CALYPSO_DSP_SHUNT=0`**. Tout ce qui a été mesuré « en natif » jusqu'ici l'a donc
+été avec le shunt armé.
+
+Et désarmer le shunt était impossible : **QEMU crashait au boot**. Quatre défauts, tous
+de la même famille — *du code emprunté par le chemin natif qui dépend d'un état
+alimenté uniquement par le shunt* :
+
+| # | Défaut | Symptôme | Preuve | Correctif |
+|---|---|---|---|---|
+| 1 | `calypso_dsp_shunt_wp_burst_write()` appelé **sans garde** depuis `calypso_dsp_write()` (MMIO natif) → `dma_memory_write(g_shunt.as = NULL)` | **SIGSEGV à +0,054 s**, pendant le boot SIM | backtrace gdb : `address_space_write as=0x0`, `physmem.c:2972` | garde `!g_shunt.active` + 4 gardes `!g_shunt.as` dans les helpers |
+| 2 | early-boot c54x gaté sur `shunt_route_c54x()` → en natif `c54x_reset()` écrase la commande bootloader de l'ARM | DSP en **boucle de park** `0xb41c/0xb41f/0xb424/0xb427` — **firmware L1 jamais chargé** | `data[0x0fff]=0x0001` (IDLE) en boucle ; `BRANCH-TRACE` 100 % dans la boucle | gate sur `CALYPSO_DSP_RUN_C54X` seul |
+| 3 | `calypso_dsp_shunt_get_task_md()` renvoie `g_shunt.d_task_md`, posé par `shunt_latch_task()` uniquement | renvoie 0 en permanence hors shunt → **tous ses appelants morts** | `BSP-DISPATCH-FB` = 0 tir malgré la gate active | fallback API RAM `0x0804`/`0x0818` |
+| 4 | `g_canned` reste `CAN_DEFAULT` hors shunt (`shunt_parse_canned()` est **après** l'early-return) | `CALYPSO_SHUNT_NO_CANNED` **sans aucun effet** en natif | ligne `CALYPSO_CANNED (dette…)` = 0 occurrence | latent, non corrigé |
+
+**Conséquence à retenir : aucune mesure « native » antérieure à ce soir n'est
+interprétable.** Ce n'est pas une opinion — le processus mourait à 54 ms, et quand il
+survivait, le DSP tournait la boucle de park de son bootloader.
+
+*(Piège associé : 2,7 milliards d'instructions DSP avaient été relevées comme preuve que
+« le DSP tourne enfin ». C'était la boucle de park. Un compteur d'instructions ne prouve
+pas qu'un firmware s'exécute.)*
 
 ---
 
-### 0. DEUX CORRECTIONS PRÉALABLES QUI CHANGENT LA LECTURE DE TOUT LE DOSSIER
+## 2. RANK3 — TRANCHÉ, sur preuve d'exécution
 
-**(0.a) Le binaire vivant N'EST PAS celui du disque — mais les sondes critiques SONT dedans.**
-Deux agents ont invoqué « citations périmées » pour invalider en bloc les preuves. La moitié est vraie, la conclusion est fausse. Mesure directe :
-
-```
-/proc/3827436/exe -> /opt/GSM/qemu-src/build/qemu-system-arm (deleted)
-running-inode=43363984   ondisk-inode=39105158 (mtime 19:55:28, rebuild en cours)
-process start = Mon Jul 27 19:28:39 2026
-```
-
-Le processus tourne bien sur un inode supprimé (rebuild écrasé pendant le run). MAIS `grep` sur l'image vivante `/proc/3827436/exe` :
-
-| chaîne | image VIVANTE | disque |
-|---|---|---|
-| `B4-DFBDET-WR` | **présent** | présent |
-| `FBDET-WR` | **présent** | présent |
-| `ANGLE-WR` | **présent** | présent |
-| `DETECTOR-RUN`, `B4B-FLOW`, `SCAN-08F8`, `FLOWTRACE` | **présents** | présents |
-| `depots_depuis` / `BUFFER FIGE` | **absents** | présents |
-
-→ Seuls le compteur `depots_depuis`/`BUFFER FIGE` et le format d'en-tête du `.cfile` sont post-run. **Tous les « 0 hit » de B4/FBDET-WR/ANGLE-WR sont donc des mesures valides**, pas des artefacts de compilation. Les réfutations « vue-memoire », « reroutes » et « qui-ecrit-2a00 » ont sur-généralisé sur ce point.
-
-**(0.b) Le « fait établi #3 » du brief est un artefact de fenêtre — le piège explicitement listé.**
-Le dump DARAM couvre `DETECTOR-RUN #0..#199`, soit `+5.609s` → `+6.073s` (`/root/qemu.log:26417` et `:28222`). Or :
+**La cellule de dispatch de la tâche FB est `data[0x43d8]`**, chargée en **adressage
+absolu** — ce n'est ni un index calculé, ni `0x4387`, ni `0x43c0` :
 
 ```
-:28240  +6.083s DETECTOR-RUN #200 ... d_fb_mode[08f9]=0x0000
-:28846  +6.541s DETECTOR-RUN #400 ... d_fb_mode[08f9]=0x0001   <-- premier passage en mode FB
+0xb01c:  10f8 43d8        LD *(0x43d8), A
 ```
 
-**Les 200 records ont TOUS été pris pendant que `d_fb_mode = 0`**, c'est-à-dire quand le DSP n'était pas en recherche FCCH. « 0 FCCH sur 200 records » ne prouve donc rien sur le chemin FB. La sonde n'a jamais été rouverte (fermeture définitive à `+6.073s`, `_ddn >= _ddmax`, `calypso_c54x.c:14708-14711`) alors que le run dure `+1620s`. **Toute l'enquête « qui écrit 0x2a00 / timing / vue mémoire » a été menée sur une fenêtre hors sujet.**
+Scan mot-à-mot des **4 banks** de la PROM : exactement **2** références à `0x43d8` —
+le lecteur ci-dessus, et **un unique installateur** :
+
+```
+0xbb00:  76f8 43d8 ab38   ST #0xab38, *(0x43d8)
+```
+
+Et `0xab38` commence par `fc00` = `RET`. **Le handler de la tâche FB est un stub qui
+retourne immédiatement** — confirmé à l'exécution : `0xb01c → 0xab38 → 0xb01f`.
+
+### Chaîne complète, mesurée
+```
+ARM d_task_md=5 (FB_DSP_TASK, ×22)
+  → vec 0x00f0 (vec28)  →  scheduler 0x7234  →  prologue ISR 0x013b
+  → 0xa4e4  →  dispatcher 0xb0xx  →  LD *(0x43d8)  →  0xab38 = RET
+  ✗ la routine résultat FB n'est jamais atteinte
+```
+`fb0_att ≈ 190`, `fb0_ret = 0`, `snr/toa/ang/pm = 0`.
 
 ---
 
-### 1. CAUSE RACINE LA PLUS PROBABLE
+## 3. STRUCTURE DE LA ROUTINE FB (désassemblée)
 
-> **Le DSP n'exécute jamais sa routine de résultat FB/SB en banque commune `0x7700–0x79F0`, seule productrice de `d_fb_det` ET de `a_sync_demod[]`. Le mode `NATIVE_HELPED` pousse le flux dans un noyau d'énergie bancarisé (`0x9500→0xa033→0xa076`) qui ne contient structurellement aucun écrivain de `0x08f8`.**
-
-**Chaîne causale, maillon par maillon :**
-
-**(1) Aucune instruction DSP n'écrit jamais `0x08f8`, sur 1,08 milliard d'instructions / 1620 s.**
-La sonde `FBDET-WR` est **inconditionnelle et sans cap** :
-```c
-calypso_c54x.c:2880   if (addr == 0x08F8) {
-calypso_c54x.c:2881       fprintf(stderr, "[c54x] FBDET-WR data[0x08F8] 0x%04x -> 0x%04x PC=0x%04x insn=%u\n",
 ```
-Elle est dans `data_write_locked` (déf. `:2719`), dont la queue est `s->data[addr] = val;` (`calypso_c54x.c:4186`) — **tous** les stores d'instruction DSP y transitent. Résultat : `grep -c FBDET-WR` = **0**. Idem `B4-DFBDET-WR` = 0 (gate `CALYPSO_B4=1`, manifeste `qemu.log:33`).
+0x76fb:  f272 7700    BD 0x7700          entrée
+0x7702:  f274 75e8    CALLD 0x75e8
+0x7707:  fe00                            fin du préambule
+0x7708:  81f8 3fb2    STH A, *(0x3fb2)   <<< LE CORPS COMMENCE ICI
+0x770a:  f074 770d    CALL 0x770d
+0x7720:  107e         LD dma(0x7e), A    ┐
+0x7721:  f010 0004    SUB #4, A          ├ LA GARDE (veut 4)
+0x7723:  f844 7729    BC 0x7729 si ≠0    ┘
+0x7725:  f074 795f    CALL 0x795f        corrélation + publication
+0x798c:  76f8 08fd 4000  ST #0x4000, *(0x08fd)   SNR — INCONDITIONNEL
+0x79e3:  fc44         XC (conditionnel)
+0x79e4:  69f8 08f8 0001  ORM #0x0001, *(0x08f8)  ← LE PUBLISHER de d_fb_det
+0x778a:  68f8 08f8 fffe  ANDM #0xfffe, *(0x08f8) ← le clear apparié
+```
 
-**(2) Le voisinage `a_sync_demod` n'est jamais écrit non plus.** Sonde `ANGLE-WR`, elle aussi **inconditionnelle** (cap 40, jamais atteint) :
-```c
-calypso_c54x.c:2677   if (addr >= 0x08fa && addr <= 0x08fd) {
-```
-`grep -c ANGLE-WR` = **0**. C'est le maillon qui verrouille le diagnostic : la routine contient **quatre stores distincts** vers ces cellules, dont un non conditionnel — aucun ne s'exécute.
-
-**(3) Ces stores localisent la routine, et elle est unique.** Désassemblage PROM0 (base `0x7000`, mémoire confirmée) :
-```
-0x798a: 82f8 08fc          ST  A, *(0x08fc)   ; ANGLE
-0x798c: 76f8 08fd 4000     ST  #0x4000, *(0x08fd) ; SNR  <-- inconditionnel
-0x79d4: 82f8 08fd          ST  A, *(0x08fd)
-0x79de: 81f8 08fb          STH A, *(0x08fb)   ; PM
-0x79e3: fc44               XC/cond
-0x79e4: 69f8 08f8 0001     ORM #0x0001, *(0x08f8)  <-- LE PUBLISHER de d_fb_det
-0x778a: 68f8 08f8 fffe     ANDM #0xfffe, *(0x08f8) <-- le clear apparié
-```
-Un scan mot-à-mot de PROM0 (28672 mots) donne 26 occurrences du mot `0x08f8` ; en écartant celles où `0x08f8` est un **opcode** `ADD *(lk),A` (vérifié en contexte : `0x772b` `10f8 3fb4 | 08f8 3fb3` ; `0xa335` `f820 a33b | 08f8 0c6d` ; `0xa3cb`, `0xa3fb`, `0xa406`, `0xa423`, `0x91e3`, `0x9204` — tous du même moule), il ne reste comme **adresses** que `0x79e5` (ORM, set), `0x778b` (ANDM, clear) et `0xb2cd` (`76f8 08f8 0000`, ST #0 = reset NDB). **Le seul chemin qui pose le bit est `0x79e4`, et il est dans `0x7700–0x79F0`.** (Ceci corrige le brief : le « RMW @0xe5af » en PDROM est `ADD *(0x09f1),A`, et le « cluster 0xa335/0xa33b/0xa3cb » est de l'opcode — ce ne sont pas des writers.)
-
-**(4) Cette routine vit en banque COMMUNE, le noyau où le flux est envoyé vit en banque OVERLAY.**
-`c54x_prog_xlate` (`calypso_c54x.c` ≈4200) : `if (addr16 >= 0x8000 && addr16 < 0xE000) → XPC bank`. Donc `0x7700` est XPC-indépendant (toujours atteignable), tandis que `0x9500 / 0xa076 / 0x8d00` sont bancarisés. Le graphe de transferts de contrôle PROM0 confirme la séparation : la routine `0x77xx` n'a **aucun appelant hors d'elle-même**, sauf l'entrée `@0x76fb f272 7700` (`BD 0x7700`), et ses seules cibles internes sont `0x770d, 0x7794, 0x795f, 0x7773, 0x78e6, 0x79e8, 0x79d6…`. Symétriquement, tout le chemin rerouté reste bancarisé : `@0x9517/0x959a/0x95f8/0x9618 f274 → 0xa033`, `@0xa054 f273 → 0xa076`. **Les deux mondes ne se rejoignent jamais.**
-
-**(5) Et c'est précisément ce monde-là que `NATIVE_HELPED` alimente.**
-```c
-calypso_c54x.c:5736   if (is_call && src_pc == 0xb01e) {
-calypso_c54x.c:5743       if (_fbe && s->data[0x058a] == 5) {   /* d_task_md == 5 (commande FB) */
-calypso_c54x.c:5750           tgt = _fbentry;                   /* = CALYPSO_FB_CORR_ENTRY = 0x9500 */
-```
-Manifeste : `CALYPSO_FB_ENERGY=1` (`qemu.log:52`), `CALYPSO_FB_CORR_ENTRY=0x9500` (`qemu.log:4`). Au log :
-```
-:26109 +5.601s FB-ENERGY-REROUTE CALA@0xb01e tgt 0xab38 -> 0x9500
-:28363 +6.170s FB-ENERGY-REROUTE CALA@0xb01e tgt 0x8d00 -> 0x9500
-```
-Après boot, la CALA native résout vers **`0x8d00`** — et on la détourne quand même. Le détecteur `0x9ac0` tourne alors **97 400+ fois** (`:1712392 +1596.891s DETECTOR-RUN #97400`), `d_fb_mode` alterne 0↔1 (195 vs 328 échantillons loggés) — **l'ARM commande bien le FB, le DSP fait bien tourner un corrélateur, et ce corrélateur n'a pas de sortie**.
-
-**Résumé causal :** ARM commande FB (`d_task_md=5`, `d_fb_mode=1`) → CALA `0xb01e` → **reroute forcé vers `0x9500`** (noyau énergie bancarisé, sans publisher) → boucle `0x9ac0/0xa0xx` → jamais de retour vers la tâche banque-0 `0x7700` → `ORM #1,*(0x08f8)` @`0x79e4` jamais exécuté → `d_fb_det = 0` → l'ARM ne voit jamais de FCCH.
+**`0x7708` n'a aucun appelant dans les 4 banks** (aucune référence précédée de `f074`
+`CALL` ou `f272` `BD`) : le corps n'est atteignable que **par chute** depuis `0x7707`.
+L'entrée légitime est donc `0x76fb`.
 
 ---
 
-### 2. CAUSES SECONDAIRES PLAUSIBLES (classées)
+## 4. VALIDATION PAR BÉQUILLE — ce qu'elle prouve et où elle s'arrête
 
-**S1 — La tâche `0x7700` n'est pas dispatchée du tout, indépendamment du reroute.** *(probabilité haute, non départageable du #1 sans le test §4)*
-Le seul point d'entrée est `@0x76fb BD 0x7700`, atteint depuis l'ordonnanceur de tâches. Si l'ordonnanceur ne sélectionne jamais ce slot, désactiver le reroute ne suffira pas. Corrobore : les slots de dispatch bougent (`DISPATCH-CELL-RESEED` = 30 hits sur `0x43d8/0x3fd4/0x4368`) mais rien ne prouve qu'ils pointent vers `0x76fb`.
+`CALYPSO_BSP_DISPATCH_FB=1` installe une cible dans `0x43c0/0x4387/0x43d8` quand
+`task_md ∈ {5,6,8,9}` (+ `CALYPSO_BSP_DISPATCH_NOIMR=1`, ajouté pour séparer
+l'installation du démasquage IMR).
 
-**S2 — Garde d'état `dma(0x7e)` non satisfaite à l'entrée.** *(probabilité moyenne)*
-```
-0x7720: 107e            LD  dma(0x7e), A
-0x7721: f010 0004       SUB #4, A
-0x7723: f844 7729       BC  0x7729 if A != 0     <-- saute l'appel
-0x7725: f074 795f       CALL 0x795f              <-- corrélation + publish
-```
-et à l'intérieur, `0x795d: 767e 0004` (ST #4, dma(0x7e)), `0x795f-0x7962` re-teste ==4, `0x79e0-0x79e4` re-teste avant l'ORM. **Trois gardes sur la même cellule d'état.** ⚠️ `dma(0x7e)` dépend de DP au runtime : si `DP=0x11`, c'est `data[0x08fe]` (NDB, voisin de `d_fb_det`) ; **DP n'est pas mesuré**, c'est une hypothèse non vérifiée. Si S2 est la vraie garde, la correction est une écriture ARM→NDB, pas un changement de dispatch.
-
-**S3 — L'entrée `0x9500` imposée par l'env n'est pas l'entrée codée en ROM (`0x94f5`).** *(faible, mais réel)*
-Le défaut source est `_fbentry = 0x94f5` (`calypso_c54x.c:5737`), et `0x94f5` est bien référencé en ROM (`@0x87e7 f930 94f5`) ; `0x9500` ne l'est **nulle part** (0 hit sur 28672 mots). On saute donc 11 mots de mise en place (dont potentiellement ST1/DP/ARP). Effet secondaire possible sur la garde S2.
-
-**S4 — `CALYPSO_DEMOD_NOCLOBBER=1` gèle 8 mots de `0x2a00` sur un prétexte faux.** *(faible impact ici, mais dette réelle)*
-Le message dit « feed_iq autoritaire » alors que `CALYPSO_FB_IQ_DARAM=0` et `CALYPSO_FB_IQ_OWNS=0` (manifeste `:28`, `:15`). En pratique c'est `rx_burst` qui alimente (`calypso_bsp.c:1225`), donc la config n'est pas incohérente — mais le commentaire est trompeur et n'a que 8 hits cappés (`grep -c DEMOD-NOCLOBBER` = 8), donc **il n'apporte aucune information** sur l'état du buffer.
-
-**S5 — Asymétrie de verrou producteur/sonde.** *(non manifesté dans ce run)*
-Producteur sous `qemu_mutex_lock` (`calypso_bsp.c:1216/1295`), sonde DARAM-DUMP lit `s->data[]` sans verrou (`calypso_c54x.c:14666`). Lecture déchirée possible en principe ; réfutée en pratique ici (64 records byte-identiques ⇒ pas de course).
-
----
-
-### 3. DÉFINITIVEMENT ÉCARTÉ
-
-| Hypothèse | Preuve d'écartement |
+| Cible installée | Résultat mesuré |
 |---|---|
-| **Deux vues mémoire / shadow DARAM** | `calypso_c54x.h:198 uint16_t data[C54X_DATA_SIZE];` = tableau plat ; un seul `c54x_init` vivant (`calypso_trx.c:1921`) ; `calypso_bsp.c:809 bsp.dsp = dsp;` ; même pointeur `0x7b5cd4b5e010` côté WATCH-2A00 et côté feed-daram. |
-| **« Le burst suivant écrase la FCCH avant lecture »** | Consommateur (`0x9ac0`, 97 400 passages) largement plus fréquent que le producteur (216,7 dépôts/s, `DRAIN-CB delivered`). Non pertinent de toute façon : cf. ligne suivante. |
-| **« Le buffer 0x2a00 ne contient jamais de FCCH » (fait #3 du brief)** | **Artefact de fenêtre** : les 200 records couvrent `+5.609s→+6.073s`, période où `d_fb_mode=0x0000` (`:28240` à `+6.083s`). Mesure hors sujet. |
-| **« Les 200 records sont identiques »** | 5 corps distincts (md5 : blocs 16/64/16/16/32/16/16/16/8) ; 288 des 296 mots varient. |
-| **Seuil d'énergie / SNR trop haut dans le corrélateur** | Impossible : `ANGLE-WR` = 0 ⇒ même le `ST #0x4000, *(0x08fd)` **inconditionnel** de `0x798c` n'a jamais tourné. Le code de décision n'est pas atteint, il n'est pas « en échec ». |
-| **`0x08f8` non écrit parce que la sonde est aveugle** | `FBDET-WR` inconditionnel dans `data_write_locked`, dont la queue `s->data[addr]=val` (`:4186`) capte tous les stores DSP ; chaîne présente dans l'image vivante (§0.a). |
-| **« XPC ne passe jamais à 0xec07 »** | Confusion PC/XPC. `0xec07` est un **PC** cible (`@0x8e8a`, `@0x9ff5`), pas une valeur de XPC. |
-| **Toutes les citations `chemin:ligne` sont périmées** | Faux (§0.a) : seuls `depots_depuis`/`BUFFER FIGE` et l'en-tête `.cfile` le sont. |
+| `0x76fb` (entrée légitime) | routine entrée ; **préemptée à `0x7706`** par une IT → vecteur `0x00d4` ; ne reprend jamais |
+| `0x7708` (corps, raccourci) | high-water `0x7708` → **`0x7843`** ; garde `0x7720` atteinte ×3 — mais **rejette** |
+
+Pourquoi la garde rejette avec `0x7708` : `dma(0x7e)` est **DP-relatif**, et entrer au
+milieu de la routine se fait **sans le contexte de l'appelant** → `DP = 0x189`, la garde
+lit `data[0xc4fe] = 0x003e` au lieu d'une cellule NDB (`DP = 0x11` donnerait `0x08fe`,
+six mots après `d_fb_det`). **C'est une limite de la béquille, pas un défaut du firmware.**
+
+`data[0x08f8]` est touché **290 fois — uniquement par le CLEAR `0x778a`** (`0x0000 →
+0x0000`). Le publisher `0x79e4` n'a jamais tourné.
+
+**Ce que la béquille établit malgré tout :** le slot `0x43d8` est bien le verrou, et la
+chaîne amont (IT → scheduler → ISR → dispatcher) est fonctionnelle.
 
 ---
 
-### 4. LE TEST DÉCISIF
+## 5. LE VERROU SUIVANT — préemption vec21 (BRINT0)
 
-Il départage **#1 (reroute coupable)** de **S1/S2 (dispatch/garde d'état coupables)**. Il ne demande **aucun rebuild** : la sonde nécessaire (`FBDET-WR`, inconditionnelle) est déjà dans l'image.
+Sur le chemin **légitime** (`0x76fb`), la routine est préemptée six instructions après
+son entrée :
 
-**Relancer la pile avec une seule variable modifiée : `CALYPSO_FB_ENERGY=0`** (tout le reste identique — `NATIVE_HELPED=1`, `DSP_RUN_C54X=1`, `ARM2DSP_BGEN=1`, `FRAME_IT_NATIVE=1`). Laisser tourner ≥ 120 s, puis **une seule commande de verdict** :
+```
+0x7706  →  *** vers 0x00d4 ***  (op = 0xf4eb)
+```
+
+`0x00d4` = `0x0080 + 21×4` = **vec 21**. Le code le documente déjà
+(`calypso_c54x.c:2541`) : *« vec19(FRAME)@0xcc et vec21(BRINT0)@0xd4 sont des stubs
+RETE(0xf4eb)/NOP à froid »*. `f4eb` = `RETE`. C'est donc **l'arrivée de nouveaux
+échantillons I/Q (BRINT0) qui interrompt la routine FB**, et son handler est un simple
+retour d'interruption.
+
+**Question ouverte, à mesurer :** un `RETE` doit rendre la main à l'instruction
+interrompue (`0x7707`) et la routine devrait tomber dans son corps `0x7708`. Or elle
+repart de `0x76fb` au passage suivant. **Où le `RETE` retombe-t-il réellement ?**
+(sonde : les PC suivant la sortie + le sommet de pile).
+
+---
+
+## 6. CE QUI TOMBE DE LA VERSION PRÉCÉDENTE
+
+| Affirmation retirée | Pourquoi |
+|---|---|
+| « Cause racine #1 = le reroute `FB_ENERGY` vers un noyau bancarisé » | **retirée comme cause racine, pas comme fait** : les mesures qui la fondaient ont été prises alors que le DSP n'exécutait pas son firmware (§1). Le reroute lui-même **fonctionne** (2 tirs mesurés, +5,601 s et +6,170 s) et amène réellement le flux au corrélateur — `DADST`/`DETECTOR-RUN` le prouvent. Mais il y arrive par un chemin que la ROM n'emprunte pas, en court-circuitant l'étage qui publie : `d_fb_det` restait 0. |
+| « `CALA@0xb01e` = le dispatch FB » | elle fire à +0,111 s avec `d_task_md(0x0804/0x0818) = 0` — c'est de l'init. (Sa sonde était plafonnée à 40 tirs, tous consommés au boot.) |
+| « slot de dispatch `0x4387`/`0x43c0` » | le slot effectif est **`0x43d8`**, en adressage absolu |
+| « 30+ writers de `0x08f8` dans la PROM » | la quasi-totalité sont l'**opcode** `ADD *(lk),A` (ex. `@0x772b : 08f8 3fb3`), pas une adresse. Writers réels : `0x79e4` (set), `0x778a` (clear), `0xb2cd` (reset NDB). |
+| « 0 FCCH sur 200 dumps du buffer » | artefact de fenêtre : les 200 records ont été pris pendant `d_fb_mode = 0` (le DSP ne cherchait pas de FCCH). Corrigé : la sonde est désormais gatée `d_fb_mode != 0`. |
+
+### ⚠️ Correction d'une sur-affirmation (2026-07-27, tard)
+
+J'avais écrit que le gate du reroute (`s->data[0x058a] == 5`) testait une cellule valant
+« `0x4000` en permanence ». **C'est faux.** Les 40 échantillons de la sonde `CALA-FB`
+étaient tous pris entre +0,111 s et +0,176 s (le plafond de sonde était consommé au
+boot) ; or le reroute a firé plus tard, à +5,601 s et +6,170 s — donc `data[0x058a]`
+**prend bien la valeur 5**. Ce qui reste exact : `0x058a` est **sous `0x0800`**, donc en
+DARAM interne du DSP et **non** dans l'API RAM — ce n'est pas la cellule `d_task_md` de
+l'interface ARM (`0x0804` page0 / `0x0818` page1), mais rien n'interdit au firmware d'y
+cacher le mode courant. **À mesurer avant toute nouvelle affirmation.**
+
+### Ce que `DADST` / `SHADOW-DADST` prouvent, et ce qu'ils ne prouvent pas
+
+La sonde `SHADOW-DADST` (`calypso_c54x.c:14358`, non gatée) fire sur l'exécution d'un
+`DADST`/`DSADT` = le noyau corrélateur calcule. Elle **sort** en mode
+`NATIVE_HELPED` + `FB_ENERGY=1` (reroute actif) et **disparaît** en natif pur
+(`CALYPSO_DSP=none`, `FB_ENERGY=0`), où `DETECTOR-RUN` = 0.
+
+- ✅ ce que ça prouve : **le corrélateur émulé fonctionne** et peut calculer.
+- ❌ ce que ça ne prouve pas : que le firmware l'atteint. En natif il n'est appelable
+  que par `0x7725 : CALL 0x795f`, **après la garde `0x7720`** — qui rejette.
+
+Corollaire rétrospectif : la mesure « B2 : le corrélateur CALCULE, |A|=294908 », pilier
+de l'ancien dossier, décrivait un corrélateur **alimenté de force**. Elle ne dit rien du
+chemin natif.
+
+**`SHADOW-DADST` est donc le bon test de non-régression d'aval** : le jour où il refire
+*sans* `FB_ENERGY`, c'est que la garde est franchie et que le corrélateur travaille pour
+de vrai.
+
+Reste valide de la version précédente : le recoupement osmocom (§7), et le constat que
+`d_fb_det` et `a_sync_demod[]` proviennent du même étage — leurs deux zéros sont **un
+seul** producteur absent, pas deux symptômes.
+
+---
+
+## 7bis. REPRODUCTION
 
 ```bash
-docker exec osmo-operator-1 bash -lc 'echo "FBDET-WR=$(grep -c "FBDET-WR data\[0x08F8\]" /root/qemu.log)  ANGLE-WR=$(grep -c ANGLE-WR /root/qemu.log)  REROUTE=$(grep -c FB-ENERGY-REROUTE /root/qemu.log)"; grep -m5 "FBDET-WR data\[0x08F8\]\|ANGLE-WR" /root/qemu.log; grep "DETECTOR-RUN" /root/qemu.log | tail -1'
+cd /opt/GSM/qemu-src
+
+# mode natif VRAI (shunt désarmé) — impossible avant les correctifs du §1
+CALYPSO_NATIVE_HELPED=1 CALYPSO_DSP=none CALYPSO_FB_ENERGY=0 \
+  CALYPSO_FBCALL=1 CALYPSO_FBROUTE=1 CALYPSO_B4=1 ./start-clean.sh
+
+# graphe d'appels de la tâche FB (déclenché sur le front d_task_md → 5)
+grep -A60 "FBCALL === tache FB #1" /root/qemu.log
+
+# RANK3 : le slot et son unique installateur
+CALYPSO_SLOTSRC=1 CALYPSO_SCAN43D8=1 ...   # SLOTSRC-RD / SCAN43D8
+
+# béquille de validation (test, PAS un correctif)
+CALYPSO_BSP_DISPATCH_FB=1 CALYPSO_BSP_DISPATCH_FB_TGT=0x7708 \
+  CALYPSO_BSP_DISPATCH_NOIMR=1 CALYPSO_FBROUTE=1 ...
+grep -oE "FBROUTE high-water PC=0x[0-9a-f]+" /root/qemu.log | tail -1
+grep "FBROUTE jalon PC=0x7720" /root/qemu.log   # DP + adresse effective + valeur
 ```
 
-**Règle de décision, posée d'avance :**
-
-- **`FBDET-WR > 0`** (peu importe la valeur écrite, même `0x0000`) → **cause #1 CONFIRMÉE** : le reroute `FB_ENERGY` détournait le flux hors de l'unique publisher. Le correctif est §5-A.
-- **`FBDET-WR = 0` mais `ANGLE-WR > 0`** → la tâche `0x7700` tourne mais s'arrête avant `0x79e4` → **c'est S2** (garde `dma(0x7e)`/`XC` à `0x79e3`). Le `PC=` de la première ligne `ANGLE-WR` dit exactement où on s'arrête.
-- **`FBDET-WR = 0` ET `ANGLE-WR = 0`** → la tâche `0x7700` n'est jamais entrée → **c'est S1** (dispatch). Le reroute est innocent ; l'enquête bascule sur qui atteint `@0x76fb`, et il faudra une sonde `exec_pc == 0x76fb` (à ajouter, ~3 lignes).
-- Cas dégénéré à surveiller : si `DETECTOR-RUN` **cesse** d'apparaître avec `FB_ENERGY=0`, c'est que la CALA retombe sur le stub `0xab38` — alors le test est non concluant et il faut faire le B/ suivant : `CALYPSO_FB_ENERGY=1 CALYPSO_FB_CORR_ENTRY=0x94f5` (entrée ROM légitime) avant de conclure.
-
----
-
-### 5. CORRECTIF PROPOSÉ
-
-**A — si le test confirme #1 (le plus probable) : neutraliser le reroute, chirurgicalement.**
-- Fichier : `/opt/GSM/qemu-src/hw/arm/calypso/calypso_c54x.c`
-- Bloc : **`:5736`–`:5751`** (`if (is_call && src_pc == 0xb01e)`, gate `:5743 s->data[0x058a] == 5`, override `:5750 tgt = _fbentry;`)
-- Action minimale : ne rien toucher au code — passer `CALYPSO_FB_ENERGY=0` dans `/opt/GSM/qemu-src/calypso_native_helped.env` (idiome `:=` pour rester surchargeable en CLI, cf. mémoire *env-propagation*).
-- Action propre : conditionner le reroute au cas où la cible native est le **stub** seulement :
-  `:5743` → `if (_fbe && s->data[0x058a] == 5 && tgt == 0xab38)`.
-  Justification : au log, la cible native devient `0x8d00` dès `+6.170s` (`:28363`) ; le reroute n'avait de sens que contre `0xab38` (`:26109`).
-
-**Ce qui peut mal tourner (A) :** `0x8d00` est le « corrélateur symbole », pas le corrélateur FB — le commentaire `:5730-5731` affirme qu'il « ne touche jamais le buffer IQ `0x2a00` ni le noyau `0xa076` ». On peut donc perdre `DETECTOR-RUN` sans rien gagner (cas dégénéré du §4). Risque de régression sur le camp SHUNT : nul ici (`CALYPSO_DSP_SHUNT=0`, `SHUNT_LEGIT=0`), mais ne pas propager ce défaut aux profils shunt.
-
-**B — si le test pointe S2 : instrumenter la garde avant de corriger.**
-Ajouter dans `calypso_c54x.c` (à côté de la sonde `0x9ac0`, ≈`:14717`) un bloc `exec_pc == 0x7720` loggant `DP`, `dma(0x7e)` résolu et `A`, et un bloc `exec_pc == 0x76fb`. **Ne pas forcer la cellule tant que son adresse effective n'est pas mesurée** : si `DP=0x11`, l'écrire aveuglément corrompt `data[0x08fe]` dans le bloc NDB, à un mot de `d_fb_det` — exactement le genre d'empilement de correctif sur symptôme listé dans les pièges.
-
-**C — dette d'hygiène, à faire dans tous les cas (sinon la prochaine session repart sur du faux) :**
-1. **Rebuild-pendant-run.** Le binaire vivant est un inode supprimé (`/proc/3827436/exe → (deleted)`), rebuildé deux fois pendant la mesure. Interdire le build tant qu'un `qemu-system-arm` tourne, ou logger `md5sum` du binaire en tête de `qemu.log` à côté du manifeste.
-2. **Fenêtre de la sonde DARAM.** `calypso_c54x.c:14654` déclenche sur `exec_pc == _ddpc` sans condition d'état → le dump se remplit au boot et se ferme (`:14708`) avant que `d_fb_mode` passe à 1. Ajouter `&& s->data[0x08f9] != 0` : la sonde ne filmera plus que les passages en mode FB. **C'est ce défaut qui a produit le « fait établi #3 » et fait dérailler trois des cinq dimensions d'enquête.**
-3. Corriger le message `DEMOD-NOCLOBBER` (« feed_iq autoritaire ») qui est faux avec `FB_IQ_OWNS=0` — c'est `rx_burst` (`calypso_bsp.c:1225`) l'autoritaire.
-
----
-
-### 6. CE QUI RESTE INCERTAIN — à ne pas surinterpréter
-
-- **Le lien de causalité entre le reroute et la non-exécution de `0x7700` n'est PAS démontré**, seulement rendu plausible par la séparation banque-commune/overlay. Le reroute ne modifie qu'**une** CALA (`0xb01e`) ; il est parfaitement possible que `0x7700` soit dispatché par un chemin totalement indépendant qui, lui, est cassé pour une autre raison (S1). **C'est exactement ce que le test §4 tranche — ne pas appliquer le correctif A avant.**
-- **`dma(0x7e)` n'est pas résolu.** L'équivalence `dma(0x7e) ≡ data[0x08fe]` suppose `DP=0x11`, non mesuré. Hypothèse non vérifiée.
-- **Le décodage de `0xfc44` @`0x79e3` comme `XC n, ANEQ`** est une inférence par analogie avec `f844`/`f842`/`f846` (même octet bas = même condition). Non confirmé dans la table d'opcodes de `calypso_c54x.c`.
-- **Le contenu de `0x2a00` reste non caractérisé pendant les phases `d_fb_mode=1`** — soit 99,6 % du run. Tout ce qu'on sait de ce buffer vient d'une fenêtre de 0,46 s où le DSP ne cherchait pas de FCCH. Les analyses « signal écrêté / ton miroir / 35 valeurs complexes distinctes » décrivent un état hors-FB et **ne doivent pas être reportées** sur la phase FB.
-- **`d_fb_mode` alterne 0↔1 jusqu'à la fin du run** (dernier échantillon `+1620.263s` à `0x0000`) : le firmware ARM boucle sur sa recherche, ce qui est cohérent avec l'absence de détection, mais ne dit rien de plus.
-- Aucun des correctifs proposés n'a été appliqué ni compilé. Diagnostic en lecture seule, conformément à la préférence de restart de la pile.
-
----
+Sondes livrées, **toutes gatées par env et inactives par défaut** : `CALYPSO_FBROUTE`,
+`FBCALL`, `TASKGO`, `FBENTRY`, `DISPTAB`, `DISPIDX`, `SLOTSRC`, `SCAN43D8`, `SCANFB`,
+`CALA_FB`, `DARAM_DUMP` (+ verdict `DARAM-SANITY`), `BSP_DISPATCH_NOIMR`,
+`BSP_IQ_SHIFT`. À nettoyer une fois le dossier clos.
 
 ## 7. RECOUPEMENT AVEC OSMOCOM-BB — comment le vrai firmware obtient `d_fb_det`
 
@@ -248,3 +267,147 @@ docker exec osmo-operator-1 bash -lc 'cd /opt/GSM/osmocom-bb/src/target/firmware
   grep -n "d_fb_det" include/calypso/dsp_api.h layer1/prim_fbsb.c calypso/dsp.c && \
   sed -n 364,386p layer1/prim_fbsb.c && grep -n "FB_DSP_TASK" include/calypso/l1_environment.h'
 ```
+
+---
+
+## 8. BASELINE NATIF NU — ce que le firmware fait, sans aucune prothèse
+
+`calypso.env:213` source **inconditionnellement** `calypso_wire.env`, qui active par
+défaut une douzaine de béquilles : `ARM2DSP_BGEN`, `ARM2DSP_CTRLSYS`, `KEEP_IMR`,
+`TINT0_MASTER`, `FORCE_INTM_ONESHOT`, `BSP_DIRECT_BRINT0`, `BSP_DISPATCH_FB`,
+`BSP_DARAM_FORCE`, `FIX_3FCD`, `SEED5AC8_VAL`… Tous nos runs « natifs » les portaient.
+
+**Run de référence, toutes coupées** (`FORCE_INTM_ONESHOT=0 BSP_DIRECT_BRINT0=0
+KEEP_IMR=0 TINT0_MASTER=0 BSP_DISPATCH_FB=0 ARM2DSP_CTRLSYS=0`, `DSP=none`,
+`FB_ENERGY=0`) — DSP vivant : 9,4 M instructions, 22 266 lignes `[c54x]`, ARM postant
+`task_md=5` 53×, DSP l'enregistrant 84× :
+
+```
+d_task_md=5 → vec 0x00f0 → sched 0x7234 → 0x013b  (DÉRAIL, au lieu de 0x8341)
+  → 0xa4e4 → 0xa4fd → 0xb522 → 0xa501 → 0xa51c → 0xa531 → 0xa534 → 0xa53c
+      BITF *(AR1+0x10),0x8000 : data[0x0810]=0x0000 → TC=0 → BC 0xa575 PRIS
+  → 0xa575 → 0xaff9 → 0xd294 → 0xaffd → 0xb01c
+      LD *(0x43d8),A = 0xab38 → CALL → RET immédiat
+FBROUTE=0  SHADOW-DADST=0  FBDET-WR=0  ANGLE-WR=0
+```
+
+**Le graphe est IDENTIQUE à celui obtenu béquilles activées.** Seule `BSP_DISPATCH_FB`
+avait un effet mesurable (la `CALA` résolvait alors vers `0x8d00`). Les onze autres sont
+**inertes sur le chemin FB** — elles ont été écrites à une époque où le DSP n'exécutait
+pas son firmware.
+
+**Deux effets de bord de nos propres béquilles, identifiés au passage :**
+- `BSP_DIRECT_BRINT0=1` faisait lever vec21 par le BSP → c'est **notre** hack qui
+  préemptait la routine FB à `0x7706`, pas le firmware.
+- `BSP_DISPATCH_FB` était **déjà à 1 par défaut** ; si elle ne tirait pas, c'était à
+  cause de `get_task_md()` (défaut n°3 du §1), pas de la gate.
+
+### Ce que fait réellement `0x8d00` (sonde ARWATCH)
+
+Quand on force la `CALA` vers `0x8d00`, la routine **calcule vraiment** : chargement de
+coefficients (`0x8e8c`, `COEFFS-WR` → `0x2bc0..0x2bc7`), boucle MAC `0x8e97 ↔ 0x8ea8`
+avec accumulateur variant. Mais **aucun registre d'adresse ne pointe jamais dans le
+buffer IQ `[0x2a00..0x2b27]`** sur toute son exécution :
+
+```
+AR3 = 0x4bd0     source coefficients
+AR4 = 0x2bc0..   destination (workzone 0x2b28..0x2c00)
+AR5 = 0xdb7b..   opérande, +2 par itération — mémoire haute, hors buffer IQ
+```
+
+⚠️ **Ceci tranche une contradiction entre deux sources du projet**, en faveur du code :
+`calypso_c54x.c:5730` (« `0x8d00` ne touche jamais le buffer IQ `0x2a00` ») est
+**confirmé** ; `DOC_PATH_BOOT_TO_CORRELATOR_2026-07-25.md`, qui désigne `0x8d00` comme
+la cible de dispatch requise, est **infirmé sur ce point** — `0x8d00` corrèle autre
+chose. Corrobore la note `correlator-ar5-not-in-buffer-rank3` (AR5=0xdb7b).
+
+Le corrélateur qui lit réellement `0x2a00` est celui du chemin énergie
+(`AR-FIRSTUSE AR4=0x2a00 PC=0x9fb8`, `SHADOW-DADST=370` en mode *helped*). Son entrée
+**référencée en ROM** est `0x94f5` (`@0x87e7 f930 94f5`) ; `0x9500`, la valeur imposée
+par `calypso_native_helped.env`, n'apparaît **nulle part** dans les 28 672 mots — on
+saute 11 mots de mise en place (`ST1`/`DP`/`ARP` possibles).
+
+### LA question ouverte, désormais unique et bien posée
+
+> Pourquoi l'ordonnanceur de trame `0x7234` part-il vers `0x013b` au lieu de tomber sur
+> `0x8341` (la LUT FB), qui est la seule à installer un vrai handler dans le slot de
+> dispatch `0x43d8` ?
+
+C'est la formulation de `DOC_PATH_BOOT_TO_CORRELATOR_2026-07-25.md` — **désormais
+confirmée par la mesure sur un DSP qui exécute son firmware**, ce qui était impossible
+avant les correctifs du §1.
+
+
+---
+
+## 9. INVALIDATION de `DOC_PATH_BOOT_TO_CORRELATOR_2026-07-25.md`
+
+Ce document désignait la cause racine ainsi : *« le frame scheduler `0x7234` DÉRAILLE
+vers l'overlay `0x013b` via soft-vector au lieu de tomber sur `0x8341` (la LUT FB), seule
+à installer `0x8d00` dans le slot de dispatch »*, et proposait comme correctif un
+événement TPU redirigeant `0x7234 → 0x8341`.
+
+**Les deux affirmations sont fausses, mesurées séparément.**
+
+### (a) `0x8341` n'est atteignable par rien
+
+Scan des **4 banks** PROM (sonde `CALYPSO_SCANREF=0x8341`) : **`total = 0`**. Aucune
+référence — ni `CALL` (`f074`), ni `B` (`f820`/`f880`), ni même comme mot de donnée. Le
+code y est pourtant réel (`0x8341: 7624 0400 7625 0800 f7b9 f6b6 7711 2f22 …`), mais
+**personne ne peut y sauter**. Un correctif qui redirige vers `0x8341` redirigerait vers
+du code que le firmware n'appelle jamais.
+
+### (b) `0x7234 → 0x013b` n'est pas un dérail
+
+Désassemblage (`CALYPSO_TRACEFROM=0x7234`) :
+
+```
+0x7234:  f074 013b     CALL 0x013b        <- INCONDITIONNEL, en ROM, aucune branche
+0x7236:  7707 2900
+0x7238:  7706 1800
+0x723a:  68f8 001d fffc
+0x723d:  f074 a4e4     CALL 0xa4e4
+```
+
+Et `0x013b` est une **routine de sauvegarde de contexte** (dump overlay) : `8bf8 3fcd`
+puis la rafale `4a06 4a1c 4a1b …` (`PSHM`), terminée par `4bf8 3fcd f495 fc00` (`RET`).
+Elle **retourne** en `0x7236`, et l'exécution enchaîne sur `CALL 0xa4e4` — exactement ce
+que montre la trace `FBCALL`. C'est le fonctionnement nominal de la ROM, pas une dérive.
+
+### (c) Aucun writer caché du slot
+
+L'exclusion est forte : `DISPATCH-CELL-RESEED` est une watchpoint dans
+`data_write_locked`, donc elle voit **toutes** les écritures DSP de `data[0x43d8]`, quel
+que soit le mode d'adressage (indirect compris — un scan de mot littéral, lui, ne les
+verrait pas). Relevé : **uniquement `0xbb00 → 0xab38`, 15 fois, toutes dans les 0,18
+première seconde**. Rien ne remplace jamais le stub.
+
+### (d) Recoupement osmocom : la ROM seule est censée suffire
+
+`calypso/dsp_bootcode.c` :
+
+```c
+/* We don't really need any DSP boot code, it happily works with its own ROM */
+static const struct dsp_section *dsp_bootcode = NULL;
+```
+
+`dsp_pre_boot(NULL)` ne téléverse donc **rien**, et `dsp.c:205` porte un
+`/* FIXME: Implement Patch download, if any */` — le patch DSP n'est pas implémenté non
+plus. Sur vrai matériel, osmocom fait fonctionner la FBSB avec **la ROM seule**.
+
+### Ce que ça laisse
+
+> **La ROM seule suffit sur le téléphone réel. Notre émulation n'atteint pas le chemin
+> qui installe un vrai handler dans `data[0x43d8]`.**
+
+Les hypothèses « handler téléversé » et « dérail du scheduler » sont écartées. Restent :
+1. un **événement d'initialisation** non émulé, qui déclencherait une autre séquence
+   d'installation du slot ;
+2. le traitement FB **ne passe pas par ce slot** dans le firmware réel — auquel cas
+   `0xb01c` n'est pas le bon point d'observation ;
+3. une **divergence d'exécution** (décodage, banques, timing) qui fait rater au firmware
+   la branche qui installerait le handler.
+
+Aucune n'est départageable avec les mesures actuelles. Ce qui est acquis, en revanche,
+c'est qu'on ne perdra plus de temps sur le TPU ni sur `0x8341`.
+

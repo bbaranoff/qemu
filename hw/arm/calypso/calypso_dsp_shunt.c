@@ -165,6 +165,7 @@ static void calypso_sdcch_ul_publish(const uint8_t *l2, uint16_t task_u,
 }
 
 static void shunt_poll_si_shm(void);                /* fwd : poll SI shm (gr-gsm→a_cd) */
+static bool shunt_grgsm_off(void);                  /* fwd : CALYPSO_SHUNT_NO_GRGSM */
 
 /* ---- LATCH : called on ARM write to NDB+0 (d_dsp_page) ---- */
 static void shunt_latch_task(uint16_t new_d_dsp_page)
@@ -604,7 +605,13 @@ void calypso_dsp_shunt_on_frame_tick(void)
             const char *e = getenv("CALYPSO_DSP_RUN_C54X");
             run_c54x = (e && *e == '1') ? 1 : 0;
         }
-        if (run_c54x)
+        /* [2026-07-27] anti double-run : depuis le split du gate, le tick TDMA
+         * natif execute deja le DSP en mode ASSIST. Ce runner n a de sens que
+         * si le shunt SUBSTITUE (ou sur demande explicite). */
+        static int _drive = -1;
+        if (_drive < 0) { const char *d = getenv("CALYPSO_SHUNT_DRIVE_DSP");
+                          _drive = (d && *d == '1') ? 1 : 0; }
+        if (run_c54x && (_drive || calypso_dsp_shunt_substitutes()))
             shunt_route_to_c54x_run();
     }
 
@@ -1186,6 +1193,11 @@ static void shunt_gsmtap_read(void *opaque)
 
 static void shunt_gsmtap_init(void)
 {
+    if (shunt_grgsm_off()) {
+        SHUNT_ERR("gr-gsm COUPE : listener GSMTAP/SI :4730 NON arme "
+                  "-> si_buf (BCCH/SI) doit venir du DSP");
+        return;
+    }
     const char *p = getenv("CALYPSO_SHUNT_GSMTAP_PORT");
     int port = (p && *p) ? atoi(p) : 4730;
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -1275,8 +1287,22 @@ static void shunt_sch_read(void *opaque)
     }
 }
 
+/* [2026-07-28] CALYPSO_SHUNT_NO_GRGSM : voir en-tete du patch. */
+static bool shunt_grgsm_off(void)
+{
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("CALYPSO_SHUNT_NO_GRGSM");
+                 v = (e && *e == '1') ? 1 : 0; }
+    return v != 0;
+}
+
 static void shunt_sch_init(void)
 {
+    if (shunt_grgsm_off()) {
+        SHUNT_ERR("gr-gsm COUPE (CALYPSO_SHUNT_NO_GRGSM=1) : listener SCH :4731 NON arme "
+                  "-> sb_bsic/sb_fn/sb_toa doivent venir du DSP");
+        return;
+    }
     const char *p = getenv("CALYPSO_SHUNT_SCH_PORT");
     int port = (p && *p) ? atoi(p) : 4731;
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -1647,6 +1673,63 @@ void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
                             g_shunt.rx_snr, g_shunt.rx_afc);
                     rfl++;
                 }
+                /* [2026-07-28] SHUNT_DSP_FB : voir en-tete du patch. */
+                {
+                    static int _sdf = -1; static uint16_t _entry = 0x94f5;
+                    static int _budget = 20000; static unsigned _sdfn = 0;
+                    static unsigned _sdfmax = 40;   /* borne totale d excursions */
+                    static uint16_t _spscratch = 0x5000;  /* pile dediee a l excursion */
+                    if (_sdf < 0) {
+                        const char *e = getenv("CALYPSO_SHUNT_DSP_FB");
+                        _sdf = (e && *e == '1') ? 1 : 0;
+                        const char *p = getenv("CALYPSO_SHUNT_DSP_FB_ENTRY");
+                        if (p && *p) _entry = (uint16_t)strtol(p, NULL, 0);
+                        const char *b = getenv("CALYPSO_SHUNT_DSP_FB_BUDGET");
+                        if (b && *b) _budget = atoi(b);
+                        const char *m = getenv("CALYPSO_SHUNT_DSP_FB_MAX");
+                        if (m && *m) _sdfmax = (unsigned)atoi(m);
+                        const char *sp = getenv("CALYPSO_SHUNT_DSP_FB_SP");
+                        if (sp && *sp) _spscratch = (uint16_t)strtol(sp, NULL, 0);
+                        if (_sdf)
+                            SHUNT_ERR("SHUNT_DSP_FB arme : entree=0x%04x budget=%d "
+                                      "(correlateur DSP pilote par le shunt ; REAL_FB reste l oracle)",
+                                      _entry, _budget);
+                    }
+                    /* borne stricte : au-dela, inerte — sinon on affame osmocon/mobile (28/07). */
+                    if (_sdf && g_shunt.c54x && _sdfn < _sdfmax) {
+                        C54xState *_d = g_shunt.c54x;
+                        /* --- sauvegarde du contexte --- */
+                        uint16_t _pc = _d->pc, _xpc = _d->xpc, _sp = _d->sp;
+                        uint16_t _st0 = _d->st0, _st1 = _d->st1, _t = _d->t;
+                        int64_t  _a = _d->a, _b = _d->b;
+                        bool     _idle = _d->idle;
+                        uint16_t _ar[8];
+                        for (int _k = 0; _k < 8; _k++) _ar[_k] = _d->ar[_k];
+                        /* --- excursion bornee dans le correlateur --- */
+                        /* pile DEDIEE : l excursion ne doit jamais ecrire dans la pile du DSP
+                         * (restaurer SP ne restaure pas le CONTENU ecrase). */
+                        _d->sp = _spscratch;
+                        _d->pc = _entry; _d->idle = false; _d->running = true;
+                        c54x_run(_d, _budget);
+                        _sdfn++;
+                        if (_sdfn <= _sdfmax) {
+                            fprintf(stderr, "[feed-daram-dsp] DSP-FB fn=%u sortie PC=0x%04x "
+                                    "A=0x%010llx B=0x%010llx AR4=%04x AR5=%04x "
+                                    "wz[2c00..03]=%04x %04x %04x %04x | oracle det=%d coh=%.3f\n",
+                                    fn, _d->pc,
+                                    (unsigned long long)(_d->a & 0xFFFFFFFFFFULL),
+                                    (unsigned long long)(_d->b & 0xFFFFFFFFFFULL),
+                                    _d->ar[4], _d->ar[5],
+                                    _d->data[0x2c00], _d->data[0x2c01],
+                                    _d->data[0x2c02], _d->data[0x2c03], det, coh);
+                        }
+                        /* --- restauration : le DSP retrouve son etat exact --- */
+                        _d->pc = _pc; _d->xpc = _xpc; _d->sp = _sp;
+                        _d->st0 = _st0; _d->st1 = _st1; _d->t = _t;
+                        _d->a = _a; _d->b = _b; _d->idle = _idle;
+                        for (int _k = 0; _k < 8; _k++) _d->ar[_k] = _ar[_k];
+                    }
+                }
             }
         }
     }
@@ -1735,6 +1818,7 @@ void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
 /* SORTIE du DSP shunte : gr-gsm a-t-il ecrit un nouveau SI ? Si oui -> a_cd. */
 static void shunt_poll_si_shm(void)
 {
+    if (shunt_grgsm_off()) return;   /* SI shm = ecrit par gr-gsm */
     if (!g_shm)
         return;
     uint32_t seq = g_shm->si_seq;
@@ -1948,13 +2032,38 @@ bool calypso_dsp_shunt_active(void)
     return g_shunt.active;
 }
 
+/* [2026-07-27] SPLIT DU GATE — voir en-tete du patch.
+ * active()      = l infrastructure shunt est armee (overlay NDB, ponts, feeds).
+ *                 VRAI aussi en mode ASSIST (CALYPSO_DSP=c54x).
+ * substitutes() = le shunt REMPLACE le DSP (mock ARM) -> et LUI SEUL doit
+ *                 gater les c54x_run natifs. FAUX en mode assist, ou le vrai
+ *                 DSP execute son firmware et doit tourner a la cadence trame. */
+bool calypso_dsp_shunt_substitutes(void)
+{
+    if (!g_shunt.active) return false;
+    if (calypso_l1_c_active()) return true;      /* L1=c : modele HLE remplace le DSP */
+    { const char *e = getenv("CALYPSO_DSP_SHUNT");
+      return (e && strcmp(e, "1") == 0); }      /* mock explicite */
+}
+
 /* Public getter — mission courante du DSP (d_task_md, lu du write-page ARM).
  * Sert a gater les wires inter-blocs (BSP BRINT0 / TPU DSP_INT_PG) sur la
  * mission FB/SB reelle. Valeurs (osmo l1_environment.h) : FB_DSP_TASK=5,
  * SB_DSP_TASK=6, TCH_FB=8, TCH_SB=9. 0 = pas de tache. */
 uint16_t calypso_dsp_shunt_get_task_md(void)
 {
-    return g_shunt.d_task_md;
+    if (g_shunt.d_task_md) return g_shunt.d_task_md;
+    /* [2026-07-27] FALLBACK NATIF : hors shunt, g_shunt.d_task_md n est JAMAIS
+     * alimente (pose uniquement par shunt_latch_task) -> l accesseur renvoyait 0
+     * en permanence et tuait silencieusement tous ses appelants cote natif.
+     * On lit alors la cellule API RAM du DSP : d_task_md page0 = 0x0804,
+     * page1 = 0x0818. La branche shunt ci-dessus reste prioritaire. */
+    if (g_shunt.c54x && g_shunt.c54x->data) {
+        uint16_t _a = g_shunt.c54x->data[0x0804];
+        if (_a) return _a;
+        return g_shunt.c54x->data[0x0818];
+    }
+    return 0;
 }
 
 /* CALYPSO_DSP=c54x : relie le handle du VRAI DSP (depuis calypso_mb.c). */

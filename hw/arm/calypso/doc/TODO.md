@@ -42,24 +42,50 @@ SHUNT (LU ACCEPT + TMSI REALLOC + On Network) et le RACH UL qui la fermait.
 
 ## NATIF (DSP c54x fait le FBSB - WIP)
 
-- **[P1] d_fb_det : le correlateur tourne mais 0 detection**
-  - Etat : en NATIF le correlateur DSP TOURNE (atteint 0x8d00, DETECTOR-RUN
-    @0x9ac0, d_fb_mode=1) mais `d_fb_det[0x08f8]` reste 0 -> aucune detection FB.
-    (Supersede l'ancien "0x8d00 = 0 hit / jamais dispatche" : le mur a bouge.)
-  - Quoi : cabler / regler la detection FB en sortie de correlateur -> poser
-    `d_fb_det[0x08f8]` : fenetre de detection + dispatch par-trame.
-  - Ou : `DSP_ADDRESS_MAP.md` / `DSP_ARM_LINKAGE.md` ; DETECTOR-RUN @0x9ac0 ;
-    entree IQ data[0x9213/0x9215] (NATIVE_HELPED : feed_iq DARAM 0x9210).
-  - Honnetete : le buffer IQ RX n'est pas cable au recepteur on-chip en QEMU.
+> Reecrit 2026-07-28. Le natif **n'avait jamais tourne** avant cette date (SIGSEGV au
+> boot + DSP jamais sorti de son bootloader) : toute mesure anterieure est
+> ininterpretable. Detail : `ETAT_ACTUEL.md` §3, `../../../RAPPORT_DFBDET.md` §8-9.
 
-- **[P2] Camp natif ("No sysinfo")**
-  - Etat : rxlev natif = DONE (-47 dBm reel, modele trf6151/DECAN) mais FB pas
-    detecte -> "No sysinfo" -> pas de camp -> pas de LU/SMS en natif.
-  - Quoi : une fois d_fb_det pose (P1 ci-dessus), faire remonter les SI pour
-    atteindre C3 camped en natif, puis derouler LU / SMS.
-  - Depend de : P1 NATIF.
+- **[P0] ✅ FAIT — rendre le natif observable** (4 defauts « le natif depend du shunt »)
+  - SIGSEGV `g_shunt.as = NULL` ; early-boot gate sur le routage shunt ; `get_task_md()`
+    shunt-only ; split `active()` / `substitutes()`.
+  - Effet mesure : DSP a la cadence trame (`dsp_n_exec_2/5 = 32768`) et
+    **`DSP_ERR_STACK_OV` eteint**.
 
----
+- **[P1] Pointeur d'entree du demod jamais initialise** ← *le verrou courant*
+  - Mesure (`CALYPSO_DEMODRD`, `XPC=0`) : le demod lit ses echantillons a
+    `data[0x0000]`, `[0x0005]`, `[0x000a]` (pas de 5) — que des zeros ; `AR6 = 0000` sur
+    toutes les iterations, alors que `AR4` (ecriture) parcourt bien `0x2a00+`.
+  - Consequence : **toute l'IQ injectee depuis des semaines n'a jamais ete lue**
+    (`0x2a00`, `0x9213/0x9215`, `0x9260/0x9261`).
+  - Hypothese a tester EN PREMIER : on entre en `0x9500` alors que l'entree ROM est
+    `0x94f5` -> 11 mots de mise en place sautes. `CALYPSO_FB_CORR_ENTRY=0x94f5`
+    (**verifier la valeur dans `/proc/<pid>/environ`** : un run l'a recue tronquee).
+  - Si insuffisant : identifier qui pose `AR6` en amont, et le reproduire.
+
+- **[P2] Slot de dispatch FB = stub `RET`**
+  - `0xb01c: 10f8 43d8` (adressage **absolu**, ni `0x4387` ni `0x43c0`).
+    `data[0x43d8] = 0xab38`, dont le 1er mot est `fc00` = `RET`. Unique ecrivain sur les
+    4 banks : `0xbb00`. Aucun writer cache (watchpoint dans `data_write_locked`).
+  - ⚠️ **NE PAS refaire** le correctif TPU de `DOC_PATH_BOOT_TO_CORRELATOR_2026-07-25.md` :
+    `0x8341` a **0 reference** sur 4 banks, et `0x7234 -> 0x013b` est un **CALL ROM
+    inconditionnel** qui retourne (mesures 28/07).
+  - Bequille de validation dispo : `CALYPSO_BSP_DISPATCH_FB=1` (+ `_TGT`, `_NOIMR`).
+
+- **[P3] `d_fb_det` : personne ne l'ecrit en natif**
+  - Verifie des 2 cotes du miroir api_ram (`CALYPSO_FBDET_API`) : seul l'ARM touche la
+    cellule, toujours a 0. Le `FB0_SEARCH -> SB_SEARCH` observe est le **renoncement**
+    d'osmocom, pas une detection (`BSIC=0`, `snr=0`).
+  - Depend de P1 puis P2.
+
+- **[P4] Remplacer gr-gsm par le DSP DANS `SHUNT_LEGIT`** (plan 2026-07-28)
+  - Le FB ne depend **deja plus** de gr-gsm (correlateur hote `REAL_FB`, 280/300
+    detections). Restent SCH (`sb_bsic/sb_fn/sb_toa`) et SI (`si_buf`).
+  - Couper gr-gsm : `CALYPSO_SHUNT_NO_GRGSM=1`.
+  - Piloter le correlateur DSP depuis le shunt : `CALYPSO_SHUNT_DSP_FB=1`
+    (excursion **bornee** `_MAX`, **pile dediee** `_SP` — sans elle on corrompt la pile
+    du DSP et `STACK_OV` revient).
+  - Ordre : FB (fait) -> SCH -> SI. Oracle a chaque etape = le producteur actuel.
 
 ## Dette transverse (tous modes, P3)
 
