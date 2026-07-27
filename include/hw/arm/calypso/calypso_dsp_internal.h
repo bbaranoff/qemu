@@ -153,6 +153,9 @@ struct dsp_shunt_state {
     uint8_t    sdcch_buf[23];
     bool       sdcch_valid;
     uint32_t   sdcch_tick;           /* legacy single-slot */
+    uint8_t    sdcch_ss;             /* base DL fn%51 de la voie dediee (SDCCH/4 ou /8) */
+    bool       sdcch_ss_set;         /* true = sdcch_ss issu d'un IMM-ASS valide (sinon defaut 22) */
+    bool       sdcch_ch8;            /* true = derniere assignation = SDCCH/8 (sinon /4) */
     /* PM REEL (no-hardcode) : magnitude moyenne du dernier burst DL (feed_iq).
      * Remplace le canned 0x7000 / le 0=-110 : le firmware en derive le vrai rxlev. */
     uint16_t   last_pm;

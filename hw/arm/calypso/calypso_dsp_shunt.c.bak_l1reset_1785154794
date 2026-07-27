@@ -675,13 +675,7 @@ void calypso_dsp_shunt_on_frame_tick(void)
                  * sinon si_rr FIGE une fois came et SI3 n'est plus livre en idle ->
                  * moniteur cellule servante famine -> no-cell-info chaque seconde. */
                 static unsigned si_rot = 0;
-                /* [2026-07-27] rotation SI accELErEe : avance si_rr a chaque bloc
-                 * (mask 0) au lieu de tous les 8 -> le mobile re-collecte SI1+SI2+SI3
-                 * VITE apres un dedie (sinon sync timeout -> No service post-SMS).
-                 * Tunable CALYPSO_SHUNT_SI_ROT_MASK (0=chaque bloc, 7=ancien). */
-                static int _rotmask = -1;
-                if (_rotmask < 0) { const char *e = getenv("CALYPSO_SHUNT_SI_ROT_MASK"); _rotmask = (e && *e) ? atoi(e) : 7; }
-                if ((si_rot++ & (unsigned)_rotmask) == 0) {
+                if ((si_rot++ & 7) == 0) {
                     for (int k = 1; k <= 6; k++) {
                         int si = (g_shunt.si_rr + k) % 6;
                         if (g_shunt.si_set_have[si]) { g_shunt.si_rr = si; break; }
@@ -910,33 +904,6 @@ static void calypso_dsp_shunt_feed_agch(const uint8_t *l2, int len)
     int n = len < 23 ? len : 23;
     memcpy(g_shunt.agch_buf, l2, n);
     for (int i = n; i < 23; i++) g_shunt.agch_buf[i] = 0x2B;
-    /* [2026-07-27] SONDE sous-voie SDCCH de l IMM-ASS (channel desc [4..6]) :
-     * confirme le mismatch SS0-hardcode vs sous-voie assignee (cause rejet SMS flaky). */
-    if (g_shunt.agch_buf[2] == 0x3f) {
-        uint8_t cd0 = g_shunt.agch_buf[4];
-        /* [2026-07-27] Base DL fn%%51 de la voie dediee assignee (GSM 05.02, cf
-         * firmware mframe_sched.c). chan_desc.chan_nr = cd0. Le RESEAU ICI assigne
-         * du SDCCH/8 (01SSS, DL base=SS*4) et parfois SDCCH/4 (001SS). On calcule
-         * la base DL et on la memorise pour presenter l'UA sur la BONNE fenetre. */
-        int _ss = -1, _base = -1; const char *_ct = "?";
-        if ((cd0 & 0xE0) == 0x20) {            /* SDCCH/4 combined : 001SS */
-            _ss = (cd0 >> 3) & 0x03; _ct = "SDCCH/4";
-            static const int b4[4] = { 22, 26, 32, 36 };
-            _base = b4[_ss];
-        } else if ((cd0 & 0xC0) == 0x40) {     /* SDCCH/8 : 01SSS, DL base = SS*4 */
-            _ss = (cd0 >> 3) & 0x07; _ct = "SDCCH/8";
-            _base = _ss * 4;                    /* 0,4,8,12,16,20,24,28 (mod 51) */
-        }
-        if (_base >= 0) { g_shunt.sdcch_ss = (uint8_t)_base; g_shunt.sdcch_ss_set = true;
-                          g_shunt.sdcch_ch8 = ((cd0 & 0xC0) == 0x40); }  /* base + type /4|/8 */
-        static unsigned _iac = 0;
-        if (_iac++ < 80) {
-            fprintf(stderr, "[dsp-shunt] IMM-ASS chan_desc=[%02x %02x %02x] %s SS=%d base=%d TN=%u req-ref=[%02x %02x %02x]\n",
-                    g_shunt.agch_buf[4], g_shunt.agch_buf[5], g_shunt.agch_buf[6],
-                    _ct, _ss, _base, cd0 & 0x07,
-                    g_shunt.agch_buf[7], g_shunt.agch_buf[8], g_shunt.agch_buf[9]);
-        }
-    }
 
     /* FN-FIX (le vrai fix, ON par defaut ; CALYPSO_REQREF_REWRITE=0 pour A/B) :
      * reecrit la request-reference de l'IMM ASSIGN (octets L2 [8],[9]) au FN EXACT que
@@ -1893,19 +1860,6 @@ bool calypso_dsp_shunt_fb_stream_next(uint16_t *outI, uint16_t *outQ)
     *outI = (uint16_t)g_fbs[g_fbs_rd++ & (FBS_RING-1)];
     *outQ = (uint16_t)g_fbs[g_fbs_rd++ & (FBS_RING-1)];
     return true;
-}
-
-/* [2026-07-27] Reset L1 (Ctrl-C mobile / L1CTL_RESET_REQ FULL) : clear l'etat
- * transitoire du shunt (IMM-ASSIGN / SDCCH-DL latches par un SMS) qui sinon
- * supprime le SI apres la relance -> le mobile ne re-campe pas. Appele depuis
- * calypso_arm2dsp.c quand l'ARM ecrit d_dsp_page=0 (l1s_reset_hw). */
-void calypso_dsp_shunt_l1_reset(void)
-{
-    g_shunt.agch_valid  = false;
-    g_shunt.sdcch_valid = false;
-    g_shunt.sdcch_ss_set = false;   /* reset -> defaut base 22 (SDCCH/4 SS0) */
-    /* PAS de si_rr=0 : d_dsp_page=0 fire aussi sur les mesures (l23_api.c:414) /
-     * FBSB -> reset si_rr figerait la rotation SI en no_canned. */
 }
 
 void calypso_dsp_shunt_set_c54x(C54xState *s)
