@@ -5905,7 +5905,7 @@ static int c54x_exec_one(C54xState *s)
                         g_vec28_tracing = false;
                     }
                 }
-            if (nx > 2)
+            if (nx > 3)   /* PROM0..3 = 4 pages ; page 3 legitime (masque & 3) */
                 C54_DBG("XPC-OOR", "FRET xpc=0x%04x PC=0x%04x SP=0x%04x insn=%u",
                         nx, s->pc, s->sp, s->insn_count);
             s->xpc = nx & 3;
@@ -14545,6 +14545,16 @@ int c54x_run(C54xState *s, int n_insns)
             }
         }
         if (exec_pc == 0x9ac0) {
+            /* [2026-07-27] B2SEQ (gated CALYPSO_B2SEQ) : dump 16 paires (I,Q) de
+             * 0x2a00 (VRAIE entree corr, depot BSP/ADC). Pattern Fs/4 = FCCH :
+             * (a,0)(0,a)(-a,0)(0,-a).. ; quasi-constant = DC sans ton (entree vide). */
+            { static int _b2s = -1; static unsigned _b2sn = 0;
+              if (_b2s < 0) _b2s = getenv("CALYPSO_B2SEQ") ? 1 : 0;
+              if (_b2s && _b2sn < 8) { _b2sn++;
+                  fprintf(stderr, "[c54x] B2SEQ 0x2a00 (I,Q)x16:");
+                  for (int _i = 0; _i < 16; _i++)
+                      fprintf(stderr, " (%d,%d)", (int)(int16_t)s->data[0x2a00 + 2*_i], (int)(int16_t)s->data[0x2a00 + 2*_i + 1]);
+                  fprintf(stderr, "\n"); } }
             static unsigned dr = 0;
             if (dr < 30 || (dr % 200) == 0)
                 fprintf(stderr, "[c54x] DETECTOR-RUN #%u @0x9ac0 d_fb_mode[08f9]=0x%04x "

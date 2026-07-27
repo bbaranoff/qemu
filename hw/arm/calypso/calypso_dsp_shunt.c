@@ -1948,6 +1948,28 @@ bool calypso_dsp_shunt_fb_stream_next(uint16_t *outI, uint16_t *outQ)
     if (g_fbs_rd + 1 >= g_fbs_wr) return false;
     *outI = (uint16_t)g_fbs[g_fbs_rd++ & (FBS_RING-1)];
     *outQ = (uint16_t)g_fbs[g_fbs_rd++ & (FBS_RING-1)];
+    /* [2026-07-27] B2IN (gated CALYPSO_B2IN) : mesure la VRAIE entree corr
+     * (0x9213/0x9215 = CE stream), pas la sortie 0x2a00. max|I|/|Q| + energie +
+     * indice du max sur 296 -> tranche "entree morte/DC" vs "vrai ton FCCH". */
+    {
+        static int _b2i = -1; static unsigned _n = 0, _imax = 0, _qmax = 0; static int _iidx = -1;
+        static uint64_t _e = 0; static unsigned _wn = 0;
+        if (_b2i < 0) _b2i = getenv("CALYPSO_B2IN") ? 1 : 0;
+        if (_b2i) {
+            int16_t _I = (int16_t)*outI, _Q = (int16_t)*outQ;
+            unsigned _ai = _I < 0 ? (unsigned)(-_I) : (unsigned)_I;
+            unsigned _aq = _Q < 0 ? (unsigned)(-_Q) : (unsigned)_Q;
+            if (_ai > _imax) { _imax = _ai; _iidx = (int)_wn; }
+            if (_aq > _qmax) _qmax = _aq;
+            _e += (uint64_t)_I * _I + (uint64_t)_Q * _Q;
+            if (++_wn >= 296) {
+                if (_n++ < 30)
+                    fprintf(stderr, "[dsp-shunt] B2IN (0x9213/0x9215) win=296 max|I|=%u@%d max|Q|=%u energy=%llu\n",
+                            _imax, _iidx, _qmax, (unsigned long long)_e);
+                _wn = 0; _imax = 0; _qmax = 0; _iidx = -1; _e = 0;
+            }
+        }
+    }
     return true;
 }
 
