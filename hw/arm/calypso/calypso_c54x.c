@@ -1643,12 +1643,19 @@ static uint16_t data_read(C54xState *s, uint16_t addr)
     /* [2026-07-27] FB-STREAM : injecte un echantillon FCCH FRAIS a chaque lecture
      * de la cellule sample du demod (0x9213 I / 0x9215 Q) -> vraie fenetre dans
      * 0x2a00, sans dependre de la cadence. Modelise le DMA on-chip. Gate CALYPSO_FB_STREAM. */
-    if (s->pc >= 0x9f00 && s->pc <= 0x9fb8 && (addr == 0x9213 || addr == 0x9215)) {
+    /* [2026-07-27] cellules I/Q du demod configurables : WATCH-9F00-RD a montre
+     * que le demod lit 0x9260/0x9261 (pas 0x9213/0x9215). CALYPSO_FB_STREAM_CELL(Q). */
+    static uint16_t _fscI = 0, _fscQ = 0;
+    if (_fscI == 0) {
+        const char *c = getenv("CALYPSO_FB_STREAM_CELL");  _fscI = c ? (uint16_t)strtol(c, NULL, 0) : 0x9213;
+        const char *q = getenv("CALYPSO_FB_STREAM_CELLQ"); _fscQ = q ? (uint16_t)strtol(q, NULL, 0) : 0x9215;
+    }
+    if (s->pc >= 0x9f00 && s->pc <= 0x9fb8 && (addr == _fscI || addr == _fscQ)) {
         static int _fs = -1;
         if (_fs < 0) _fs = getenv("CALYPSO_FB_STREAM") ? 1 : 0;
         if (_fs) {
             static uint16_t _si, _sq; static int _hv = 0; uint16_t _rv;
-            if (addr == 0x9213) { _hv = calypso_dsp_shunt_fb_stream_next(&_si, &_sq) ? 1 : 0; _rv = _hv ? _si : s->data[addr]; }
+            if (addr == _fscI) { _hv = calypso_dsp_shunt_fb_stream_next(&_si, &_sq) ? 1 : 0; _rv = _hv ? _si : s->data[addr]; }
             else { _rv = _hv ? _sq : s->data[addr]; }
             static unsigned _sl = 0;
             if (_sl++ < 24)
@@ -14544,6 +14551,29 @@ int c54x_run(C54xState *s, int n_insns)
                 if ((s->pc == 0xec07) || (s->pc >= 0x8d00 && s->pc <= 0x8d10)) _armed = 0;
             }
         }
+        if (exec_pc == 0xa076) {   /* kernel MAC = LECTURE des operandes (I/Q + coeffs) */
+            static int _b2k = -1; static unsigned _b2kn = 0;
+            if (_b2k < 0) _b2k = getenv("CALYPSO_B2AR") ? 1 : 0;
+            if (_b2k && _b2kn < 16) {
+                _b2kn++;
+                #define _INB(a) (((a) >= 0x2a00 && (a) < 0x2b28) ? "IN" : "oob")
+                fprintf(stderr, "[c54x] B2KERN @0xa076 AR2=%04x[%d]%s AR3=%04x[%d]%s AR4=%04x[%d]%s AR5=%04x[%d]%s\n",
+                        s->ar[2],(int)(int16_t)s->data[s->ar[2]],_INB(s->ar[2]),
+                        s->ar[3],(int)(int16_t)s->data[s->ar[3]],_INB(s->ar[3]),
+                        s->ar[4],(int)(int16_t)s->data[s->ar[4]],_INB(s->ar[4]),
+                        s->ar[5],(int)(int16_t)s->data[s->ar[5]],_INB(s->ar[5]));
+                #undef _INB
+            }
+        }
+        if (exec_pc == 0x93a5) {   /* consommateur DARAM 0x2a00 (AR3 post-inc) = VRAIE entree corr */
+            static int _b2c = -1; static unsigned _b2cn = 0;
+            if (_b2c < 0) _b2c = getenv("CALYPSO_B2SEQ") ? 1 : 0;
+            if (_b2c && _b2cn < 8) { _b2cn++;
+                fprintf(stderr, "[c54x] B2SEQ-IN 0x2a00@0x93a5 (I,Q)x16:");
+                for (int _i = 0; _i < 16; _i++)
+                    fprintf(stderr, " (%d,%d)", (int)(int16_t)s->data[0x2a00 + 2*_i], (int)(int16_t)s->data[0x2a00 + 2*_i + 1]);
+                fprintf(stderr, "\n"); }
+        }
         if (exec_pc == 0x9ac0) {
             /* [2026-07-27] B2SEQ (gated CALYPSO_B2SEQ) : dump 16 paires (I,Q) de
              * 0x2a00 (VRAIE entree corr, depot BSP/ADC). Pattern Fs/4 = FCCH :
@@ -14561,6 +14591,17 @@ int c54x_run(C54xState *s, int n_insns)
                         "d_fb_det[08f8]=0x%04x insn=%u\n",
                         dr, s->data[0x08f9], s->data[0x08f8], s->insn_count);
             dr++;
+            /* [2026-07-27] B2AR (gated CALYPSO_B2AR) : ou pointent les AR du corr
+             * + valeur lue. AR5/AR3 dans [0x2a00..0x2b27] => lit la FCCH ; hors =>
+             * lit a cote (RANK3, pointeur mal initialise). */
+            { static int _b2a = -1; static unsigned _b2an = 0;
+              if (_b2a < 0) _b2a = getenv("CALYPSO_B2AR") ? 1 : 0;
+              if (_b2a && _b2an < 12) { _b2an++;
+                  int _a3in = (s->ar[3] >= 0x2a00 && s->ar[3] < 0x2b28);
+                  int _a5in = (s->ar[5] >= 0x2a00 && s->ar[5] < 0x2b28);
+                  fprintf(stderr, "[c54x] B2AR @0x9ac0 AR2=%04x AR3=%04x[%d]%s AR4=%04x AR5=%04x[%d]%s\n",
+                          s->ar[2], s->ar[3], (int)(int16_t)s->data[s->ar[3]], _a3in?"IN":"OOB",
+                          s->ar[4], s->ar[5], (int)(int16_t)s->data[s->ar[5]], _a5in?"IN":"OOB"); } }
             /* [2026-07-27] B2 (gated CALYPSO_B2) : module accu A/B + max/indice
              * sur les 296 mots entree(0x2a00) & workspace(0x2c00). Tranche nul vs
              * plat-sans-pic. */
