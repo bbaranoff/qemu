@@ -131,6 +131,19 @@ static void shunt_poll_si_shm(void);                /* fwd : poll SI shm (gr-gsm
 static void shunt_latch_task(uint16_t new_d_dsp_page)
 {
     if (!(new_d_dsp_page & B_GSM_TASK)) {
+        /* [2026-07-27] d_dsp_page=0 = l1s_reset_hw() (fermeture canal dedie SMS/LU
+         * ou Ctrl-C mobile). Clear les latches IMM-ASS/SDCCH -> le gate SI se rouvre.
+         * CHEMIN VIVANT (l'ancien hook arm2dsp/trx.c 0x01A8 etait mort : d_dsp_page
+         * vit en API-RAM, pas en MMIO). Desactivable CALYPSO_L1_RESET_WIRE=0. */
+        if (new_d_dsp_page == 0) {
+            static int l1rst_on = -1;
+            if (l1rst_on < 0) { const char *e = getenv("CALYPSO_L1_RESET_WIRE"); l1rst_on = (e && *e == '0') ? 0 : 1; }
+            if (l1rst_on) {
+                static unsigned nrst = 0;
+                if (nrst++ < 30) SHUNT_LOG("L1-RESET: d_dsp_page=0 -> clear latches (SI revient)\n");
+                calypso_dsp_shunt_l1_reset();
+            }
+        }
         return; /* not a real task signal (might be d_dsp_page=0 reset) */
     }
 
