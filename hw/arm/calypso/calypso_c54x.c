@@ -1643,12 +1643,19 @@ static uint16_t data_read(C54xState *s, uint16_t addr)
     /* [2026-07-27] FB-STREAM : injecte un echantillon FCCH FRAIS a chaque lecture
      * de la cellule sample du demod (0x9213 I / 0x9215 Q) -> vraie fenetre dans
      * 0x2a00, sans dependre de la cadence. Modelise le DMA on-chip. Gate CALYPSO_FB_STREAM. */
-    if (s->pc >= 0x9f00 && s->pc <= 0x9fb8 && (addr == 0x9213 || addr == 0x9215)) {
+    /* [2026-07-27] cellules I/Q du demod configurables : WATCH-9F00-RD a montre
+     * que le demod lit 0x9260/0x9261 (pas 0x9213/0x9215). CALYPSO_FB_STREAM_CELL(Q). */
+    static uint16_t _fscI = 0, _fscQ = 0;
+    if (_fscI == 0) {
+        const char *c = getenv("CALYPSO_FB_STREAM_CELL");  _fscI = c ? (uint16_t)strtol(c, NULL, 0) : 0x9213;
+        const char *q = getenv("CALYPSO_FB_STREAM_CELLQ"); _fscQ = q ? (uint16_t)strtol(q, NULL, 0) : 0x9215;
+    }
+    if (s->pc >= 0x9f00 && s->pc <= 0x9fb8 && (addr == _fscI || addr == _fscQ)) {
         static int _fs = -1;
         if (_fs < 0) _fs = getenv("CALYPSO_FB_STREAM") ? 1 : 0;
         if (_fs) {
             static uint16_t _si, _sq; static int _hv = 0; uint16_t _rv;
-            if (addr == 0x9213) { _hv = calypso_dsp_shunt_fb_stream_next(&_si, &_sq) ? 1 : 0; _rv = _hv ? _si : s->data[addr]; }
+            if (addr == _fscI) { _hv = calypso_dsp_shunt_fb_stream_next(&_si, &_sq) ? 1 : 0; _rv = _hv ? _si : s->data[addr]; }
             else { _rv = _hv ? _sq : s->data[addr]; }
             static unsigned _sl = 0;
             if (_sl++ < 24)
@@ -1723,8 +1730,10 @@ static uint16_t data_read(C54xState *s, uint16_t addr)
     return v;
 }
 
+static void flow_log(const char *rw, uint16_t addr, uint16_t val, uint16_t pc, unsigned insn);
 static uint16_t data_read_locked(C54xState *s, uint16_t addr)
 {
+    flow_log("R", addr, s->data[addr], s->pc, s->insn_count);
     read_stats_record(addr);
     /* MEM-WATCH-2B80 (2026-07-02, gated CALYPSO_MEM_WATCH_2B80) : le correlateur
      * FB (PC=0xee38) lit data[0x2b97] via AR3 (STM hardcode ROM), region
@@ -2682,8 +2691,47 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
     qemu_mutex_unlock(&calypso_pcb_daram_lock);
 }
 
+/* [2026-07-27] FLOWTRACE : voir en-tete du patch. */
+static FILE *g_flow_f = NULL;
+static long  g_flow_budget = -2;
+static int   g_flow_armed = 0;
+static void flow_log(const char *rw, uint16_t addr, uint16_t val, uint16_t pc, unsigned insn)
+{
+    if (g_flow_budget == -2) {
+        const char *e = getenv("CALYPSO_FLOWTRACE");
+        g_flow_budget = (e && *e) ? atol(e) : -1;
+        if (g_flow_budget > 0) {
+            g_flow_f = fopen("/tmp/calypso_flow.txt", "w");
+            fprintf(stderr, "[c54x] FLOWTRACE armed budget=%ld -> /tmp/calypso_flow.txt\n", g_flow_budget);
+        }
+    }
+    if (g_flow_budget <= 0 || !g_flow_f || !g_flow_armed) return;
+    if (addr < 0x2800 || addr >= 0x3000) return;
+    fprintf(g_flow_f, "%s %04x %04x pc=%04x insn=%u\n", rw, addr, val, pc, insn);
+    if (--g_flow_budget == 0) { fflush(g_flow_f); fclose(g_flow_f); g_flow_f = NULL;
+        fprintf(stderr, "[c54x] FLOWTRACE done -> /tmp/calypso_flow.txt\n"); }
+}
+
 static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
 {
+    flow_log("W", addr, val, s->pc, s->insn_count);
+    /* [2026-07-27] DEMOD-NOCLOBBER (gated CALYPSO_DEMOD_NOCLOBBER) : l etage
+     * demod emule (PC 0x9fb8=I / 0x9fe2=Q) remplit le buffer d entree du
+     * correlateur avec des paires CONSTANTES (0000,52ed) — prouve par la trace
+     * de flux — ecrasant la vraie FCCH deposee par feed_iq (FB_IQ_DARAM=1).
+     * On ignore ces ecritures : feed_iq devient autoritaire sur 0x2a00. */
+    {
+        static int _nc = -1;
+        if (_nc < 0) { const char *e = getenv("CALYPSO_DEMOD_NOCLOBBER"); _nc = (e && atoi(e) > 0) ? 1 : 0; }
+        if (_nc && addr >= 0x2a00 && addr < 0x2b28 &&
+            (s->pc == 0x9fb8 || s->pc == 0x9fe2)) {
+            static unsigned _ncn = 0;
+            if (_ncn++ < 8)
+                fprintf(stderr, "[c54x] DEMOD-NOCLOBBER skip PC=0x%04x data[0x%04x] <- 0x%04x "
+                        "(feed_iq autoritaire)\n", s->pc, addr, val);
+            return;
+        }
+    }
     /* MEM-WATCH-2B80 (2026-07-02, gated CALYPSO_MEM_WATCH_2B80) : voir le
      * commentaire jumeau dans data_read_locked. Log tout WRITE dans
      * [0x2b80,0x2c00), cap 200 -- confirme/infirme si un boot-copy peuple
@@ -5905,7 +5953,7 @@ static int c54x_exec_one(C54xState *s)
                         g_vec28_tracing = false;
                     }
                 }
-            if (nx > 2)
+            if (nx > 3)   /* PROM0..3 = 4 pages ; page 3 legitime (masque & 3) */
                 C54_DBG("XPC-OOR", "FRET xpc=0x%04x PC=0x%04x SP=0x%04x insn=%u",
                         nx, s->pc, s->sp, s->insn_count);
             s->xpc = nx & 3;
@@ -14544,13 +14592,69 @@ int c54x_run(C54xState *s, int n_insns)
                 if ((s->pc == 0xec07) || (s->pc >= 0x8d00 && s->pc <= 0x8d10)) _armed = 0;
             }
         }
+        if (exec_pc == 0xa076) {   /* kernel MAC = LECTURE des operandes (I/Q + coeffs) */
+            g_flow_armed = 1;   /* FLOWTRACE : arme la fenetre autour du detecteur */
+            static int _b2k = -1; static unsigned _b2kn = 0;
+            if (_b2k < 0) _b2k = getenv("CALYPSO_B2AR") ? 1 : 0;
+            /* [fix] compteur HORS gate : le min/max doit couvrir TOUT le run
+             * (la version precedente se bloquait a la 1ere iteration). */
+            static uint16_t _ar5min = 0xffff, _ar5max = 0;
+            static unsigned _ar5seen = 0, _ar5in = 0;
+            if (s->ar[5] < _ar5min) _ar5min = s->ar[5];
+            if (s->ar[5] > _ar5max) _ar5max = s->ar[5];
+            _ar5seen++;
+            if (s->ar[5] >= 0x2a00 && s->ar[5] < 0x2b28) _ar5in++;
+            if (_b2k && (_ar5seen % 20000) == 0)
+                fprintf(stderr, "[c54x] B2AR5-RANGE n=%u min=0x%04x max=0x%04x IN_BUF=%u (buf=0x2a00..0x2b27)\n",
+                        _ar5seen, _ar5min, _ar5max, _ar5in);
+            if (_b2k && _b2kn < 16) {
+                _b2kn++;
+                #define _INB(a) (((a) >= 0x2a00 && (a) < 0x2b28) ? "IN" : "oob")
+                fprintf(stderr, "[c54x] B2KERN @0xa076 AR2=%04x[%d]%s AR3=%04x[%d]%s AR4=%04x[%d]%s AR5=%04x[%d]%s\n",
+                        s->ar[2],(int)(int16_t)s->data[s->ar[2]],_INB(s->ar[2]),
+                        s->ar[3],(int)(int16_t)s->data[s->ar[3]],_INB(s->ar[3]),
+                        s->ar[4],(int)(int16_t)s->data[s->ar[4]],_INB(s->ar[4]),
+                        s->ar[5],(int)(int16_t)s->data[s->ar[5]],_INB(s->ar[5]));
+                #undef _INB
+            }
+        }
+        if (exec_pc == 0x93a5) {   /* consommateur DARAM 0x2a00 (AR3 post-inc) = VRAIE entree corr */
+            static int _b2c = -1; static unsigned _b2cn = 0;
+            if (_b2c < 0) _b2c = getenv("CALYPSO_B2SEQ") ? 1 : 0;
+            if (_b2c && _b2cn < 8) { _b2cn++;
+                fprintf(stderr, "[c54x] B2SEQ-IN 0x2a00@0x93a5 (I,Q)x16:");
+                for (int _i = 0; _i < 16; _i++)
+                    fprintf(stderr, " (%d,%d)", (int)(int16_t)s->data[0x2a00 + 2*_i], (int)(int16_t)s->data[0x2a00 + 2*_i + 1]);
+                fprintf(stderr, "\n"); }
+        }
         if (exec_pc == 0x9ac0) {
+            /* [2026-07-27] B2SEQ (gated CALYPSO_B2SEQ) : dump 16 paires (I,Q) de
+             * 0x2a00 (VRAIE entree corr, depot BSP/ADC). Pattern Fs/4 = FCCH :
+             * (a,0)(0,a)(-a,0)(0,-a).. ; quasi-constant = DC sans ton (entree vide). */
+            { static int _b2s = -1; static unsigned _b2sn = 0;
+              if (_b2s < 0) _b2s = getenv("CALYPSO_B2SEQ") ? 1 : 0;
+              if (_b2s && _b2sn < 8) { _b2sn++;
+                  fprintf(stderr, "[c54x] B2SEQ 0x2a00 (I,Q)x16:");
+                  for (int _i = 0; _i < 16; _i++)
+                      fprintf(stderr, " (%d,%d)", (int)(int16_t)s->data[0x2a00 + 2*_i], (int)(int16_t)s->data[0x2a00 + 2*_i + 1]);
+                  fprintf(stderr, "\n"); } }
             static unsigned dr = 0;
             if (dr < 30 || (dr % 200) == 0)
                 fprintf(stderr, "[c54x] DETECTOR-RUN #%u @0x9ac0 d_fb_mode[08f9]=0x%04x "
                         "d_fb_det[08f8]=0x%04x insn=%u\n",
                         dr, s->data[0x08f9], s->data[0x08f8], s->insn_count);
             dr++;
+            /* [2026-07-27] B2AR (gated CALYPSO_B2AR) : ou pointent les AR du corr
+             * + valeur lue. AR5/AR3 dans [0x2a00..0x2b27] => lit la FCCH ; hors =>
+             * lit a cote (RANK3, pointeur mal initialise). */
+            { static int _b2a = -1; static unsigned _b2an = 0;
+              if (_b2a < 0) _b2a = getenv("CALYPSO_B2AR") ? 1 : 0;
+              if (_b2a && _b2an < 12) { _b2an++;
+                  int _a3in = (s->ar[3] >= 0x2a00 && s->ar[3] < 0x2b28);
+                  int _a5in = (s->ar[5] >= 0x2a00 && s->ar[5] < 0x2b28);
+                  fprintf(stderr, "[c54x] B2AR @0x9ac0 AR2=%04x AR3=%04x[%d]%s AR4=%04x AR5=%04x[%d]%s\n",
+                          s->ar[2], s->ar[3], (int)(int16_t)s->data[s->ar[3]], _a3in?"IN":"OOB",
+                          s->ar[4], s->ar[5], (int)(int16_t)s->data[s->ar[5]], _a5in?"IN":"OOB"); } }
             /* [2026-07-27] B2 (gated CALYPSO_B2) : module accu A/B + max/indice
              * sur les 296 mots entree(0x2a00) & workspace(0x2c00). Tranche nul vs
              * plat-sans-pic. */

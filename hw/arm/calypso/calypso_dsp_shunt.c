@@ -1541,9 +1541,16 @@ void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
         if (_fs < 0) { const char *e = getenv("CALYPSO_FB_STREAM"); _fs = (e && atoi(e) > 0) ? 1 : 0;
             const char *d = getenv("CALYPSO_FB_STREAM_DECIM"); if (d && *d) _fsd = atoi(d); if (_fsd < 1) _fsd = 1; }
         if (_fs) {
-            for (int k = 0; 2*(k*_fsd)+1 < n; k++) {
-                g_fbs[g_fbs_wr++ & (FBS_RING-1)] = iq[2*(k*_fsd)];
-                g_fbs[g_fbs_wr++ & (FBS_RING-1)] = iq[2*(k*_fsd)+1];
+            /* [2026-07-27] SKIP frames all-zero (startup fn 0-4) : elles polluent le
+             * ring que le demod lit au front -> il tombe sur des zeros au lieu de la
+             * vraie FCCH poussee ensuite. On ne pousse que si la frame a du signal. */
+            int _nz = 0;
+            for (int i = 0; i < n && i < 64; i++) if (iq[i]) { _nz = 1; break; }
+            if (_nz) {
+                for (int k = 0; 2*(k*_fsd)+1 < n; k++) {
+                    g_fbs[g_fbs_wr++ & (FBS_RING-1)] = iq[2*(k*_fsd)];
+                    g_fbs[g_fbs_wr++ & (FBS_RING-1)] = iq[2*(k*_fsd)+1];
+                }
             }
         }
     }
@@ -1948,6 +1955,28 @@ bool calypso_dsp_shunt_fb_stream_next(uint16_t *outI, uint16_t *outQ)
     if (g_fbs_rd + 1 >= g_fbs_wr) return false;
     *outI = (uint16_t)g_fbs[g_fbs_rd++ & (FBS_RING-1)];
     *outQ = (uint16_t)g_fbs[g_fbs_rd++ & (FBS_RING-1)];
+    /* [2026-07-27] B2IN (gated CALYPSO_B2IN) : mesure la VRAIE entree corr
+     * (0x9213/0x9215 = CE stream), pas la sortie 0x2a00. max|I|/|Q| + energie +
+     * indice du max sur 296 -> tranche "entree morte/DC" vs "vrai ton FCCH". */
+    {
+        static int _b2i = -1; static unsigned _n = 0, _imax = 0, _qmax = 0; static int _iidx = -1;
+        static uint64_t _e = 0; static unsigned _wn = 0;
+        if (_b2i < 0) _b2i = getenv("CALYPSO_B2IN") ? 1 : 0;
+        if (_b2i) {
+            int16_t _I = (int16_t)*outI, _Q = (int16_t)*outQ;
+            unsigned _ai = _I < 0 ? (unsigned)(-_I) : (unsigned)_I;
+            unsigned _aq = _Q < 0 ? (unsigned)(-_Q) : (unsigned)_Q;
+            if (_ai > _imax) { _imax = _ai; _iidx = (int)_wn; }
+            if (_aq > _qmax) _qmax = _aq;
+            _e += (uint64_t)_I * _I + (uint64_t)_Q * _Q;
+            if (++_wn >= 296) {
+                if (_n++ < 30)
+                    fprintf(stderr, "[dsp-shunt] B2IN (0x9213/0x9215) win=296 max|I|=%u@%d max|Q|=%u energy=%llu\n",
+                            _imax, _iidx, _qmax, (unsigned long long)_e);
+                _wn = 0; _imax = 0; _qmax = 0; _iidx = -1; _e = 0;
+            }
+        }
+    }
     return true;
 }
 
