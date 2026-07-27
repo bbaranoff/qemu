@@ -149,6 +149,7 @@ struct dsp_shunt_state {
     struct { uint8_t l2[23]; uint32_t fn; uint32_t tick; uint16_t reps; bool used; } sdcch_ring[SDCCH_RING_N];
     uint32_t   sdcch_ring_head;
     uint32_t   sdcch_ring_tail;
+    uint32_t   evict_overflow, evict_ttl, evict_reps;  /* A1 politiques eviction */
     uint32_t   sdcch_last_fn;
     uint8_t    sdcch_buf[23];
     bool       sdcch_valid;
