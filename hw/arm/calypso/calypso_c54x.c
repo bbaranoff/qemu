@@ -1730,8 +1730,10 @@ static uint16_t data_read(C54xState *s, uint16_t addr)
     return v;
 }
 
+static void flow_log(const char *rw, uint16_t addr, uint16_t val, uint16_t pc, unsigned insn);
 static uint16_t data_read_locked(C54xState *s, uint16_t addr)
 {
+    flow_log("R", addr, s->data[addr], s->pc, s->insn_count);
     read_stats_record(addr);
     /* MEM-WATCH-2B80 (2026-07-02, gated CALYPSO_MEM_WATCH_2B80) : le correlateur
      * FB (PC=0xee38) lit data[0x2b97] via AR3 (STM hardcode ROM), region
@@ -2689,8 +2691,47 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
     qemu_mutex_unlock(&calypso_pcb_daram_lock);
 }
 
+/* [2026-07-27] FLOWTRACE : voir en-tete du patch. */
+static FILE *g_flow_f = NULL;
+static long  g_flow_budget = -2;
+static int   g_flow_armed = 0;
+static void flow_log(const char *rw, uint16_t addr, uint16_t val, uint16_t pc, unsigned insn)
+{
+    if (g_flow_budget == -2) {
+        const char *e = getenv("CALYPSO_FLOWTRACE");
+        g_flow_budget = (e && *e) ? atol(e) : -1;
+        if (g_flow_budget > 0) {
+            g_flow_f = fopen("/tmp/calypso_flow.txt", "w");
+            fprintf(stderr, "[c54x] FLOWTRACE armed budget=%ld -> /tmp/calypso_flow.txt\n", g_flow_budget);
+        }
+    }
+    if (g_flow_budget <= 0 || !g_flow_f || !g_flow_armed) return;
+    if (addr < 0x2800 || addr >= 0x3000) return;
+    fprintf(g_flow_f, "%s %04x %04x pc=%04x insn=%u\n", rw, addr, val, pc, insn);
+    if (--g_flow_budget == 0) { fflush(g_flow_f); fclose(g_flow_f); g_flow_f = NULL;
+        fprintf(stderr, "[c54x] FLOWTRACE done -> /tmp/calypso_flow.txt\n"); }
+}
+
 static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
 {
+    flow_log("W", addr, val, s->pc, s->insn_count);
+    /* [2026-07-27] DEMOD-NOCLOBBER (gated CALYPSO_DEMOD_NOCLOBBER) : l etage
+     * demod emule (PC 0x9fb8=I / 0x9fe2=Q) remplit le buffer d entree du
+     * correlateur avec des paires CONSTANTES (0000,52ed) — prouve par la trace
+     * de flux — ecrasant la vraie FCCH deposee par feed_iq (FB_IQ_DARAM=1).
+     * On ignore ces ecritures : feed_iq devient autoritaire sur 0x2a00. */
+    {
+        static int _nc = -1;
+        if (_nc < 0) { const char *e = getenv("CALYPSO_DEMOD_NOCLOBBER"); _nc = (e && atoi(e) > 0) ? 1 : 0; }
+        if (_nc && addr >= 0x2a00 && addr < 0x2b28 &&
+            (s->pc == 0x9fb8 || s->pc == 0x9fe2)) {
+            static unsigned _ncn = 0;
+            if (_ncn++ < 8)
+                fprintf(stderr, "[c54x] DEMOD-NOCLOBBER skip PC=0x%04x data[0x%04x] <- 0x%04x "
+                        "(feed_iq autoritaire)\n", s->pc, addr, val);
+            return;
+        }
+    }
     /* MEM-WATCH-2B80 (2026-07-02, gated CALYPSO_MEM_WATCH_2B80) : voir le
      * commentaire jumeau dans data_read_locked. Log tout WRITE dans
      * [0x2b80,0x2c00), cap 200 -- confirme/infirme si un boot-copy peuple
@@ -14552,8 +14593,20 @@ int c54x_run(C54xState *s, int n_insns)
             }
         }
         if (exec_pc == 0xa076) {   /* kernel MAC = LECTURE des operandes (I/Q + coeffs) */
+            g_flow_armed = 1;   /* FLOWTRACE : arme la fenetre autour du detecteur */
             static int _b2k = -1; static unsigned _b2kn = 0;
             if (_b2k < 0) _b2k = getenv("CALYPSO_B2AR") ? 1 : 0;
+            /* [fix] compteur HORS gate : le min/max doit couvrir TOUT le run
+             * (la version precedente se bloquait a la 1ere iteration). */
+            static uint16_t _ar5min = 0xffff, _ar5max = 0;
+            static unsigned _ar5seen = 0, _ar5in = 0;
+            if (s->ar[5] < _ar5min) _ar5min = s->ar[5];
+            if (s->ar[5] > _ar5max) _ar5max = s->ar[5];
+            _ar5seen++;
+            if (s->ar[5] >= 0x2a00 && s->ar[5] < 0x2b28) _ar5in++;
+            if (_b2k && (_ar5seen % 20000) == 0)
+                fprintf(stderr, "[c54x] B2AR5-RANGE n=%u min=0x%04x max=0x%04x IN_BUF=%u (buf=0x2a00..0x2b27)\n",
+                        _ar5seen, _ar5min, _ar5max, _ar5in);
             if (_b2k && _b2kn < 16) {
                 _b2kn++;
                 #define _INB(a) (((a) >= 0x2a00 && (a) < 0x2b28) ? "IN" : "oob")

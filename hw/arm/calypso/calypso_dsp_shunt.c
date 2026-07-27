@@ -1541,9 +1541,16 @@ void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
         if (_fs < 0) { const char *e = getenv("CALYPSO_FB_STREAM"); _fs = (e && atoi(e) > 0) ? 1 : 0;
             const char *d = getenv("CALYPSO_FB_STREAM_DECIM"); if (d && *d) _fsd = atoi(d); if (_fsd < 1) _fsd = 1; }
         if (_fs) {
-            for (int k = 0; 2*(k*_fsd)+1 < n; k++) {
-                g_fbs[g_fbs_wr++ & (FBS_RING-1)] = iq[2*(k*_fsd)];
-                g_fbs[g_fbs_wr++ & (FBS_RING-1)] = iq[2*(k*_fsd)+1];
+            /* [2026-07-27] SKIP frames all-zero (startup fn 0-4) : elles polluent le
+             * ring que le demod lit au front -> il tombe sur des zeros au lieu de la
+             * vraie FCCH poussee ensuite. On ne pousse que si la frame a du signal. */
+            int _nz = 0;
+            for (int i = 0; i < n && i < 64; i++) if (iq[i]) { _nz = 1; break; }
+            if (_nz) {
+                for (int k = 0; 2*(k*_fsd)+1 < n; k++) {
+                    g_fbs[g_fbs_wr++ & (FBS_RING-1)] = iq[2*(k*_fsd)];
+                    g_fbs[g_fbs_wr++ & (FBS_RING-1)] = iq[2*(k*_fsd)+1];
+                }
             }
         }
     }

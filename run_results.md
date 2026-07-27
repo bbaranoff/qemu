@@ -92,18 +92,75 @@ le corrélateur **calcule** bien (B2 : A/B non-nuls), **mais** son flux **boucle
 s'exécute** (B4 : `data[0x08f8]` jamais écrit). C'est le **mur de contrôle de flux « RANK3 »,
 désormais chiffré**, pas une conjecture.
 
-**Réinterprétation (⚠️ UNE SEULE cause, en AMONT).** Puisque `0x2a00` est la **vraie entrée** et
-qu'elle est **DC/sans FCCH** (B2), la boucle de normalisation qui ne sort jamais (B4B) est
-probablement le **comportement CORRECT d'un chercheur de FCCH sur entrée vide** — **pas** un mur
-de flux. `d_fb_det` jamais écrit (B4) = **conséquence** d'une entrée sans ton, pas un bug de
-contrôle de flux. Les deux causes que je chassais **s'effondrent en une seule, en amont : la
-chaîne RF/ABB émulée ne dépose pas de FCCH dans `0x2a00`.** Cause probable : modèle **AFC**
-(DAC TWL3025→VCXO) décalé → le ton FCCH n'atterrit pas dans le bin où la ROM le cherche ; et/ou
-gain **TRF6151** → l'offset DC. **B2SEQ CONFIRME** : `0x2a00` = **toutes `(21229,21229)` = DC plat, ZÉRO FCCH** (pas de rotation Fs/4). Entrée morte prouvée au byte.
+### ATLAS NATIF — graphe de données reconstruit par TRACE (méthode, pas conjecture)
 
-**Le shunt host-side reste la voie qui marche** : gr-gsm trouve la FCCH sur le **même downlink**
-→ le signal EXISTE à l'antenne → la rupture est dans **RF-modèle → BSP → `0x2a00`**, pas dans le
-DSP. Voir la matrice statut × mode dans `hw/arm/calypso/doc/ETAT_ACTUEL.md`.
+Après ~15 sondes ponctuelles qui **oscillaient** (0x2a00 entrée→sortie→entrée ; démod lisant
+0x9213 puis 0x9260 ; g_fbs vide puis pollué), on a arrêté d échantillonner : **une seule trace
+brute** de tous les accès R/W dans `data[0x2800..0x3000)` armée au kernel `0xa076`
+(`CALYPSO_FLOWTRACE=N` → `/tmp/calypso_flow.txt`), puis reconstruction **hors ligne** du graphe.
+200 000 accès analysés. C est ce qui a tranché — et corrigé trois de mes conclusions.
+
+**Graphe mesuré :**
+
+| PC | Rôle | Région | Volume |
+|---|---|---|---|
+| `0x9fe0` | lit le buffer | `0x2a00..0x2b27` | 4 720 |
+| **`0x9fb8` (I) / `0x9fe2` (Q)** | **écrivent** le buffer | `0x2a00..0x2b27` | 9 472 |
+| `0xa07x–0xa08x` | lisent **et** écrivent (workspace de calcul) | `0x2c00..` | ~4 210 R / 2 498 W |
+| `0xa0e6/0xa0e7` | lisent/écrivent | `0x2b28..0x2c00` | 7 424 |
+
+**Trois corrections que la trace impose :**
+1. **`0x52ED` n est PAS le shadow IMR** (coïncidence de valeur) : c est **le démod lui-même
+   (`PC=0x9fe2`) qui l écrit** dans le buffer.
+2. **`0x2c00` n est pas une table plate** : le kernel MAC y écrit ses **résultats intermédiaires**
+   (valeurs variées `455c, 6ab8, 255c…`). Mon « réf plate 31/-31 » était un instantané.
+3. Les verdicts « AR5 jamais dans le buffer » / « entrée DC » venaient de sondes lues **au mauvais
+   instant** (store `0x9ac0`, `head` des logs). Ne jamais conclure d un échantillon non daté.
+
+### 🔑 MAILLON CASSÉ — l étage démod produit du DC
+
+`0x9fb8` écrit `0000` **4 319×** et `0x9fe2` écrit `52ed` **4 319×** — même compte : ce sont les
+paires **(I,Q)**. Le démod remplit donc `0x2a00..0x2b27` de **`(0000, 52ed)` constants (91 % des
+écritures, 7 valeurs distinctes seulement)**, en boucle séquentielle, sur toute la fenêtre
+(insn 3.81M→4.31M) — **alors que son entrée IQ est variée et réelle** (`ff6e, c307, 910d…`,
+injectée en `0x9260/0x9261`, cf. maillon 2 ci-dessous).
+
+**Donc : ce n est ni l antenne, ni l entrée, ni le corrélateur, ni les pointeurs — c est la
+transformation démod (`0x9f00`→`0x9fe2`) qui dégénère en constante.**
+
+| # | Maillon | État | Preuve |
+|---|---|---|---|
+| 1 | FCCH à l antenne | ✅ | `corr_iq.py` : +67 708 Hz, coh 0.998, dphi +1.00×π/2 |
+| 2 | IQ → cellules démod `0x9260/61` | ✅ **(fixé)** | `WATCH_9F00_RD` a montré que le démod lit `0x9260/61` (pas `0x9213`) ; cellules rendues configurables + skip des frames all-zero dans `g_fbs` → FB-STREAM sert enfin de l IQ variée |
+| 3 | **démod → buffer `0x2a00`** | ❌ **CASSÉ** | fill `(0000,52ed)` 91 % (trace de flux) |
+| 4 | kernel MAC `0xa07x` ↔ `0x2c00` | ✅ tourne | workspace actif, valeurs variées |
+| 5 | `d_fb_det` `0x08f8` | ❌ jamais écrit | watchpoint B4 = 0 écriture ; **conséquence** de (3) |
+
+### Fix appliqué : `CALYPSO_DEMOD_NOCLOBBER=1`
+L étage démod émulé étant dégénéré, on le **court-circuite** : ses écritures vers
+`0x2a00..0x2b27` (PC `0x9fb8`/`0x9fe2`) sont ignorées, et `feed_iq` (`CALYPSO_FB_IQ_DARAM=1`)
+reste **autoritaire** sur le buffer — le kernel MAC lit alors la vraie FCCH décimée au lieu du DC.
+Gate opt-in, aucun effet quand absent.
+
+```bash
+CALYPSO_NATIVE_HELPED=1 CALYPSO_FB_IQ_DARAM=1 CALYPSO_DEMOD_NOCLOBBER=1 ./start-direct.sh
+grep -E "DEMOD-NOCLOBBER|DETECTOR-RUN" /root/qemu.log | head
+```
+Critère : `d_fb_det[08f8]` devient ≠ 0 ⇒ la chaîne native complète la FBSB.
+
+**Résultat mesuré** : le skip fire (`DEMOD-NOCLOBBER skip PC=0x9fb8/0x9fe2`) mais `d_fb_det`
+reste 0 (0/55 sur tout le run). Deux faits de plus en sont sortis :
+
+| Fait | Mesure | Fix |
+|---|---|---|
+| feed_iq ne remplissait que **27 %** du buffer | `wrote=80` sur 296 mots | `CALYPSO_BSP_IQ_DECIM=1` → **`wrote=296`** (buffer plein) ✅ |
+| sur-décimage : IQ **déjà à 1 SPS** re-décimée ×4 | `corr_iq.py` : bursts fed `0x2a00` **@1SPS**, N=148 | idem ci-dessus |
+
+Avec buffer plein **et** clobber supprimé, `d_fb_det` reste 0 (0/41). **Point de reprise (méthode,
+pas conjecture)** : dumper `data[0x2a00..0x2b28]` en **binaire** pendant le run et le passer dans
+`corr_iq.py` — « le buffer contient-il une vraie FCCH ? » devient alors une **mesure** (coh, dphi)
+avec l outil déjà validé, au lieu d un jugement à l œil sur 16 paires. Si coh>0.85 ⇒ le problème
+est en aval du buffer ; sinon le remplissage est encore fautif.
 
 ### Reproduire (Run B)
 ```bash
