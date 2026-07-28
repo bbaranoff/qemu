@@ -76,7 +76,11 @@ done
 # Les env de modes (calypso.env socle + calypso_<mode>.env) vivent a la racine,
 # hors ADD_ROOTS -> la passe 2 ne les voit pas. On les auto-ajoute ici (100%%
 # Calypso, absents de QEMU vanilla). Globs surchargeables CALYPSO_OVERLAY_ROOT_GLOBS.
-ROOT_GLOBS="${CALYPSO_OVERLAY_ROOT_GLOBS:-calypso*.env QUICK_START.md run_results.md}"
+# [2026-07-27] RAPPORT_DFBDET.md ajoute : rapport d enquete indexe dans le README,
+# il doit suivre l overlay comme run_results.md (sinon lien mort cote overlay).
+# [2026-07-28] glob RAPPORT_*.md + PLAN_*.md : couvre RAPPORT_DFBDET/OPCODES/BRINT0/
+# SYNTHESE et PLAN_APPLICATION sans re-editer ce script a chaque nouveau rapport.
+ROOT_GLOBS="${CALYPSO_OVERLAY_ROOT_GLOBS:-calypso*.env QUICK_START.md run_results.md RAPPORT_*.md PLAN_*.md}"
 for pat in $ROOT_GLOBS; do
     for f in $SRC/$pat; do
         [ -f "$f" ] || continue
