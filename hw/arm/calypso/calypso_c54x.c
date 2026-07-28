@@ -9354,6 +9354,39 @@ static int c54x_exec_one(C54xState *s)
             if (dst) s->b = sext40(v); else s->a = sext40(v);
             return consumed + s->lk_used;
         }
+        /* [2026-07-28] sub 4..7 : la moitie LOGIQUE de la famille tombait dans le
+         * `default` ci-dessous et etait exécutée comme un LD. Encodages : table
+         * projet doc/opcodes/tic54x_hi8_map.md + SPRU172C (tableaux 2-7/2-8/2-9
+         * et SUBC p.4-192). Smem est ZERO-etendu sur 40 bits : l exemple TI de
+         * AND (p.4-12) donne A=00 00FF 1200 & Smem=0x1500 -> A=00 0000 1000.
+         * Impact mesure : 0x1860 (AND) lu comme LD mettait A=15 au lieu de A&15,
+         * d ou T=31 et un `LD Smem,TS` decalant de +31 qui saturait l accumulateur
+         * (A=0x80000000) et aplatissait la sortie du demod. */
+        case 0x4: { /* 0x1800: AND Smem, src — src = src & Smem */
+            uint64_t cur = (uint64_t)(dst ? s->b : s->a) & 0xFFFFFFFFFFULL;
+            uint64_t r = cur & (uint64_t)(uint16_t)val;
+            if (dst) s->b = sext40((int64_t)r); else s->a = sext40((int64_t)r);
+            return consumed + s->lk_used;
+        }
+        case 0x5: { /* 0x1A00: OR Smem, src — src = src | Smem */
+            uint64_t cur = (uint64_t)(dst ? s->b : s->a) & 0xFFFFFFFFFFULL;
+            uint64_t r = cur | (uint64_t)(uint16_t)val;
+            if (dst) s->b = sext40((int64_t)r); else s->a = sext40((int64_t)r);
+            return consumed + s->lk_used;
+        }
+        case 0x6: { /* 0x1C00: XOR Smem, src — src = src ^ Smem */
+            uint64_t cur = (uint64_t)(dst ? s->b : s->a) & 0xFFFFFFFFFFULL;
+            uint64_t r = cur ^ (uint64_t)(uint16_t)val;
+            if (dst) s->b = sext40((int64_t)r); else s->a = sext40((int64_t)r);
+            return consumed + s->lk_used;
+        }
+        case 0x7: { /* 0x1E00: SUBC Smem, src — soustraction conditionnelle (division) */
+            int64_t src = dst ? sext40((int64_t)s->b) : sext40((int64_t)s->a);
+            int64_t d = src - ((int64_t)(uint16_t)val << 15);
+            int64_t r = (d >= 0) ? ((d << 1) + 1) : (src << 1);
+            if (dst) s->b = sext40(r); else s->a = sext40(r);
+            return consumed + s->lk_used;
+        }
         default:
             v = (s->st1 & ST1_SXM) ? (int16_t)val : (uint16_t)val;
             break;
