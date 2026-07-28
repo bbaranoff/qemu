@@ -1659,6 +1659,13 @@ static uint16_t data_read(C54xState *s, uint16_t addr)
     }
     if (s->pc >= 0x9f00 && s->pc <= 0x9fb8 && (addr == _fscI || addr == _fscQ)) {
         static int _fs = -1;
+        /* @BEQUILLE — FB_STREAM (lecture)  (CALYPSO_FB_STREAM, defaut OFF)
+         *   masque  : l absence de DMA on-chip. On INJECTE un echantillon frais a
+         *             chaque lecture de la cellule au lieu qu un peripherique
+         *             remplisse le tampon.
+         *   retirer : quand le tampon est alimente par le vrai chemin (BSP -> DARAM).
+         *   Note : inerte avec CORR_ENTRY=0x94f5 — les cellules 0x9260/61 n y sont
+         *   jamais lues (mesure 2026-07-28, WATCH-9F00-RD). */
         if (_fs < 0) _fs = getenv("CALYPSO_FB_STREAM") ? 1 : 0;
         if (_fs) {
             static uint16_t _si, _sq; static int _hv = 0; uint16_t _rv;
@@ -5031,6 +5038,46 @@ static bool c54x_irq_level_check(C54xState *s)
     return true;
 }
 
+
+/* [2026-07-28] GATE UNIFIE DES CORRECTIFS D EMULATION.
+ *   CALYPSO_FIXES=FIX_UN,FIX_DEUX   active des correctifs nommes
+ *   CALYPSO_FIXES=all               les active tous
+ *   (absent)                        aucun — comportement d origine strictement inchange
+ *
+ * PROTOCOLE : on pose TOUS les correctifs surs derriere ce gate d un coup, on teste
+ * SOUS CHARGE MAXIMALE (camp + LU + SMS, pas un simple boot), et DES QU UN CORRECTIF
+ * EST CONFIRME on efface **la CONDITION**, pas le correctif : on retire le
+ * `if (calypso_fix_enabled("FIX_...")) {` et ses accolades, le code reste et devient
+ * inconditionnel. Son nom disparait alors de la liste des gates.
+ * Ce gate est un SAS TEMPORAIRE, jamais une option de configuration : une bequille
+ * reste, un sas se vide. Ne jamais y laisser vieillir un correctif valide. */
+static bool calypso_fix_enabled(const char *name)
+{
+    static char buf[1024];
+    static int  init = 0;
+    if (!init) {
+        const char *e = getenv("CALYPSO_FIXES");
+        snprintf(buf, sizeof(buf), "%s", e ? e : "");
+        init = 1;
+        if (buf[0])
+            fprintf(stderr, "[c54x] CALYPSO_FIXES=%s (sas temporaire — effacer le gate "
+                            "de chaque correctif confirme)\n", buf);
+    }
+    if (!buf[0]) return false;
+    if (strcmp(buf, "all") == 0) return true;
+    size_t n = strlen(name);
+    const char *p = buf;
+    while ((p = strstr(p, name)) != NULL) {
+        char before = (p == buf) ? ',' : p[-1];
+        char after  = p[n];
+        if ((before == ',' || before == ' ') &&
+            (after == '\0' || after == ',' || after == ' '))
+            return true;
+        p += n;
+    }
+    return false;
+}
+
 static int c54x_exec_one(C54xState *s)
 {
     if (c54x_irq_level_check(s)) {
@@ -5252,6 +5299,144 @@ static int c54x_exec_one(C54xState *s)
     }
     uint8_t hi4 = (op >> 12) & 0xF;
     uint8_t hi8 = (op >> 8) & 0xFF;
+
+    /* [2026-07-28] LOT DE CORRECTIFS DE LONGUEUR — gate CALYPSO_FIXES (voir
+     * calypso_fix_enabled). Chaque entree cite binutils tic54x-opc.c, dont le 2e
+     * champ EST le nombre de mots. Le decodeur consommait 2 mots la ou ces
+     * instructions n en font qu 1, ce qui desynchronise tout le decodage suivant. */
+    if (getenv("CALYPSO_FIXES")) {
+        /* LD Xmem, SHFT, dst — binutils { "ld", 1,3,3, 0x9400, 0xFE00, {OP_Xmem,OP_SHFT,OP_DST} }
+         * (etait decode MVDK/MVKD sur 2 mots) */
+        if ((op & 0xFE00) == 0x9400 && calypso_fix_enabled("FIX_LD_XMEM_SHFT")) {
+            uint16_t a = resolve_xmem(s, op);
+            uint16_t v = data_read(s, a);
+            int shft = op & 0xF, d = (op >> 8) & 1;
+            int64_t x = (s->st1 & ST1_SXM) ? (int64_t)(int16_t)v : (int64_t)(uint16_t)v;
+            x <<= shft;
+            if (d) s->b = sext40(x); else s->a = sext40(x);
+            return 1;
+        }
+        /* BIT Xmem, BITC : TC = Xmem(15-BITC) — binutils { "bit", 1,2,2, 0x9600, 0xFF00 }
+         * (etait decode MVDP sur 2 mots) */
+        if ((op & 0xFF00) == 0x9600 && calypso_fix_enabled("FIX_BIT_XMEM")) {
+            uint16_t a = resolve_xmem(s, op);
+            uint16_t v = data_read(s, a);
+            int bitc = op & 0xF;
+            if ((v >> (15 - bitc)) & 1) s->st0 |= ST0_TC; else s->st0 &= ~ST0_TC;
+            return 1;
+        }
+        /* SUB Xmem, Ymem, dst : dst = (Xmem - Ymem) << 16 — binutils { "sub", 1,..., 0xA200, 0xFE00 }
+         * (etait decode ADD/SUB #lk sur 2 mots) */
+        if ((op & 0xFE00) == 0xA200 && calypso_fix_enabled("FIX_SUB_XMEM_YMEM")) {
+            uint16_t xa = resolve_xmem(s, op);
+            uint8_t ym = op & 0xF; int yar = (ym & 3) + 2, ymod = (ym & 0xC) >> 2;
+            uint16_t ya = s->ar[yar];
+            switch (ymod) {
+            case 1: s->ar[yar] = ya - 1; break;
+            case 2: s->ar[yar] = ya + 1; break;
+            case 3: s->ar[yar] = c54x_circ_ref(ya, +(int16_t)s->ar[0], s->bk); break;
+            default: break;
+            }
+            int64_t xv = (int16_t)data_read(s, xa), yv = (int16_t)data_read(s, ya);
+            int64_t r = (xv - yv) << 16;
+            if ((op >> 8) & 1) s->b = sext40(r); else s->a = sext40(r);
+            return 1;
+        }
+        /* LD Xmem, dst || MAC/MAS/MASR Ymem — binutils { "ld", 1,..., 0xA800/0xAC00/0xAE00, 0xFE00 }
+         * (etaient decodes AND #lk / MACP / MACD sur 2 mots).
+         * On execute la partie LD et on laisse la partie parallele : approximatif sur le
+         * RESULTAT, mais la LONGUEUR redevient juste et le flux cesse de deriver. */
+        if (((op & 0xFE00) == 0xA800 || (op & 0xFE00) == 0xAC00 || (op & 0xFE00) == 0xAE00)
+            && calypso_fix_enabled("FIX_LD_PARALLEL")) {
+            uint16_t a = resolve_xmem(s, op);
+            uint16_t v = data_read(s, a);
+            int64_t x = (s->st1 & ST1_SXM) ? (int64_t)(int16_t)v : (int64_t)(uint16_t)v;
+            if ((op >> 8) & 1) s->b = sext40(x << 16); else s->a = sext40(x << 16);
+            return 1;
+        }
+
+        /* LDM MMR, dst — binutils { "ldm", 1,2,2, 0x4800, 0xFE00, {OP_MMR,OP_DST} }.
+         * Un MMR est une valeur 16 bits NON SIGNEE (un pointeur, un compteur, un
+         * registre d etat) : le sign-etendre transforme AR=0x8000 en une valeur
+         * negative de 40 bits. SPRU172C : « LDM MMR, dst : dst = MMR », sans
+         * extension de signe (LDU porte explicitement « uns », LDM n a pas de
+         * variante signee). */
+        if ((op & 0xFE00) == 0x4800 && calypso_fix_enabled("FIX_LDM_ZEROEXT")) {
+            int mmr = op & 0x7F;
+            uint16_t v = data_read(s, mmr);
+            if ((op >> 8) & 1) s->b = (int64_t)(uint16_t)v; else s->a = (int64_t)(uint16_t)v;
+            return 1 + s->lk_used;
+        }
+        /* DST src, Lmem — binutils { "dst", 1,2,2, 0x4E00, 0xFE00, {OP_SRC1,OP_Lmem} }.
+         * Lmem est un operande LONG (2 mots) : le pointeur doit donc avancer de 2, pas
+         * de 1. Une post-modification de 1 decale tout le balayage d un tableau de mots
+         * longs — l erreur est silencieuse et cumulative. */
+        if ((op & 0xFE00) == 0x4E00 && calypso_fix_enabled("FIX_DST_LMEM2")) {
+            int src = (op >> 8) & 1;
+            int64_t v = src ? s->b : s->a;
+            uint8_t sm = op & 0xFF;
+            if (sm & 0x80) {                       /* indirect : *ARx avec post-modif */
+                int ar = sm & 0x7, mod = (sm >> 3) & 0xF;
+                uint16_t a = s->ar[ar];
+                data_write(s, a,     (uint16_t)((v >> 16) & 0xFFFF));
+                data_write(s, a + 1, (uint16_t)(v & 0xFFFF));
+                if (mod == 0x2) s->ar[ar] = a + 2;        /* *ARx+ : +2, pas +1 */
+                else if (mod == 0x1) s->ar[ar] = a - 2;   /* *ARx- : -2, pas -1 */
+                return 1;
+            }
+            {   /* direct : DP:offset */
+                uint16_t a = (uint16_t)(((s->st0 & ST0_DP_MASK) << 7) | (sm & 0x7F));
+                data_write(s, a,     (uint16_t)((v >> 16) & 0xFFFF));
+                data_write(s, a + 1, (uint16_t)(v & 0xFFFF));
+                return 1;
+            }
+        }
+        /* STL/STH src, SHFT, Xmem — binutils { "stl"/"sth", 1,.., 0x9800/0x9A00, 0xFE00,
+         * {OP_SRC1,OP_SHFT,OP_Xmem} }. Le champ SHFT (bits 3-0) etait ignore : la valeur
+         * stockee n avait pas la bonne echelle. */
+        if (((op & 0xFE00) == 0x9800 || (op & 0xFE00) == 0x9A00)
+            && calypso_fix_enabled("FIX_STL_STH_SHFT")) {
+            uint16_t a = resolve_xmem(s, op);
+            int shft = op & 0xF;
+            int src = (op >> 8) & 1;
+            int64_t v = src ? s->b : s->a;
+            v <<= shft;
+            uint16_t w = ((op & 0xFE00) == 0x9A00) ? (uint16_t)((v >> 16) & 0xFFFF)
+                                                   : (uint16_t)(v & 0xFFFF);
+            data_write(s, a, w);
+            return 1;
+        }
+        /* SUB Smem, 16, src [, dst] — binutils { "sub", 1,.., 0x4000, 0xFC00,
+         * {OP_Smem,OP_16,OP_SRC,OPT|OP_DST} }. Deux champs distincts : bit 9 = SRC
+         * (l accumulateur source) et bit 8 = DST. Le bit 9 etait ignore, donc la
+         * soustraction partait toujours du meme accumulateur. */
+        if ((op & 0xFC00) == 0x4000 && calypso_fix_enabled("FIX_SUB16_SRC")) {
+            bool ind2; uint16_t a = resolve_smem(s, op, &ind2);
+            uint16_t v = data_read(s, a);
+            int srcb = (op >> 9) & 1, dstb = (op >> 8) & 1;
+            int64_t sv = srcb ? s->b : s->a;
+            int64_t r  = sv - (((int64_t)(int16_t)v) << 16);
+            if (dstb) s->b = sext40(r); else s->a = sext40(r);
+            return 1 + s->lk_used;
+        }
+        /* STL B, ASM, Smem — binutils { "stl", 1,..., 0x8400, 0xFE00 } couvre 0x85 (src = B)
+         * (etait decode MVPD sur 2 mots). Miroir exact du handler 0x84 deja valide. */
+        if ((op & 0xFF00) == 0x8500 && calypso_fix_enabled("FIX_STL_B_ASM")) {
+            bool ind2; uint16_t a = resolve_smem(s, op, &ind2);
+            int shift = asm_shift(s);
+            int64_t v = s->b;
+            if (shift >= 0) v <<= shift; else v >>= (-shift);
+            data_write(s, a, (uint16_t)(v & 0xFFFF));
+            return 1 + s->lk_used;
+        }
+        /* ST TRN, Smem — binutils { "st", 1,..., 0x8D00, 0xFF00 }
+         * (etait decode MVDD sur 2 mots) */
+        if ((op & 0xFF00) == 0x8D00 && calypso_fix_enabled("FIX_ST_TRN")) {
+            bool ind2; uint16_t a = resolve_smem(s, op, &ind2);
+            data_write(s, a, s->trn);
+            return 1 + s->lk_used;
+        }
+    }
 
     /* DISP-ENTRY (CALYPSO_DEBUG=DISP-ENTRY, c web 2026-05-29) : discriminateur
      * préemption-IT vs clobber. Logge UNIQUEMENT l'entrée dispatcher 0x8341,
@@ -6056,6 +6241,16 @@ static int c54x_exec_one(C54xState *s)
                               (unsigned long long)(s->a & 0xFFFFFFULL), s->insn_count); } }
                 static int _fbe = -1; static uint16_t _fbentry = 0x94f5;
                 if (_fbe < 0) {
+                    /* @BEQUILLE — FB_ENERGY + FB_CORR_ENTRY  (CALYPSO_FB_ENERGY,
+                     *                CALYPSO_FB_CORR_ENTRY, defaut OFF)
+                     *   masque  : l absence de DISPATCH NATIF vers le correlateur.
+                     *             On REROUTE l execution vers 0x9500 / 0x94f5 au lieu
+                     *             de laisser le firmware y arriver par son chemin.
+                     *   retirer : quand BRINT0 (vec 21) est servie et que le chemin
+                     *             natif atteint le correlateur seul.
+                     *   ⚠️ Toute mesure prise sous ce reroute est une mesure SOUS
+                     *   BEQUILLE : en natif pur, cet etage n est JAMAIS execute
+                     *   (mesure 2026-07-28 : CALYPSO_WATCH_9F00_RD = 0). */
                     const char *_e = getenv("CALYPSO_FB_ENERGY"); _fbe = (_e && atoi(_e) > 0) ? 1 : 0;
                     const char *_p = getenv("CALYPSO_FB_CORR_ENTRY");
                     if (_p && *_p) _fbentry = (uint16_t)strtol(_p, NULL, 0);
@@ -16717,6 +16912,24 @@ void c54x_interrupt_ex(C54xState *s, int vec, int imr_bit)
 
     bool unmasked = (s->imr & (1 << imr_bit)) != 0;
     if (frame_force) unmasked = true;   /* VEC28-EXP : ligne frame cablee -> vectorise */
+    /* @BEQUILLE — FIX_BRINT0_UNMASK  (CALYPSO_FIXES=FIX_BRINT0_UNMASK, defaut OFF)
+     *   masque  : l absence d armement natif de l IMR bit 5 (BRINT0 / vec 21).
+     *   retirer : des que la vraie branche d armement est implementee, OU
+     *             immediatement si le test montre que la racine est en amont
+     *             (vecteur 21 installe a zero).
+     *   ⚠️ DIAGNOSTIC, a retirer, JAMAIS a confirmer. Ne compte pas comme un correctif.
+     * Repond a UNE question : BRINT0 est-elle le DERNIER verrou ou seulement le
+     * PROCHAIN ? Si le demasquage artificiel fait entrer le DSP dans le demod
+     * (CALYPSO_WATCH_9F00_RD passe de 0 a non-nul), c est le dernier ; sinon la
+     * racine est en amont — candidat : le vecteur 21 installe a zero. */
+    if (imr_bit == 5 && !unmasked && calypso_fix_enabled("FIX_BRINT0_UNMASK")) {
+        static unsigned _bu = 0;
+        if (_bu++ < 5)
+            fprintf(stderr, "[c54x] FIX_BRINT0_UNMASK : bit 5 demasque ARTIFICIELLEMENT "
+                    "(IMR=0x%04x, IFR=0x%04x, PC=0x%04x) — diagnostic, pas un correctif\n",
+                    s->imr, s->ifr, s->pc);
+        unmasked = true;
+    }
 
     /* [2026-07-23] SYNC-DISPATCH-PROBE (unconditional, capped) : c54x_interrupt_ex
      * fait un dispatch SYNCHRONE ici (au moment de la levee) si INTM=0 -- sans

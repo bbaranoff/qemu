@@ -235,6 +235,9 @@ void shunt_dispatch_fb(uint8_t page_idx)
      * REELLES calculees depuis la RX (g_shunt.rx_*) au lieu des cannes. */
     {
         static int real_fb = -1;
+        /* @BEQUILLE — SHUNT_REAL_FB (helper)  (CALYPSO_SHUNT_REAL_FB, defaut OFF)
+         *   masque  : idem — detection FB cote hote a la place du correlateur DSP.
+         *   retirer : quand d_fb_det natif fonctionne. */
         if (real_fb < 0) { const char *e = getenv("CALYPSO_SHUNT_REAL_FB"); real_fb = (e && *e == '1') ? 1 : 0; }
         if (real_fb) {
             shunt_write_w(BASE_API_NDB + NDB_D_FB_DET, g_shunt.rx_fb_det ? 1 : 0);

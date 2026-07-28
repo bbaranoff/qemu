@@ -1464,6 +1464,12 @@ bool calypso_dsp_shunt_real_fb_read(uint32_t off, uint16_t *out)
 {
     static int real_fb = -1;
     if (real_fb < 0) {
+        /* @BEQUILLE — SHUNT_REAL_FB (intercept du resultat)  (CALYPSO_SHUNT_REAL_FB, defaut OFF)
+         *   masque  : le correlateur DSP natif. Le resultat FB est calcule COTE HOTE
+         *             et court-circuite ce que le DSP aurait produit.
+         *   retirer : quand d_fb_det natif est ecrit par le DSP.
+         *   ⚠️ Cette bequille MASQUE le natif : ne jamais l activer pour juger de
+         *   l etat du mode natif. Seule data[0x08f8] via DETECTOR-RUN le mesure. */
         const char *e = getenv("CALYPSO_SHUNT_REAL_FB");
         const char *dm = getenv("CALYPSO_DECAN");  /* master DECAN implique REAL_FB */
         real_fb = ((e && *e == '1') || (dm && dm[0] == '1')) ? 1 : 0;
@@ -1570,6 +1576,10 @@ void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
      * l'intercept 0x9213/0x9215 (c54x.c) sert au demod. Gate CALYPSO_FB_STREAM. */
     {
         static int _fs = -1, _fsd = 4;
+        /* @BEQUILLE — FB_STREAM (alimentation du ring)  (CALYPSO_FB_STREAM, defaut OFF)
+         *   masque  : cote emetteur du meme contournement — pousse l IQ decime dans
+         *             le ring que l intercept de lecture sert au demod.
+         *   retirer : en meme temps que l intercept de lecture. */
         if (_fs < 0) { const char *e = getenv("CALYPSO_FB_STREAM"); _fs = (e && atoi(e) > 0) ? 1 : 0;
             const char *d = getenv("CALYPSO_FB_STREAM_DECIM"); if (d && *d) _fsd = atoi(d); if (_fsd < 1) _fsd = 1; }
         if (_fs) {
