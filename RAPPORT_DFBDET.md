@@ -129,7 +129,7 @@ son entrée :
 ```
 
 `0x00d4` = `0x0080 + 21×4` = **vec 21**. Le code le documente déjà
-(`calypso_c54x.c:2541`) : *« vec19(FRAME)@0xcc et vec21(BRINT0)@0xd4 sont des stubs
+(`calypso_c54x.c:2645`) : *« vec19(FRAME)@0xcc et vec21(BRINT0)@0xd4 sont des stubs
 RETE(0xf4eb)/NOP à froid »*. `f4eb` = `RETE`. C'est donc **l'arrivée de nouveaux
 échantillons I/Q (BRINT0) qui interrompt la routine FB**, et son handler est un simple
 retour d'interruption.
@@ -146,7 +146,7 @@ repart de `0x76fb` au passage suivant. **Où le `RETE` retombe-t-il réellement 
 | Affirmation retirée | Pourquoi |
 |---|---|
 | « Cause racine #1 = le reroute `FB_ENERGY` vers un noyau bancarisé » | **retirée comme cause racine, pas comme fait** : les mesures qui la fondaient ont été prises alors que le DSP n'exécutait pas son firmware (§1). Le reroute lui-même **fonctionne** (2 tirs mesurés, +5,601 s et +6,170 s) et amène réellement le flux au corrélateur — `DADST`/`DETECTOR-RUN` le prouvent. Mais il y arrive par un chemin que la ROM n'emprunte pas, en court-circuitant l'étage qui publie : `d_fb_det` restait 0. |
-| « `CALA@0xb01e` = le dispatch FB » | elle fire à +0,111 s avec `d_task_md(0x0804/0x0818) = 0` — c'est de l'init. (Sa sonde était plafonnée à 40 tirs, tous consommés au boot.) |
+| « `CALA@0xb01e` = le dispatch FB » | elle fire à +0,111 s avec `d_task_md(0x0804/0x0818) = 0` — c'est de l'init. (Sa sonde etait plafonnee a 40 tirs, tous consommes au boot.) **Superseded 2026-07-28** : c'est la MESURE de +0,111 s qui ne prouvait rien (plafond de sonde) ; le reroute a fire plus tard (+5,601 s / +6,170 s) et le S2 montre `0xb01c/0xb01e` bien sur le chemin FB. Lire « la sonde etait aveugle », PAS « ce n'est pas le dispatch FB » (cf. `ETAT_ACTUEL.md` S3 M6). |
 | « slot de dispatch `0x4387`/`0x43c0` » | le slot effectif est **`0x43d8`**, en adressage absolu |
 | « 30+ writers de `0x08f8` dans la PROM » | la quasi-totalité sont l'**opcode** `ADD *(lk),A` (ex. `@0x772b : 08f8 3fb3`), pas une adresse. Writers réels : `0x79e4` (set), `0x778a` (clear), `0xb2cd` (reset NDB). |
 | « 0 FCCH sur 200 dumps du buffer » | artefact de fenêtre : les 200 records ont été pris pendant `d_fb_mode = 0` (le DSP ne cherchait pas de FCCH). Corrigé : la sonde est désormais gatée `d_fb_mode != 0`. |
@@ -164,7 +164,7 @@ cacher le mode courant. **À mesurer avant toute nouvelle affirmation.**
 
 ### Ce que `DADST` / `SHADOW-DADST` prouvent, et ce qu'ils ne prouvent pas
 
-La sonde `SHADOW-DADST` (`calypso_c54x.c:14358`, non gatée) fire sur l'exécution d'un
+La sonde `SHADOW-DADST` (`calypso_c54x.c:14538` pre-capture / `:14691` impression, non gatée) fire sur l'exécution d'un
 `DADST`/`DSADT` = le noyau corrélateur calcule. Elle **sort** en mode
 `NATIVE_HELPED` + `FB_ENERGY=1` (reroute actif) et **disparaît** en natif pur
 (`CALYPSO_DSP=none`, `FB_ENERGY=0`), où `DETECTOR-RUN` = 0.
@@ -272,7 +272,12 @@ docker exec osmo-operator-1 bash -lc 'cd /opt/GSM/osmocom-bb/src/target/firmware
 
 ## 8. BASELINE NATIF NU — ce que le firmware fait, sans aucune prothèse
 
-`calypso.env:213` source **inconditionnellement** `calypso_wire.env`, qui active par
+**[MISE A JOUR 2026-07-28, verifiee]** le profil WIRE est desormais **opt-in** :
+`calypso.env:220` le garde derriere `CALYPSO_WIRE=1` (defaut 0) et ne source
+`calypso_wire.env` qu'a la ligne `:227`. Sans `CALYPSO_WIRE=1`, **aucune** des
+bequilles ci-dessous n'est posee. Instrument : `grep -n CALYPSO_WIRE calypso.env`
+et le `[calypso-manifest]` du run. Ce qui suit decrit l'etat du 27/07, ou
+`calypso.env` sourcait **inconditionnellement** `calypso_wire.env`, qui activait par
 défaut une douzaine de béquilles : `ARM2DSP_BGEN`, `ARM2DSP_CTRLSYS`, `KEEP_IMR`,
 `TINT0_MASTER`, `FORCE_INTM_ONESHOT`, `BSP_DIRECT_BRINT0`, `BSP_DISPATCH_FB`,
 `BSP_DARAM_FORCE`, `FIX_3FCD`, `SEED5AC8_VAL`… Tous nos runs « natifs » les portaient.
@@ -316,13 +321,15 @@ AR5 = 0xdb7b..   opérande, +2 par itération — mémoire haute, hors buffer IQ
 ```
 
 ⚠️ **Ceci tranche une contradiction entre deux sources du projet**, en faveur du code :
-`calypso_c54x.c:5730` (« `0x8d00` ne touche jamais le buffer IQ `0x2a00` ») est
+`calypso_c54x.c:6041` (« `0x8d00` ne touche jamais le buffer IQ `0x2a00` ») est
 **confirmé** ; `DOC_PATH_BOOT_TO_CORRELATOR_2026-07-25.md`, qui désigne `0x8d00` comme
 la cible de dispatch requise, est **infirmé sur ce point** — `0x8d00` corrèle autre
 chose. Corrobore la note `correlator-ar5-not-in-buffer-rank3` (AR5=0xdb7b).
 
-Le corrélateur qui lit réellement `0x2a00` est celui du chemin énergie
-(`AR-FIRSTUSE AR4=0x2a00 PC=0x9fb8`, `SHADOW-DADST=370` en mode *helped*). Son entrée
+Le correlateur du chemin energie est celui qui **ecrit** `0x2a00` : `0x2a00..0x2b27`
+est sa **workzone de SORTIE** (`STH A, ASM, *AR4+` @`0x9fb8`), pas son entree — **ne
+jamais y feeder** (cf. `hw/arm/calypso/doc/ETAT_ACTUEL.md` S3 M8 et S3.1). Instruments :
+`AR-FIRSTUSE AR4=0x2a00 PC=0x9fb8` et `SHADOW-DADST=370` en mode *helped*. Son entrée
 **référencée en ROM** est `0x94f5` (`@0x87e7 f930 94f5`) ; `0x9500`, la valeur imposée
 par `calypso_native_helped.env`, n'apparaît **nulle part** dans les 28 672 mots — on
 saute 11 mots de mise en place (`ST1`/`DP`/`ARP` possibles).
@@ -424,7 +431,7 @@ la commande qui la rejoue.
 
 | # | Fait mesure | Instrument |
 |---|---|---|
-| 1 | Le BSP jetait les bursts RX : **3 gates**, pas un seul. `calypso_bsp.c:474` et `:997` se levent avec `CALYPSO_BSP_DARAM_FORCE`, mais `:1347` (la **livraison** vers `data[]`) ne connaissait que `CALYPSO_TPU_RX_WIRE`. `DARAM_FORCE=1` ouvrait donc **2 verrous sur 3** et rien n'arrivait. Aligne le 2026-07-28 ; **defaut inchange**. | `[bsp] deliver: gate shunt LEVE (rxw=1)` |
+| 1 | Le BSP jetait les bursts RX : **3 gates**, pas un seul. `calypso_bsp.c:474` et `:997` se levent avec `CALYPSO_BSP_DARAM_FORCE`, mais `:1359` (la **livraison** vers `data[]`) ne connaissait que `CALYPSO_TPU_RX_WIRE`. `DARAM_FORCE=1` ouvrait donc **2 verrous sur 3** et rien n'arrivait. Aligne le 2026-07-28 ; **defaut inchange**. | `[bsp] deliver: gate shunt LEVE (rxw=1)` |
 | 2 | `CALYPSO_BSP_IQ_DECIM=1` est une **regression** : le feed arrivait a **4 SPS** (`dphi=+0.25x pi/2`). Avec `DECIM=4` : `VERDICT: FCCH @1SPS PROPRE`. Corollaire : `DARAM_LEN=296` (638 ne valait que pour le 4 SPS non decime). | `corr_iq.py --src bursts` |
 | 3 | **L'entree demod est bien `0x4c00`** : `PC=0x9fb5` lit `0x4c00/05/0a/0f/15/1a` — **stride 5** (= le polyphase 6 taps) — avec des valeurs reelles (`ff6e`, `c1fb`, `d147`). | `CALYPSO_WATCH_9F00_RD=1` |
 | 4 | `0x9260/0x9261` (cibles de `CALYPSO_FB_STREAM_CELL`) ne sont **jamais lues** dans cette config. `FB_STREAM` reste inerte (`fb_stream_next` jamais appele). **Piste abandonnee** : le demod consomme le buffer directement. | `WATCH-9F00-RD` + absence de `FB-STREAM addr=` |
@@ -478,6 +485,8 @@ Deux issues, toutes deux exploitables :
 ## 5. Reproduire
 
 ```bash
+cd /opt/GSM/qemu-src
+
 # run de reference (chaine d'entree correcte, mesuree)
 CALYPSO_NATIVE_HELPED=1 CALYPSO_FB_CORR_ENTRY=0x94f5 \
 CALYPSO_DSP_RUN_C54X=1 CALYPSO_BSP_DARAM_FORCE=1 \
@@ -486,8 +495,8 @@ CALYPSO_SHUNT_REAL_FB=1 CALYPSO_DEBUG=BSP ./start-clean.sh
 
 grep -E "deliver: gate shunt LEVE|dropping fn=" /root/qemu.log   # gate levee, 0 drop
 grep -E "DMA fn=" /root/qemu.log | tail -2                        # le BSP depose
-cd tools && python3 corr_iq.py --src bursts | grep VERDICT         # FCCH @1SPS PROPRE
-cd tools && python3 corr_iq.py --src ddump  | tail -3              # CONFORMITE KERNEL
+cd /opt/GSM/qemu-src/tools && python3 corr_iq.py --src bursts | grep VERDICT         # FCCH @1SPS PROPRE
+cd /opt/GSM/qemu-src/tools && python3 corr_iq.py --src ddump  | tail -3              # CONFORMITE KERNEL
 ```
 
 Sondes disponibles (toutes gatees, **defaut OFF**) : `CALYPSO_WMAP` (+`_LO/_HI/_LO2/_HI2`),

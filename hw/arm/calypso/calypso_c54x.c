@@ -10185,8 +10185,16 @@ static int c54x_exec_one(C54xState *s)
          * Per tic54x-opc.c + SPRU172C :
          *   stl 0x8000 / 0xFE00 → 0x80..0x81 STL src,Smem (no shift)
          *   sth 0x8200 / 0xFE00 → 0x82..0x83 STH src,Smem (no shift)
-         *   stl 0x8400 / 0xFE00 → 0x84..0x85 STL src,ASM,Smem (with shift) [TODO]
-         *   sth 0x8600 / 0xFE00 → 0x86..0x87 STH src,ASM,Smem (with shift) [TODO]
+         *   stl 0x8400 / 0xFE00 → 0x84..0x85 STL src,ASM,Smem (with shift) [FAIT]
+         *   sth 0x8600 / 0xFE00 → 0x86..0x87 STH src,ASM,Smem (with shift) [FAIT]
+         * [2026-07-28] les deux variantes ASM sont IMPLEMENTEES (handlers hi8==0x84
+         * et hi8==0x86/0x87 ci-dessus, tous deux via asm_shift()), et asm_shift()
+         * est conforme au manuel (ASM = ST1[4:0] signe, -16 <= ASM <= 15). Le
+         * "[TODO]" precedent etait perime et a coute une fausse piste en remontant
+         * la sortie du demod (0x8694 = STH A,ASM,*AR4+ ecrit data[0x2a00]) : le
+         * decalage EST applique. Le vrai bug de ce chemin etait ailleurs — les
+         * opcodes logiques 0x1800/1A00/1C00/1E00 (AND/OR/XOR/SUBC) decodes comme
+         * un LD, cf. le case 0x1 plus haut.
          * bit 8 = src (0=A, 1=B). Old code applied asm_shift incorrectly
          * to 0x81/0x82 (basic variants — no shift) AND used s->a for 0x81
          * (should be s->b). Le bug causait toutes les STL B / STH * vers
