@@ -190,6 +190,40 @@ static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
 {
     CalypsoTRX *s = opaque;
     if (offset >= CALYPSO_DSP_SIZE) return 0;
+    {   /* [2026-07-28] FIND32 : voir en-tete du patch. */
+        static int _f3 = -1; static unsigned _f3n = 0; static uint16_t _f3v = 0x0020;
+        if (_f3 < 0) { _f3 = getenv("CALYPSO_FIND32") ? 1 : 0;
+                       const char *v = getenv("CALYPSO_FIND32_VAL");
+                       if (v && *v) _f3v = (uint16_t)strtol(v, NULL, 0); }
+        if (_f3 && _f3n < 40 && s->dsp_ram && (offset & 1) == 0) {
+            uint16_t _v = s->dsp_ram[offset / 2];
+            if (_v == _f3v) {
+                _f3n++;
+                unsigned _dspw = 0x0800 + (unsigned)(offset / 2);
+                fprintf(stderr, "[calypso-trx] FIND32 off=0x%04x (mot DSP 0x%04x) = 0x%04x "
+                        "| NDB+%d mots | fn=%u\n", (unsigned)offset, _dspw, _v,
+                        (int)(((int)offset - 0x01A8) / 2), s->fn);
+            }
+        }
+    }
+    {   /* [2026-07-28] ERRREAD : voir en-tete du patch. */
+        static int _er = -1; static unsigned _ern = 0;
+        if (_er < 0) _er = getenv("CALYPSO_ERRREAD") ? 1 : 0;
+        if (_er && offset >= 0x01A8 && offset <= 0x01AE && _ern < 40) {
+            _ern++;
+            unsigned _w = (unsigned)(offset / 2);
+            unsigned _dspw = 0x0800 + _w;
+            uint16_t _arm = s->dsp_ram ? s->dsp_ram[_w] : 0xDEAD;
+            uint16_t _dsp = (s->dsp && _dspw < C54X_DATA_SIZE) ? s->dsp->data[_dspw] : 0xDEAD;
+            fprintf(stderr, "[calypso-trx] ERRREAD off=0x%04x (mot DSP 0x%04x, %s) "
+                    "vue_ARM=0x%04x vue_DSP=0x%04x %s fn=%u\n",
+                    (unsigned)offset, _dspw,
+                    offset == 0x01A8 ? "d_dsp_page" :
+                    offset == 0x01AA ? "d_error_status" : "(voisin)",
+                    _arm, _dsp,
+                    (_arm != _dsp) ? "<<<< LES DEUX VUES DIVERGENT" : "(coherent)", s->fn);
+        }
+    }
 
     /* === Hypothesis #4 probe : ARM reads R_PAGE_X (= DSP responses) ===
      * ARM lit a_pm via R_PAGE_X. R_PAGE_0 = 0x0050, R_PAGE_1 = 0x0078.

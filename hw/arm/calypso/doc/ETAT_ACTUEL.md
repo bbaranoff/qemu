@@ -169,6 +169,33 @@ routine sans le contexte de son appelant**.
 Test : `CALYPSO_FB_CORR_ENTRY=0x94f5` (attention, un run precedent l'a recu **tronque a
 `0x94f`** — verifier dans `/proc/<pid>/environ`, pas seulement au manifeste).
 
+### 3.2c ✅ DEBLOQUE (2026-07-28) : entree du demod = `data[0x4c00]`
+
+Deux mesures consecutives ont ouvert la chaine :
+
+1. **`CALYPSO_FB_CORR_ENTRY=0x94f5`** (au lieu de `0x9500`) : les 11 mots de mise en
+   place s'executent et posent **`AR6 = 0x4c00`**. Le demod cesse de lire la zone des
+   registres.
+2. **`CALYPSO_BSP_DARAM_ADDR=0x4c00`** (au lieu de `0x2a00`) : le BSP depose au bon
+   endroit. Le demod lit alors de **vraies valeurs** :
+   `data[0x4c00]=0xff6e`, `[0x4c05]=0xc1fb`, `[0x4c0a]=0x4b3a`, `[0x4c0f]=0x89d4`.
+
+> **`0x2a00` n'est PAS l'entree** : c'est la zone ou le demod **ecrit** (`AR4 = 2a00,
+> 2a01, ...`). L'entree est `0x4c00`. Toute l'IQ injectee auparavant (`0x2a00`,
+> `0x9213/0x9215`, `0x9260/0x9261`) n'etait lue par personne.
+
+**Deux points ouverts, nommes :**
+- **Pas de 5** : le demod lit `0x4c00`, `+5`, `+10`, `+15`... alors que le BSP depose 296
+  int16 contigus (I/Q entrelace). Format attendu a determiner (structure de 5 mots par
+  echantillon ?).
+- **`DSP_ERR_DMA_PEND` (0x20)** : le DSP attend l'ACHEVEMENT d'une DMA. Notre BSP ecrit
+  le buffer directement, sans passer par la machinerie DMA -> le drapeau ne se libere
+  jamais. C'est le verrou suivant.
+
+*(Progression de l'erreur DSP au fil des correctifs : `2048` STACK_OV -> `32` DMA_PEND.
+Ce n'est pas une regression : le DSP va assez loin pour se plaindre de la couche
+suivante.)*
+
 ### 3.3 Ce qui est definitivement ecarte
 
 | Hypothese | Preuve |

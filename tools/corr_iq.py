@@ -162,7 +162,9 @@ def scan_bursts(recs, fs, label):
         scored.append((m["coh"], m["dphi"], m["rms"], name, iq))
     if not scored:
         print("  (aucun burst non-nul)"); return
-    scored.sort(reverse=True)
+    # tri sur les scalaires seuls : le 5e champ est un ndarray et rend
+    # la comparaison de tuples ambigue des que (coh,dphi,rms) sont egaux.
+    scored.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
     nf = sum(1 for c, *_ in scored if c > 0.85)
     print("%s : %d bursts non-nuls, %d coherents (FCCH, coh>0.85)" % (label, len(scored), nf))
     for c, d, r, name, _ in scored[:8]:

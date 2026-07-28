@@ -1343,7 +1343,19 @@ void calypso_bsp_deliver_buffered(uint32_t current_fn)
      * d'alimenter le vrai corrélateur DSP. Réversible : sans l'env, inchangé. */
     {
         static int rxw = -1;
-        if (rxw < 0) rxw = getenv("CALYPSO_TPU_RX_WIRE") ? 1 : 0;
+        if (rxw < 0) {
+            /* [2026-07-28] coherence avec les gates :474 et :997, qui se levent
+             * deja avec CALYPSO_BSP_DARAM_FORCE. Sans ca, DARAM_FORCE=1 ouvrait
+             * 2 verrous sur 3 et la livraison restait bloquee ici -> entree du
+             * correlateur (0x4c00) gelee (mesure corr_iq : 3 lectures identiques).
+             * Defaut inchange : sans env, comportement strictement identique. */
+            const char *rc = getenv("CALYPSO_DSP_RUN_C54X");
+            rxw = (getenv("CALYPSO_TPU_RX_WIRE")
+                   || (rc && *rc == '1' && getenv("CALYPSO_BSP_DARAM_FORCE"))) ? 1 : 0;
+            if (rxw)
+                fprintf(stderr, "[bsp] deliver: gate shunt LEVE (rxw=1) — "
+                        "livraison DARAM active\n");
+        }
         if (calypso_dsp_shunt_active() && !rxw) return;
     }
 

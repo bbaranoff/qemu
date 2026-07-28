@@ -52,7 +52,22 @@ SHUNT (LU ACCEPT + TMSI REALLOC + On Network) et le RACH UL qui la fermait.
   - Effet mesure : DSP a la cadence trame (`dsp_n_exec_2/5 = 32768`) et
     **`DSP_ERR_STACK_OV` eteint**.
 
-- **[P1] Pointeur d'entree du demod jamais initialise** ← *le verrou courant*
+- **[P1] ✅ RESOLU (28/07) — entree du demod = `data[0x4c00]`**
+  - `CALYPSO_FB_CORR_ENTRY=0x94f5` (pas `0x9500`) -> les 11 mots de setup posent
+    `AR6=0x4c00` ; `CALYPSO_BSP_DARAM_ADDR=0x4c00` (pas `0x2a00`) -> le BSP depose au bon
+    endroit. Le demod lit enfin de vraies valeurs (`0xff6e`, `0xc1fb`, `0x4b3a`...).
+  - ⚠️ `0x2a00` est la SORTIE du demod (`AR4`), pas l'entree.
+
+- **[P1b] Format d'entree : le demod lit avec un PAS DE 5** ← *verrou courant*
+  - Il lit `0x4c00`, `+5`, `+10`, `+15`... alors que le BSP depose 296 int16 contigus
+    (I/Q entrelace). Determiner la structure attendue.
+
+- **[P1c] `DSP_ERR_DMA_PEND` (0x20)** ← *verrou courant*
+  - Le DSP attend l'achevement d'une DMA ; notre BSP ecrit le buffer directement sans
+    passer par la machinerie DMA -> le drapeau ne se libere jamais.
+  - Identifier qui pose/efface l'etat « DMA en cours » cote modele.
+
+- **[P1-ancien] Pointeur d'entree du demod jamais initialise** (historique)
   - Mesure (`CALYPSO_DEMODRD`, `XPC=0`) : le demod lit ses echantillons a
     `data[0x0000]`, `[0x0005]`, `[0x000a]` (pas de 5) — que des zeros ; `AR6 = 0000` sur
     toutes les iterations, alors que `AR4` (ecriture) parcourt bien `0x2a00+`.
@@ -110,3 +125,17 @@ SHUNT (LU ACCEPT + TMSI REALLOC + On Network) et le RACH UL qui la fermait.
 
 Note taxonomie : `api_write_cb` (calypso_c54x.h) = callback mort, fausse piste
 (cf `ETAT_ACTUEL.md` §6 "ne pas theoriser dessus") -> retire des TODO.
+
+## [2026-07-28] Chaine d'entree du correlateur natif — etat mesure
+
+- [x] **3e gate BSP** (`calypso_bsp.c:1347`, livraison) aligne sur `CALYPSO_BSP_DARAM_FORCE`.
+      Avant : `DARAM_FORCE` ouvrait 2 verrous sur 3, rien n'arrivait. Defaut inchange.
+- [x] **Decimation** : `CALYPSO_BSP_IQ_DECIM=4` (pas 1 — regression : feed a 4 SPS,
+      `dphi=+0.25x pi/2`). `DARAM_LEN=296` (638 ne valait que pour le 4 SPS).
+- [x] **Entree demod = `0x4c00`** confirmee par mesure (stride 5, valeurs reelles).
+- [x] `FB_STREAM` / cellules `0x9260-61` : **ecarte** — jamais lues dans cette config.
+- [ ] **P0 — sortie demod plate** : entree vivante, sortie DC figee (avec `DECIM=1` comme
+      `DECIM=4`). Suspect = emulation `0x9f95..0x9fe2`. Sonde `CALYPSO_DEMODIO=1`.
+- [ ] P1 — si le decodage est en cause : identifier l'opcode fautif (le demod lit en
+      stride 5 un buffer I/Q entrelace ; verifier que c'est bien ce que le natif attend).
+- [ ] P2 — reprendre la sequence FBSB une fois la sortie demod vivante (`d_fb_det`).

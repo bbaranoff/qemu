@@ -1629,6 +1629,9 @@ static void nop_guard_dump(C54xState *s, uint16_t pc, uint8_t xpc)
 }
 
 static uint16_t data_read_locked(C54xState *s, uint16_t addr);
+/* [2026-07-28] DEMODIO : prototype — le helper est defini plus bas mais
+ * data_read, qui l appelle, vient avant. */
+static void dio_note(C54xState *s, const char *rw, uint16_t addr, uint16_t val);
 
 /* FBWATCH (2026-05-30 soir) : sonde FB-dispatch gatée par une env DÉDIÉE
  * (CALYPSO_FBWATCH=1), résolue UNE fois en static int → check int cheap, PAS
@@ -1731,23 +1734,110 @@ static uint16_t data_read(C54xState *s, uint16_t addr)
     qemu_mutex_lock(&calypso_pcb_daram_lock);
     uint16_t v = data_read_locked(s, addr);
     qemu_mutex_unlock(&calypso_pcb_daram_lock);
+    dio_note(s, "R", addr, v);
     return v;
 }
 
 static void flow_log(const char *rw, uint16_t addr, uint16_t val, uint16_t pc, unsigned insn);
+
+/* [2026-07-28] RMAP : carte agregee des adresses LUES par les PC d une plage.
+ * Symetrique de WMAP. Voir en-tete du patch rmap.py. */
+#define RMAP_PCS 48
+static struct { uint16_t pc; uint32_t n; uint16_t a[8]; uint8_t na;
+                uint16_t amn, amx; } g_rmap[RMAP_PCS];
+static int      g_rmap_n;
+static uint32_t g_rmap_tot;
+static int      g_rmap_on = -1;
+static uint16_t g_rmap_pclo, g_rmap_pchi;
+
+static void rmap_dump(void)
+{
+    fprintf(stderr, "[c54x] RMAP PC 0x%04x..0x%04x  lectures=%u  PCs=%d%s\n",
+            g_rmap_pclo, g_rmap_pchi, g_rmap_tot, g_rmap_n,
+            g_rmap_n >= RMAP_PCS ? "  *** SATUREE ***" : "");
+    for (int i = 0; i < g_rmap_n; i++) {
+        fprintf(stderr, "[c54x] RMAP   PC=0x%04x n=%-7u lit 0x%04x..0x%04x  ex:",
+                g_rmap[i].pc, g_rmap[i].n, g_rmap[i].amn, g_rmap[i].amx);
+        for (int k = 0; k < g_rmap[i].na && k < 8; k++)
+            fprintf(stderr, " %04x", g_rmap[i].a[k]);
+        fprintf(stderr, "\n");
+    }
+}
+
+static void rmap_note(uint16_t addr, uint16_t pc)
+{
+    if (g_rmap_on < 0) {
+        const char *e = getenv("CALYPSO_RMAP");
+        g_rmap_on = (e && atoi(e) > 0) ? 1 : 0;
+        const char *lo = getenv("CALYPSO_RMAP_PCLO"), *hi = getenv("CALYPSO_RMAP_PCHI");
+        g_rmap_pclo = lo ? (uint16_t)strtoul(lo, NULL, 0) : 0x9f00;
+        g_rmap_pchi = hi ? (uint16_t)strtoul(hi, NULL, 0) : 0x9fff;
+        if (g_rmap_on)
+            fprintf(stderr, "[c54x] RMAP armed PC 0x%04x..0x%04x\n", g_rmap_pclo, g_rmap_pchi);
+    }
+    if (!g_rmap_on || pc < g_rmap_pclo || pc > g_rmap_pchi) return;
+
+    int i;
+    for (i = 0; i < g_rmap_n; i++) if (g_rmap[i].pc == pc) break;
+    if (i == g_rmap_n) {
+        if (g_rmap_n >= RMAP_PCS) return;
+        g_rmap_n++;
+        g_rmap[i].pc = pc; g_rmap[i].n = 0; g_rmap[i].na = 0;
+        g_rmap[i].amn = 0xffff; g_rmap[i].amx = 0;
+    }
+    g_rmap[i].n++;
+    if (addr < g_rmap[i].amn) g_rmap[i].amn = addr;
+    if (addr > g_rmap[i].amx) g_rmap[i].amx = addr;
+    if (g_rmap[i].na < 8) {
+        int seen = 0;
+        for (int k = 0; k < g_rmap[i].na; k++) if (g_rmap[i].a[k] == addr) { seen = 1; break; }
+        if (!seen) g_rmap[i].a[g_rmap[i].na++] = addr;
+    }
+    if (++g_rmap_tot % 5000 == 0) rmap_dump();
+}
+
 static uint16_t data_read_locked(C54xState *s, uint16_t addr)
 {
+    rmap_note(addr, s->pc);
+    {   /* [2026-07-28] WZREAD : voir en-tete du patch (gate CALYPSO_WZWRITE). */
+        static int _wr = -1; static unsigned _wrn = 0;
+        if (_wr < 0) _wr = getenv("CALYPSO_WZWRITE") ? 1 : 0;
+        if (_wr && addr == 0x2c00 && s->pc == 0xa07c && _wrn < 40) {
+            /* v3 : seule la lecture du noyau MAC nous interesse (0x9aba = boucle
+             * de normalisation, bruyante et deja caracterisee en B4B). */
+            _wrn++;
+            fprintf(stderr, "[c54x] WZREAD  data[0x%04x] = 0x%04x PC=0x%04x op=0x%04x "
+                    "AR2=%04x AR3=%04x AR4=%04x AR5=%04x insn=%u\n",
+                    addr, s->data[addr], s->pc, prog_fetch(s, s->pc),
+                    s->ar[2], s->ar[3], s->ar[4], s->ar[5], s->insn_count);
+        }
+    }
+    {   /* [2026-07-28] DMAWATCH (lecture) : voir en-tete du patch. */
+        static int _dw2 = -1; static unsigned _dwr = 0;
+        if (_dw2 < 0) _dw2 = getenv("CALYPSO_DMAWATCH") ? 1 : 0;
+        if (_dw2 && addr >= 0x0054 && addr <= 0x0057 && _dwr < 40) {
+            _dwr++;
+            const char *_nm = (addr==0x0054) ? "DMPREC?(modele:DMSA)" :
+                              (addr==0x0055) ? "DMSA?(modele:DMSDI)" :
+                              (addr==0x0056) ? "DMSDI?" : "DMSDN";
+            fprintf(stderr, "[c54x] DMAWATCH RD 0x%04x %-20s = 0x%04x PC=0x%04x insn=%u\n",
+                    addr, _nm, s->data[addr], s->pc, s->insn_count);
+        }
+    }
     {   /* [2026-07-28] DEMODRD : voir en-tete du patch. */
         static int _dr = -1; static unsigned _drn = 0;
         if (_dr < 0) _dr = getenv("CALYPSO_DEMODRD") ? 1 : 0;
-        if (_dr && _drn < 60 && s->pc >= 0x9fa8 && s->pc <= 0x9fbb) {
+        if (_dr && _drn < 60 && s->pc == 0x9fb5) {   /* seule la lecture des echantillons */
             _drn++;
             fprintf(stderr, "[c54x] DEMODRD PC=0x%04x XPC=%u op=0x%04x lit data[0x%04x]=0x%04x "
-                    "AR1=%04x AR2=%04x AR3=%04x AR4=%04x AR5=%04x AR6=%04x AR7=%04x "
-                    "ST0=0x%04x ST1=0x%04x insn=%u\n",
+                    "AR0=%04x AR1=%04x AR2=%04x AR3=%04x AR4=%04x AR5=%04x AR6=%04x AR7=%04x "
+                    "BK=%04x | 5 mots: %04x %04x %04x %04x %04x | insn=%u\n",
                     s->pc, (unsigned)s->xpc, prog_fetch(s, s->pc), addr, s->data[addr],
-                    s->ar[1], s->ar[2], s->ar[3], s->ar[4], s->ar[5], s->ar[6], s->ar[7],
-                    s->st0, s->st1, s->insn_count);
+                    s->ar[0], s->ar[1], s->ar[2], s->ar[3], s->ar[4], s->ar[5],
+                    s->ar[6], s->ar[7], s->bk,
+                    s->data[(uint16_t)(addr+0)], s->data[(uint16_t)(addr+1)],
+                    s->data[(uint16_t)(addr+2)], s->data[(uint16_t)(addr+3)],
+                    s->data[(uint16_t)(addr+4)], s->insn_count);
         }
     }
     {   /* [2026-07-27] SLOTSRC-RD : quelle adresse contient le stub 0xab38 ? */
@@ -2738,9 +2828,177 @@ static void flow_log(const char *rw, uint16_t addr, uint16_t val, uint16_t pc, u
         fprintf(stderr, "[c54x] FLOWTRACE done -> /tmp/calypso_flow.txt\n"); }
 }
 
+
+/* [2026-07-28] WMAP : carte agregee des ecrivains d une plage data[].
+ * Voir en-tete du patch wmap.py — un agregat, pas un flux : aucun plafond de
+ * lignes, donc aucune fenetre a rater (les 3 sondes precedentes ont toutes ete
+ * tronquees). Sortie periodique : PC, n, valeurs distinctes, min/max. */
+#define WMAP_PCS 64
+static struct { uint16_t pc; uint32_t n; uint16_t v[8]; uint8_t nv;
+                uint16_t mn, mx; uint16_t addr0; uint32_t n0; } g_wmap[WMAP_PCS];
+static int      g_wmap_n;
+static uint32_t g_wmap_tot;
+static int      g_wmap_on = -1;
+static uint16_t g_wmap_lo, g_wmap_hi, g_wmap_lo2, g_wmap_hi2;
+
+static void wmap_dump(void)
+{
+    fprintf(stderr, "[c54x] WMAP plages 0x%04x..0x%04x + 0x%04x..0x%04x  ecritures=%u  ecrivains=%d%s\n",
+            g_wmap_lo, g_wmap_hi, g_wmap_lo2, g_wmap_hi2, g_wmap_tot, g_wmap_n,
+            g_wmap_n >= WMAP_PCS ? "  *** TABLE SATUREE, ecrivains manquants ***" : "");
+    for (int i = 0; i < g_wmap_n; i++) {
+        fprintf(stderr, "[c54x] WMAP   PC=0x%04x n=%-7u @0x%04x(n=%u) distinct=%s%d  min=0x%04x max=0x%04x  ex:",
+                g_wmap[i].pc, g_wmap[i].n, g_wmap[i].addr0, g_wmap[i].n0,
+                g_wmap[i].nv >= 8 ? ">=" : "", g_wmap[i].nv,
+                g_wmap[i].mn, g_wmap[i].mx);
+        for (int k = 0; k < g_wmap[i].nv && k < 8; k++)
+            fprintf(stderr, " %04x", g_wmap[i].v[k]);
+        fprintf(stderr, "%s\n", g_wmap[i].n0 < 2 ? "   <= (trop peu d echantillons)"
+                : g_wmap[i].nv == 1 ? "   <= CONSTANTE dans le temps"
+                                    : "   <= VARIE dans le temps = PORTE DE LA DONNEE");
+    }
+}
+
+/* v3 : battement — prouve que la sonde est VIVANTE meme a zero ecriture.
+ * Appele sur chaque write hors plage ; n imprime qu une fois par tranche de
+ * 5e6 writes globaux, en rappelant le total DANS la plage (0 = vrai zero). */
+static void wmap_heartbeat(void)
+{
+    static uint64_t k;
+    if (!g_wmap_on) return;
+    if (++k % 5000000ULL) return;
+    fprintf(stderr, "[c54x] WMAP heartbeat: writes DSP=%llu, dans plages=%u"
+            " (0 = la plage n est jamais ecrite par une instruction DSP)\n",
+            (unsigned long long)k, g_wmap_tot);
+}
+
+static void wmap_note(uint16_t addr, uint16_t val, uint16_t pc)
+{
+    if (g_wmap_on < 0) {
+        const char *e = getenv("CALYPSO_WMAP");
+        g_wmap_on = (e && atoi(e) > 0) ? 1 : 0;
+        const char *lo = getenv("CALYPSO_WMAP_LO"), *hi = getenv("CALYPSO_WMAP_HI");
+        g_wmap_lo = lo ? (uint16_t)strtoul(lo, NULL, 0) : 0x2c00;
+        g_wmap_hi = hi ? (uint16_t)strtoul(hi, NULL, 0) : 0x2c1f;
+        const char *lo2 = getenv("CALYPSO_WMAP_LO2"), *hi2 = getenv("CALYPSO_WMAP_HI2");
+        g_wmap_lo2 = lo2 ? (uint16_t)strtoul(lo2, NULL, 0) : 0xffff;
+        g_wmap_hi2 = hi2 ? (uint16_t)strtoul(hi2, NULL, 0) : 0x0000;
+        if (g_wmap_on)
+            fprintf(stderr, "[c54x] WMAP armed 0x%04x..0x%04x\n", g_wmap_lo, g_wmap_hi);
+    }
+    if (!g_wmap_on) return;
+    if (!((addr >= g_wmap_lo  && addr <= g_wmap_hi) ||
+          (addr >= g_wmap_lo2 && addr <= g_wmap_hi2))) { wmap_heartbeat(); return; }
+
+    int i;
+    for (i = 0; i < g_wmap_n; i++) if (g_wmap[i].pc == pc) break;
+    if (i == g_wmap_n) {
+        if (g_wmap_n >= WMAP_PCS) return;
+        g_wmap_n++;
+        g_wmap[i].pc = pc; g_wmap[i].n = 0; g_wmap[i].nv = 0;
+        g_wmap[i].mn = 0xffff; g_wmap[i].mx = 0;
+        g_wmap[i].addr0 = addr; g_wmap[i].n0 = 0;   /* v2 : cellule temoin figee */
+    }
+    g_wmap[i].n++;
+    if (val < g_wmap[i].mn) g_wmap[i].mn = val;
+    if (val > g_wmap[i].mx) g_wmap[i].mx = val;
+    /* v2 : le critere de SIGNAL est la variation dans le TEMPS a adresse FIXE. */
+    if (addr != g_wmap[i].addr0) return;
+    g_wmap[i].n0++;
+    if (g_wmap[i].nv < 8) {
+        int seen = 0;
+        for (int k = 0; k < g_wmap[i].nv; k++) if (g_wmap[i].v[k] == val) { seen = 1; break; }
+        if (!seen) g_wmap[i].v[g_wmap[i].nv++] = val;
+    }
+    /* v3 : seuil bas + tick temporel, pour que l ABSENCE soit mesurable. */
+#define WMAP_TICK 2000
+    if (++g_wmap_tot % WMAP_TICK == 0) wmap_dump();
+}
+
+
+/* [2026-07-28] DEMODIO : voir en-tete du patch demodio.py. */
+static int      g_dio_on = -1;
+static uint64_t g_dio_after;
+static unsigned g_dio_n;
+static uint16_t g_dio_pclo, g_dio_pchi;
+
+static void dio_init(void)
+{
+    const char *e = getenv("CALYPSO_DEMODIO");
+    g_dio_on = (e && atoi(e) > 0) ? 1 : 0;
+    const char *a = getenv("CALYPSO_DEMODIO_AFTER");
+    g_dio_after = a && *a ? strtoull(a, NULL, 0) : 40000000ULL;
+    const char *lo = getenv("CALYPSO_DEMODIO_PCLO"), *hi = getenv("CALYPSO_DEMODIO_PCHI");
+    g_dio_pclo = lo ? (uint16_t)strtoul(lo, NULL, 0) : 0x9f95;
+    g_dio_pchi = hi ? (uint16_t)strtoul(hi, NULL, 0) : 0x9fe2;
+    if (g_dio_on)
+        fprintf(stderr, "[c54x] DEMODIO armed PC 0x%04x..0x%04x apres insn=%llu\n",
+                g_dio_pclo, g_dio_pchi, (unsigned long long)g_dio_after);
+}
+
+static void dio_note(C54xState *s, const char *rw, uint16_t addr, uint16_t val)
+{
+    if (g_dio_on < 0) dio_init();
+    if (!g_dio_on) return;
+    if (s->pc < g_dio_pclo || s->pc > g_dio_pchi) return;
+    if (s->insn_count < g_dio_after) return;
+    if (g_dio_n >= 160) return;
+    int64_t a = (s->a & 0x8000000000LL) ? (int64_t)(s->a | ~0xFFFFFFFFFFLL) : (int64_t)s->a;
+    int64_t b = (s->b & 0x8000000000LL) ? (int64_t)(s->b | ~0xFFFFFFFFFFLL) : (int64_t)s->b;
+    fprintf(stderr, "[c54x] DEMODIO %s PC=0x%04x op=0x%04x addr=0x%04x val=0x%04x "
+            "A=%lld B=%lld T=0x%04x AR2=%04x AR3=%04x AR4=%04x AR5=%04x insn=%u\n",
+            rw, s->pc, prog_fetch(s, s->pc), addr, val, (long long)a, (long long)b,
+            s->t, s->ar[2], s->ar[3], s->ar[4], s->ar[5], s->insn_count);
+    g_dio_n++;
+}
+
 static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
 {
+    dio_note(s, "W", addr, val);
+    wmap_note(addr, val, s->pc);
     flow_log("W", addr, val, s->pc, s->insn_count);
+    {   /* [2026-07-28] WZWRITE : qui remplit l entree du noyau ? (voir en-tete) */
+        static int _wz = -1; static unsigned _wzn = 0;
+        if (_wz < 0) _wz = getenv("CALYPSO_WZWRITE") ? 1 : 0;
+        if (_wz && addr == 0x2c00 && (s->pc == 0x9fd5 || s->pc == 0x9ab1) && _wzn < 40) {
+            /* v3 : filtre par PC PRODUCTEUR — 0xa03d/a042/a079 (init MAC) exclus,
+             * ils saturaient le plafond et masquaient les bursts suivants. */
+            _wzn++;
+            fprintf(stderr, "[c54x] WZWRITE data[0x%04x] <- 0x%04x PC=0x%04x op=0x%04x "
+                    "A=0x%010llx AR2=%04x AR3=%04x AR4=%04x AR5=%04x insn=%u\n",
+                    addr, val, s->pc, prog_fetch(s, s->pc),
+                    (unsigned long long)(s->a & 0xFFFFFFFFFFULL),
+                    s->ar[2], s->ar[3], s->ar[4], s->ar[5], s->insn_count);
+        }
+    }
+    {   /* [2026-07-28] ERRWATCH : qui pose d_error_status ? (voir en-tete) */
+        static int _ew = -1; static unsigned _ewn = 0;
+        if (_ew < 0) _ew = getenv("CALYPSO_ERRWATCH") ? 1 : 0;
+        /* v3 : sur d_error_status (0x08D5) on ignore les ecritures de 0 —
+         * elles sont le nettoyage de boot et consommaient tout le plafond. */
+        if (_ew && addr == 0x08D5 && val != 0 && _ewn < 60) {
+            _ewn++;
+            const char *_b = (val & 0x0800) ? "STACK_OV" : (val & 0x0400) ? "DMA_UL_PEND" :
+                             (val & 0x0200) ? "DMA_UL_PROG" : (val & 0x0100) ? "DMA_UL_TASK" :
+                             (val & 0x0080) ? "VM" : (val & 0x0020) ? "DMA_PEND" :
+                             (val & 0x0010) ? "DMA_TASK" : (val & 0x0008) ? "DMA_PROG" :
+                             (val & 0x0004) ? "IQ_SAMPLES" : (val & 0x0001) ? "RHEA" : "(clear)";
+            fprintf(stderr, "[c54x] ERRWATCH data[0x%04x] 0x%04x -> 0x%04x [%s] "
+                    "PC=0x%04x op=0x%04x A=0x%06llx AR1=%04x AR2=%04x AR6=%04x insn=%u\n",
+                    addr, s->data[addr], val, _b, s->pc, prog_fetch(s, s->pc),
+                    (unsigned long long)(s->a & 0xFFFFFFULL),
+                    s->ar[1], s->ar[2], s->ar[6], s->insn_count);
+        }
+    }
+    {   /* [2026-07-28] DMAWATCH (ecriture). */
+        static int _dw3 = -1; static unsigned _dww = 0;
+        if (_dw3 < 0) _dw3 = getenv("CALYPSO_DMAWATCH") ? 1 : 0;
+        if (_dw3 && addr >= 0x0054 && addr <= 0x0057 && _dww < 40) {
+            _dww++;
+            fprintf(stderr, "[c54x] DMAWATCH WR 0x%04x <- 0x%04x (etait 0x%04x) PC=0x%04x insn=%u\n",
+                    addr, val, s->data[addr], s->pc, s->insn_count);
+        }
+    }
     {   /* [2026-07-28] BOOTCMD cote DSP : qui ecrase la commande ? */
         static int _bc2 = -1; static unsigned _bc2n = 0;
         if (_bc2 < 0) _bc2 = getenv("CALYPSO_BOOTCMD") ? 1 : 0;
@@ -14741,6 +14999,31 @@ int c54x_run(C54xState *s, int n_insns)
                     }
                 }
                 _tfp = s->pc;
+            }
+        }
+        {   /* [2026-07-28] CORROUT : voir en-tete du patch. */
+            static int _co = -1; static int _in_k = 0; static unsigned _con = 0;
+            if (_co < 0) _co = getenv("CALYPSO_CORROUT") ? 1 : 0;
+            if (_co) {
+                if (exec_pc >= 0xa070 && exec_pc <= 0xa0a0) { _in_k = 1; }
+                else if (_in_k) {   /* on vient de QUITTER le noyau MAC */
+                    _in_k = 0;
+                    if (_con < 40) {
+                        _con++;
+                        fprintf(stderr, "[c54x] CORROUT sortie noyau -> PC=0x%04x "
+                                "A=0x%010llx B=0x%010llx T=%04x "
+                                "AR3=%04x AR4=%04x AR5=%04x AR6=%04x insn=%u\n",
+                                exec_pc,
+                                (unsigned long long)(s->a & 0xFFFFFFFFFFULL),
+                                (unsigned long long)(s->b & 0xFFFFFFFFFFULL),
+                                s->t, s->ar[3], s->ar[4], s->ar[5], s->ar[6],
+                                s->insn_count);
+                        fprintf(stderr, "[c54x] CORROUT   wz[2c00..0f]=");
+                        for (int _k = 0; _k < 16; _k++)
+                            fprintf(stderr, " %04x", s->data[0x2c00 + _k]);
+                        fprintf(stderr, "\n");
+                    }
+                }
             }
         }
         {   /* [2026-07-28] VECTAB : voir en-tete du patch. */

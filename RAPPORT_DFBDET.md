@@ -411,3 +411,85 @@ Les hypothèses « handler téléversé » et « dérail du scheduler » sont é
 Aucune n'est départageable avec les mesures actuelles. Ce qui est acquis, en revanche,
 c'est qu'on ne perdra plus de temps sur le TPU ni sur `0x8341`.
 
+
+
+---
+
+# Session 2026-07-28 — la chaine d'entree, mesuree de bout en bout
+
+Tout ce qui suit est **mesure**, jamais deduit. Chaque ligne nomme son instrument et
+la commande qui la rejoue.
+
+## 1. Acquis
+
+| # | Fait mesure | Instrument |
+|---|---|---|
+| 1 | Le BSP jetait les bursts RX : **3 gates**, pas un seul. `calypso_bsp.c:474` et `:997` se levent avec `CALYPSO_BSP_DARAM_FORCE`, mais `:1347` (la **livraison** vers `data[]`) ne connaissait que `CALYPSO_TPU_RX_WIRE`. `DARAM_FORCE=1` ouvrait donc **2 verrous sur 3** et rien n'arrivait. Aligne le 2026-07-28 ; **defaut inchange**. | `[bsp] deliver: gate shunt LEVE (rxw=1)` |
+| 2 | `CALYPSO_BSP_IQ_DECIM=1` est une **regression** : le feed arrivait a **4 SPS** (`dphi=+0.25x pi/2`). Avec `DECIM=4` : `VERDICT: FCCH @1SPS PROPRE`. Corollaire : `DARAM_LEN=296` (638 ne valait que pour le 4 SPS non decime). | `corr_iq.py --src bursts` |
+| 3 | **L'entree demod est bien `0x4c00`** : `PC=0x9fb5` lit `0x4c00/05/0a/0f/15/1a` — **stride 5** (= le polyphase 6 taps) — avec des valeurs reelles (`ff6e`, `c1fb`, `d147`). | `CALYPSO_WATCH_9F00_RD=1` |
+| 4 | `0x9260/0x9261` (cibles de `CALYPSO_FB_STREAM_CELL`) ne sont **jamais lues** dans cette config. `FB_STREAM` reste inerte (`fb_stream_next` jamais appele). **Piste abandonnee** : le demod consomme le buffer directement. | `WATCH-9F00-RD` + absence de `FB-STREAM addr=` |
+| 5 | **Sortie demod = DC quasi pur et figee**, avec `DECIM=1` **comme** avec `DECIM=4` : `\|DC\|=2.86e4` pour `rms=2.94e4`, `dphi=+0.004`. Cellule temoin invariante sur 157-203 bursts (`0x9fb8@0x2a00=0x0000`, `0x9fe2@0x2a00=0x52ed`). | `corr_iq.py --src ddump` + `WMAP` |
+| 6 | Noyau MAC `0xa079..0xa09d` : **60 000 ecritures pour 4 a 7 valeurs distinctes**, toutes dans `{0001,0002,001f,003e}` ± bit `0xe000`. `003e=2x001f`, `0002=2x0001` : un accumulateur qui double une constante, pas une correlation. | `WMAP` |
+| 7 | `0x9fd5` depose une **table de coefficients constante** (`0xffc8`, 5/5 a cellule figee). Son apparente variation etait un artefact d'agregation par PC (une courbe sur 15 cellules). | `WMAP v2` |
+| 8 | `d_fb_mode[08f9]=0x0001` observe : le detecteur **est** arme, la fenetre est bonne. L'ancien « 0 FCCH sur 200 dumps » etait un artefact de `d_fb_mode=0`. | `DETECTOR-RUN` |
+
+**Etat resultant : entree vivante, sortie morte.** Le signal reel arrive au bon endroit,
+est lu par le bon code, au bon rythme — et l'etage demod n'en produit rien.
+
+## 2. Invalide cette session (mes propres conclusions)
+
+- **« `0x4c00` est gele »** — lecture faite a `0xFFD08800` via le monitor, **hors fenetre
+  API RAM**. Signature de l'artefact, reconnaissable : `peak` exactement `0x8000` et 54 %
+  de zeros. `corr_iq.py` portait deja l'avertissement (`do_daram`). La mesure valide se
+  prend **a l'interieur** (BSP_LOG au point d'ecriture, ou `ddump`).
+- **« `Q == 0` »** — conclu sur les 2 premiers mots d'un burst, la ou l'amplitude est faible
+  par construction. Sur le burst entier : `zeros=0%`.
+- **« `0xa042` detruit le signal avant que le noyau ne le lise »** — `0x2c00` est du scratch ;
+  il n'y avait pas de signal a detruire.
+
+## 3. Regles de sonde (payees 4 fois cette session)
+
+1. **Une sonde se concoit par sa CONDITION DE DECLENCHEMENT, pas par son adresse.** Un
+   plafond global est mange par le PC le plus bruyant : `0xa079` (48 lignes) a masque
+   `0x9fd5` (1 ligne) et rendu le test « constante ou signal ? » indecidable.
+2. **Preferer un AGREGAT a un FLUX plafonne.** `WMAP` compte tout le run et n'imprime
+   qu'un tableau : aucune fenetre a rater. Y prevoir un **temoin de saturation**
+   (`ecrivains=24` = exactement `WMAP_PCS` signalait une table pleine, donc tronquee).
+3. **Distinguer « varie dans l'espace » de « varie dans le temps ».** Un PC qui ecrit une
+   courbe sur 15 cellules parait varier ; a **cellule figee**, il est constant. Seule la
+   variation temporelle est un signal. (`WMAP v2` : champ `@0xADDR(n=...)`.)
+4. **« Pas de log » n'est jamais « pas d'evenement »** tant que la sonde n'est pas verifiee
+   vivante **et** sa fenetre verifiee couvrante. Quatre causes distinctes rencontrees :
+   plafond sature, seuil de dump trop haut, plage ecrite **cote hote** (invisible depuis
+   `data_write_locked`), variable d'env absente du manifeste.
+
+## 4. Cible suivante
+
+Entree vivante + sortie morte ⇒ le suspect est l'**emulation des instructions
+`0x9f95..0x9fe2`**. Une sortie rigoureusement constante ressemble a un calcul dont le
+resultat ne depend pas des operandes lus. Sonde `DEMODIO` (gate `CALYPSO_DEMODIO=1`) :
+correle, sur une meme fenetre, ce que le demod LIT et ce qu'il ECRIT, avec A/B/T et les AR.
+
+Deux issues, toutes deux exploitables :
+- la sortie ne bouge pas quand les entrees bougent ⇒ decodage/emulation fautif ;
+- la sortie bouge dans `data[]` mais `ddump` reste plat ⇒ le buffer de sortie est ecrase
+  ailleurs, et il faut trouver par qui.
+
+## 5. Reproduire
+
+```bash
+# run de reference (chaine d'entree correcte, mesuree)
+CALYPSO_NATIVE_HELPED=1 CALYPSO_FB_CORR_ENTRY=0x94f5 \
+CALYPSO_DSP_RUN_C54X=1 CALYPSO_BSP_DARAM_FORCE=1 \
+CALYPSO_BSP_DARAM_ADDR=0x4c00 CALYPSO_BSP_DARAM_LEN=296 CALYPSO_BSP_IQ_DECIM=4 \
+CALYPSO_SHUNT_REAL_FB=1 CALYPSO_DEBUG=BSP ./start-clean.sh
+
+grep -E "deliver: gate shunt LEVE|dropping fn=" /root/qemu.log   # gate levee, 0 drop
+grep -E "DMA fn=" /root/qemu.log | tail -2                        # le BSP depose
+cd tools && python3 corr_iq.py --src bursts | grep VERDICT         # FCCH @1SPS PROPRE
+cd tools && python3 corr_iq.py --src ddump  | tail -3              # CONFORMITE KERNEL
+```
+
+Sondes disponibles (toutes gatees, **defaut OFF**) : `CALYPSO_WMAP` (+`_LO/_HI/_LO2/_HI2`),
+`CALYPSO_RMAP` (+`_PCLO/_PCHI`), `CALYPSO_DEMODIO` (+`_AFTER/_PCLO/_PCHI`),
+`CALYPSO_WATCH_9F00_RD`, `CALYPSO_DARAM_DUMP`, `CALYPSO_B2IN`, `CALYPSO_DEBUG=BSP`.

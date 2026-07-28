@@ -1713,15 +1713,17 @@ void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
                         c54x_run(_d, _budget);
                         _sdfn++;
                         if (_sdfn <= _sdfmax) {
-                            fprintf(stderr, "[feed-daram-dsp] DSP-FB fn=%u sortie PC=0x%04x "
-                                    "A=0x%010llx B=0x%010llx AR4=%04x AR5=%04x "
-                                    "wz[2c00..03]=%04x %04x %04x %04x | oracle det=%d coh=%.3f\n",
+                            fprintf(stderr, "[feed-daram-dsp] DSP-FB fn=%u PC=0x%04x "
+                                    "A=0x%010llx B=0x%010llx T=%04x AR3=%04x AR4=%04x AR5=%04x AR6=%04x\n"
+                                    "                          wz[2c00..07]=%04x %04x %04x %04x %04x %04x %04x %04x"
+                                    " | ORACLE det=%d coh=%.3f\n",
                                     fn, _d->pc,
                                     (unsigned long long)(_d->a & 0xFFFFFFFFFFULL),
                                     (unsigned long long)(_d->b & 0xFFFFFFFFFFULL),
-                                    _d->ar[4], _d->ar[5],
-                                    _d->data[0x2c00], _d->data[0x2c01],
-                                    _d->data[0x2c02], _d->data[0x2c03], det, coh);
+                                    _d->t, _d->ar[3], _d->ar[4], _d->ar[5], _d->ar[6],
+                                    _d->data[0x2c00], _d->data[0x2c01], _d->data[0x2c02],
+                                    _d->data[0x2c03], _d->data[0x2c04], _d->data[0x2c05],
+                                    _d->data[0x2c06], _d->data[0x2c07], det, coh);
                         }
                         /* --- restauration : le DSP retrouve son etat exact --- */
                         _d->pc = _pc; _d->xpc = _xpc; _d->sp = _sp;
