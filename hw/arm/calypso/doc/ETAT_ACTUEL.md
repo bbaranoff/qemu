@@ -303,11 +303,84 @@ apres `fb0_ret`, `ARM RD a_cd` et `CALYPSO_A_TRACE_PC`.
    pas y ecrire une constante independante de l'entree. Le correctif rend le
    decodage correct ; il ne prouve pas que c'etait le seul mecanisme. A
    instrumenter au niveau du fallback si ca ressort.
-2. **`FIX_F1XX_ALU_LK` est dans le SAS**, pas valide. Il capture aussi `hi8 ==
-   0xF0` (mesure : `f020`/`f010` tracees). Validation exigee de niveau 3 :
-   camp -> LU -> SMS. Un fix d'ISA touche tout le firmware.
-3. **Le transfert DMA** — c'est le mur suivant, et le `TODO.md` §E l'avait ecrit
-   d'avance : « implementer SEULEMENT si A debloque ». La condition est remplie.
+2. ~~**`FIX_F1XX_ALU_LK` est dans le SAS**~~ — ✅ **CONDITION EFFACEE le 03/08**, le
+   correctif est devenu le comportement normal. Preuve A/B en
+   `native_twl_host_demod` : effet positif mesure (`0xa5cd` s'execute), aucun
+   observable perdu (SI 8 vs 7, camp 46 vs 30/42, CHAN_REQ 15 vs 10/14).
+   ⚠️ Limite assumee : le niveau 3 (camp -> LU -> SMS) est STRUCTURELLEMENT
+   inexercable — le seul banc allant au SMS est `shunt_legit`, qui pose
+   `CALYPSO_DSP_RUN_C54X=0` (le c54x n'y tourne pas). Detail : `fixes.env`.
+3. ~~**Le transfert DMA**~~ — ✅ **IMPLEMENTE le 03/08**, cf. §14.13.
+
+### 14.13 🏁 LE DMA TRANSFERE — la chaine de livraison est complete
+
+**`CALYPSO_RHEA_DMA_XFER=1`** (defaut 0 : le module reste l'instrument de lecture
+qu'il etait). `calypso_rhea_dma.c` vide le recepteur RIF vers la memoire API a
+`DMA2_AAD`, borne a `DMA2_ALGTH`, pose `IRQ_STATE` et leve `INT10n` si `IRQ_MODE`.
+Un accesseur `calypso_rif_drain()` (nouveau) est le seul chemin de prelevement :
+la FIFO et l'etage d'attente restent prives au RIF.
+
+Il ne s'arme JAMAIS de lui-meme — `ENABLE=0` ou `DIRECTION=0` et il ne fait rien.
+Il sert une demande du firmware, il ne la fabrique pas : c'est ce qui le distingue
+d'une bequille.
+
+#### 14.13.1 CE QUI EST MESURE
+
+| fait | mesure |
+|---|---|
+| le DMA transfere | **4 000 transferts** en `native` PUR (aucune bequille) |
+| burst complet | 296 mots **en 4 pages** (`ALGTH=192` -> 96 mots/page) |
+| le contenu est du VRAI IQ | `128/296 mots non nuls`, valeurs variables : `88b0 d147 b6dd 9721…` |
+| la destination est la bonne | `0x0cce` (= `AAD` programme par le FIRMWARE) est **reference dans le ROM** en `0x0729b/0x072b0/0x072c1` — soit dans la routine qu'appelle le tremplin `data[0x0158] = call 0x7242` installe par `0xa5cd` |
+| 🏁 **le DSP demode** | **`A_CD-WR = 915`** en `native_twl` sans AUCUNE injection (`INJECT_ACD=0`, `FEED_SI=0`) — le DSP est le seul ecrivain possible |
+
+**`A_CD-WR = 915` est le resultat de la journee.** Le juge historique du banc, muet
+depuis la creation du projet, parle. Les ecritures viennent d'opcodes du DSP
+(`exec_pc=0x96db/0x96dd/0x9719`), pas du DMA — qui ecrit dans `api_ram`, un autre
+tableau et une autre plage. Aucune confusion possible.
+
+#### 14.13.2 UNE HYPOTHESE VALIDEE, UNE REFUTEE
+
+**Validee (mecaniquement)** : le chaînage de pages. La v1 ne drainait qu'une page
+(96 mots) par requete alors que le burst en fait 296 — les 200 mots restants
+attendaient et le burst suivant les trouvait sur place. Corrige : 4 pages, burst
+complet.
+
+**Refutee** : que ce drainage partiel expliquait l'overrun. Apres correction,
+`overrun` reste a **84 %** (4 627/5 500), inchange. La cause est ailleurs : le
+firmware **masque son recepteur** la plupart du temps (`RDMA_MASK=1`) et l'hote
+injecte en CONTINU (`BSP_DIRECT_FEED` livre « SANS match FN »). Cet overrun mesure
+donc probablement un desalignement temporel normal dans cette configuration, pas
+une defaillance. **Ne pas le traiter comme un bug sans l'avoir etabli.**
+
+#### 14.13.3 LE MUR NATIF, REFORMULE ET ISOLE
+
+En `native` pur : `A_CD-WR = 0`, `PM MEAS: 0 dBm at baseband`, et surtout —
+
+> **la zone FB `0x7700-0x79f0` n'est TOUJOURS jamais executee** (§14.4 intact).
+
+Ce n'est donc pas que le DSP demodule mal : **il n'essaie jamais**. Les deux
+correctifs du 03/08 debloquaient le chemin NB/CCCH, qui est en AVAL de la synchro ;
+le verrou FB est un probleme distinct, jamais traite.
+
+Ce que la mesure ECARTE desormais, et qu'il ne faut plus soupconner :
+* la livraison des echantillons — ils arrivent, en vrai IQ, a l'adresse que le
+  firmware a lui-meme programmee, lue par le handler qu'il a lui-meme installe ;
+* les deux tampons candidats sont alimentes : `0x0cce` par le DMA, `0x4c00` par
+  `BSP_DIRECT_FEED` ;
+* l'ordonnancement, le dispatch, l'armement, la mailbox — tous mesures sains.
+
+⚠️ `PM MEAS: 0 dBm` en `native` est une valeur **propre** : en `native_twl` la meme
+ligne affiche `448 dBm`, le poison documente (`a_pm = 0x7000`, une ADRESSE dans le
+champ puissance). Ici le DSP calcule vraiment, et trouve zero. Ne pas confondre.
+
+⚠️ Non creuse, signale : `128/296 mots non nuls` = 57 % de zeros dans un burst. Ca
+peut etre normal (periodes de garde) ou signaler un remplissage partiel. **Ce n'est
+pas presente comme sain.**
+
+**QUESTION SUIVANTE** : pourquoi la zone `0x7700-0x79f0` n'est-elle jamais atteinte,
+alors que l'armement RX, lui, l'est desormais ? Instrument deja en place et deja
+utilise ce jour : `CALYPSO_FBROUTE=1` (high-water + jalons).
 
 **Corollaire** : la §13.1 (« `d_task_d` ecrite 913 fois toujours a 0 », moniteur
 mailbox) ne surveillait qu'une adresse — elle n'a vu que les remises a zero de

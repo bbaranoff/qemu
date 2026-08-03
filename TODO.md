@@ -165,7 +165,27 @@ c'est un vrai changement de comportement, a valider sous charge.
 
 **Candidat d'explication** pour les ecrasements de page R deja documentes.
 
-## E. Implementer le transfert DMA — ✅ **CONDITION REMPLIE le 03/08, c'est LE mur**
+## E. Implementer le transfert DMA — ✅ **FAIT le 03/08** (`CALYPSO_RHEA_DMA_XFER=1`)
+
+> 🏁 **Implemente et mesure** : 4 000 transferts en `native` PUR, burst complet de
+> 296 mots en 4 pages, contenu = **vrai IQ** (128/296 mots non nuls), destination
+> `0x0cce` = celle que le firmware programme lui-meme et que lit le handler RX
+> installe par `0xa5cd`. Detail : `doc/ETAT_ACTUEL.md` §14.13.
+>
+> **Et le DSP demodule** : `A_CD-WR = 915` en `native_twl` sans aucune injection.
+> Premiere demodulation du DSP emule du projet.
+>
+> ⚠️ Le mur natif RESTE : la zone FB `0x7700-0x79f0` n'est toujours jamais
+> executee (§14.13.3). Le DSP n'essaie pas de detecter la FB — c'est un verrou
+> distinct, en AMONT de tout ce qui a ete debloque aujourd'hui.
+>
+> ⚠️ `overrun` a 84 % NON resolu, et probablement NORMAL : le firmware masque son
+> recepteur la plupart du temps pendant que l'hote injecte en continu. Ne pas le
+> traiter comme un bug sans l'avoir etabli.
+
+### E (contexte du matin)
+
+## E. Implementer le transfert DMA — condition remplie
 
 > 🏁 **Le « si A debloque » est acquis.** `0xa5cd` (armement RX) s'execute pour la
 > premiere fois : le tremplin `data[0x0158]` est installe et `DMA2_AAD`/`ALGTH`/

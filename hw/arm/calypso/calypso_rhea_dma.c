@@ -402,19 +402,65 @@ void calypso_rhea_dma_rx_request(C54xState *s)
     if (max_words > (int)(sizeof(buf) / sizeof(buf[0])))
         max_words = (int)(sizeof(buf) / sizeof(buf[0]));
 
-    int got = calypso_rif_drain(buf, max_words);
-    if (got <= 0) {
+    /* ─────────────────────────────────────────────────────────────────────────
+     * [2026-08-03] ENCHAINEMENT DES PAGES (§11.3.5 CURRENT_PAGE).
+     *
+     * MESURE QUI L'IMPOSE. La v1 ne drainait QU'UNE page par requete :
+     *     TRANSFERT RX : 96 mots   ALGTH=192      <- page = 96 mots
+     *     burst        : n=296 mots               <- burst = 296 mots
+     *     overrun      : 11 392 sur 13 000 bursts (84 %)
+     * Les 200 mots restants attendaient dans l'etage du RIF, et le burst suivant
+     * les y trouvait -> RSRFULL -> overrun. Il faut ~3 pages par burst. A 84 % de
+     * perte, assembler 4 bursts consecutifs (un bloc CCCH) est impossible : ca
+     * suffit a expliquer SI=0 SANS mettre en cause la qualite de la demodulation.
+     *
+     * ⚠️ HYPOTHESE ASSUMEE, pas une certitude. Deux lectures tenaient :
+     *   (1) le DMA doit enchainer les pages (§11.3.5) — retenue ici, c'est celle
+     *       de la doc, et elle est reversible (meme gate) ;
+     *   (2) l'hote fournit la mauvaise granularite (CALYPSO_BSP_DARAM_LEN=296
+     *       contre des pages de 96 mots) — si (1) ne suffit pas, c'est (2), et ca
+     *       se teste en changeant un seul parametre.
+     * Ne pas presenter (1) comme etablie tant qu'un run ne l'a pas montree.
+     *
+     * CURRENT_PAGE bascule a chaque page pour refleter le double buffering du
+     * §11.3.5. La destination NE bouge PAS entre les pages : le firmware relit
+     * la meme fenetre a chaque end-DMA (une IT est levee par page si IRQ_MODE).
+     * C'est le point le moins sur de cette implementation — si le firmware
+     * attendait deux tampons distincts (AAD et AAD+ALGTH), ca se verrait comme
+     * un ecrasement de la premiere moitie. */
+    int total = 0, pages = 0;
+    for (;;) {
+        int got = calypso_rif_drain(buf, max_words);
+        if (got <= 0)
+            break;
+
+        for (int i = 0; i < got; i++)
+            api[dst_idx + i] = buf[i];
+
+        total += got;
+        pages++;
+        rd.ch[n].cur_off = (uint16_t)(got * 2);
+        rd.ch[n].ctrl ^= CTRL_CURRENT_PAGE;      /* §11.3.5 : page suivante */
+
+        if (got < max_words)
+            break;                                /* recepteur vide avant la fin */
+        if (pages >= 64) {                        /* garde-fou : jamais de boucle infinie */
+            static unsigned n_cap;
+            if (n_cap++ < 5)
+                fprintf(stderr, "[rhea-dma] ⚠ plafond de 64 pages atteint sur une "
+                        "requete (burst anormalement long ?) — reste non draine\n");
+            break;
+        }
+    }
+
+    if (total <= 0) {
         static unsigned long long n_empty;
         if (n_empty++ == 0 || (n_empty % 5000) == 0)
             fprintf(stderr, "[rhea-dma] requete RX x%llu : recepteur RIF vide, "
                     "rien a transferer\n", n_empty);
         return;
     }
-
-    for (int i = 0; i < got; i++)
-        api[dst_idx + i] = buf[i];
-
-    rd.ch[n].cur_off = (uint16_t)(got * 2);
+    int got = total;
 
     /* §11.3.5 : le transfert est fini -> IRQ_STATE, et DMA_START retombe. */
     rd.ch[n].ctrl = (uint16_t)((rd.ch[n].ctrl | CTRL_IRQ_STATE) & ~CTRL_DMA_START);
@@ -426,13 +472,34 @@ void calypso_rhea_dma_rx_request(C54xState *s)
         n_ok++;
         if (n_ok <= 20 || (n_ok % 500) == 0)
             fprintf(stderr, "[rhea-dma] *** TRANSFERT RX #%llu : %d mots RIF -> "
-                    "api_ram[0x%04x..0x%04x] (mot DSP 0x%04x, ARM 0x%08x) "
+                    "api_ram[0x%04x..0x%04x] en %d page(s) (mot DSP 0x%04x, ARM 0x%08x) "
                     "ALGTH=%u IRQ_MODE=%d ONE_SHOT=%d\n",
-                    n_ok, got, dst_idx, dst_idx + got - 1,
+                    n_ok, got, dst_idx, dst_idx + (got > max_words ? max_words : got) - 1, pages,
                     (unsigned)(C54X_API_BASE + dst_idx),
                     0xFFD00000u + (rd.ch[n].aad & 0x0FFF),
                     rd.ch[n].algth, !!(rd.ch[n].ctrl & CTRL_IRQ_MODE),
                     !!(rd.ch[n].ctrl & CTRL_ONE_SHOT));
+        /* [2026-08-03] CONTENU, pas seulement la plomberie. Question ouverte :
+         * le DSP mesure `PM MEAS: 0 dBm at baseband` en natif alors que le DMA
+         * transporte 296 mots par burst. Deux lectures possibles — (1) le chemin
+         * PM/FB lit un autre tampon que 0x0cce, (2) le DMA transporte fidelement
+         * du VIDE. On ne peut pas trancher sans regarder ce qui passe.
+         * Un echantillon suffit : des zeros disent (2) et renvoient le probleme en
+         * amont, dans ce que l'hote injecte au RIF ; des valeurs IQ plausibles
+         * disent (1) et il faudra trouver quel tampon le PM interrogue.
+         * Plafonne aux 10 premiers transferts — c'est un diagnostic, pas une trace. */
+        if (n_ok <= 10) {
+            int nz = 0;
+            for (int i = 0; i < got; i++)
+                if (buf[i]) nz++;
+            fprintf(stderr, "[rhea-dma]     contenu : %d/%d mots non nuls ; "
+                    "8 premiers = %04x %04x %04x %04x %04x %04x %04x %04x\n",
+                    nz, got,
+                    got > 0 ? buf[0] : 0, got > 1 ? buf[1] : 0,
+                    got > 2 ? buf[2] : 0, got > 3 ? buf[3] : 0,
+                    got > 4 ? buf[4] : 0, got > 5 ? buf[5] : 0,
+                    got > 6 ? buf[6] : 0, got > 7 ? buf[7] : 0);
+        }
     }
 
     /* §11.3.5 IRQ_MODE : c'est le firmware qui a decide s'il veut l'interruption. */
