@@ -2556,6 +2556,35 @@ static void stkw_rec(C54xState *s, uint16_t addr, uint16_t val)
 
 static void data_write(C54xState *s, uint16_t addr, uint16_t val)
 {
+    {   /* [2026-08-03] HANDLER-WATCH — CALYPSO_DISPATCH_PROBE=1, lecture seule.
+         *
+         * data[0x43d8] est le slot du HANDLER COURANT : le dispatcher fait
+         *     0xb01c  ld   *(0x43d8), A
+         *     0xb01e  cala A
+         * et la trace du 03/08 montre qu'il y appelle systematiquement 0xab38,
+         * le RET partage des slots vides. Toute la chaine RX se reduit donc a
+         * « qui ecrit cette cellule, et pourquoi jamais 0xa5cd ».
+         *
+         * On surveille l'ECRITURE plutot qu'un PC : deux fois de suite j'ai vise
+         * l'operande au lieu de l'instruction (0xb0f1/0xb0ff au lieu des `add`,
+         * puis 0xbb01 au lieu de 0xbb00). Surveiller la cellule est insensible a
+         * cette erreur — et attrape aussi tout ecrivain qu'on n'a pas identifie. */
+        static int _hw = -1;
+        if (_hw < 0) _hw = calypso_gate("CALYPSO_DISPATCH_PROBE", 0);
+        if (_hw && addr == 0x43d8) {
+            static unsigned long long _n = 0;
+            uint16_t old = s->data[addr];
+            if (old != val || _n < 8) {
+                _n++;
+                fprintf(stderr, "[dispatch] *** data[0x43d8] : 0x%04x -> 0x%04x "
+                        "par PC=0x%04x%s  (data[0x43b0]=0x%04x) insn=%u\n",
+                        old, val, s->pc,
+                        (val == 0xa5cd) ? "  <<< ARMEMENT RX INSTALLE !" :
+                        (val == 0xab38) ? "  (RET partage = slot vide)" : "",
+                        s->data[0x43b0], s->insn_count);
+            }
+        }
+    }
     /* [2026-07-29] Moniteur mailbox — voir calypso_mailbox.h. Placé EN TÊTE :
      * s->data[addr] contient encore l'ancienne valeur. Coût nul quand éteint
      * (test d'un int en ligne), et data_write est un chemin chaud. */
@@ -16071,6 +16100,201 @@ int c54x_run(C54xState *s, int n_insns)
                         exec_pc, s->ar[0], s->ar[1], s->ar[2], s->ar[3],
                         s->ar[4], s->ar[5], s->ar[6], s->ar[7], _in,
                         (unsigned long long)(s->a & 0xFFFFFFULL), s->insn_count);
+            }
+        }
+        {   /* ═══════════════════════════════════════════════════════════════
+             * [2026-08-03] DISPATCH-PROBE — CALYPSO_DISPATCH_PROBE=1, defaut 0.
+             *
+             * Sonde de LECTURE SEULE posee sur tous les points remarquables du
+             * desassemblage du 03/08. Elle ne modifie RIEN : elle observe.
+             *
+             * CE QU'ON CHERCHE. La routine d'armement RX du ROM, `0xa5cd`, installe
+             * le tremplin data[0x0158] ET programme DMA2_AAD/ALGTH/CTRL(ENABLE=1).
+             * Elle existe, elle est complete, et elle n'est JAMAIS exécutée. C'est
+             * une entree de la table de dispatch, recopiee a l'init de la memoire
+             * PROGRAMME vers les DONNEES :
+             *     0xb4b6 : program[0xaae7..0xab34] -> data[0x4387..0x43d4]
+             * donc program[0xab10]=0xa5cd atterrit en data[0x43b0], index 41.
+             *
+             * Le dispatcher fait, en SEPT endroits, le meme motif :
+             *     sub #k1,A ; bc ...,AGT ; sub #k2,A ; add #0x4387,A
+             *     stlm A,AR3 ; ld *AR3,A ; cala A
+             * soit un aiguillage par PLAGES. La question est donc : quelle valeur
+             * arrive dans A ? Le statique ne peut pas y repondre — d'ou cette sonde.
+             *
+             * Les sept sites sont les `add #0x4387` : on y lit A AVANT l'addition,
+             * donc l'index brut, et on resout le handler que ca designe.
+             * ═══════════════════════════════════════════════════════════════ */
+            static int _dp = -1;
+            if (_dp < 0) {
+                _dp = calypso_gate("CALYPSO_DISPATCH_PROBE", 0);
+                if (_dp)
+                    fprintf(stderr, "[dispatch] sonde armee : 7 sites d'aiguillage "
+                            "(add #0x4387), l'armement RX 0xa5cd, l'arm/desarm DMA "
+                            "0xa620/0xa62e, le publieur d_fb_det 0x79e4, l'init de "
+                            "table 0xb4b6, et les acces au handler courant "
+                            "data[0x43d8] (0xb01d lit, 0xbb01 ecrit). "
+                            "LECTURE SEULE.\n");
+            }
+            if (_dp) {
+                /* --- les sept aiguillages : A contient l'index avant `add` ------ */
+                /* [2026-08-03, CORRIGE] la v1 listait aussi 0xb0f1 et 0xb0ff :
+                 * FAUX. Le scan du ROM montre l'operande 0x4387 precedee de
+                 * l'opcode 0xf000 (`ld #k16,A`) a ces deux endroits, et de 0xf200
+                 * (`add #k16,A`) aux cinq autres. Ce ne sont pas des aiguillages
+                 * mais des chargements de la base ; A y contenait deja une adresse
+                 * de table resolue (0x43ac = base+37), d'ou l'`index=17324` absurde
+                 * du premier run. Cinq vrais sites, donc. */
+                static const uint16_t _sw[] = {0xb070,0xb08d,0xb0aa,0xb0be,0xb0d1};
+                for (unsigned _i = 0; _i < sizeof(_sw)/sizeof(_sw[0]); _i++) {
+                    if (exec_pc != _sw[_i]) continue;
+                    uint16_t idx  = (uint16_t)(s->a & 0xFFFF);
+                    uint16_t addr = (uint16_t)(0x4387 + idx);
+                    uint16_t hnd  = s->data[addr];
+                    /* dedupe par (site, index) : un aiguillage stable ne doit pas
+                     * noyer le journal — c'est la LEÇON du 03/08 sur DISPATCH SB. */
+                    static struct { uint16_t pc, idx; unsigned long long n; } _seen[64];
+                    static int _n = 0;
+                    int _k = -1;
+                    for (int _j = 0; _j < _n; _j++)
+                        if (_seen[_j].pc == exec_pc && _seen[_j].idx == idx) { _k = _j; break; }
+                    if (_k >= 0) {
+                        if (++_seen[_k].n % 20000 == 0)
+                            fprintf(stderr, "[dispatch] site 0x%04x index=%u × %llu\n",
+                                    exec_pc, idx, _seen[_k].n);
+                    } else {
+                        if (_n < 64) { _seen[_n].pc = exec_pc; _seen[_n].idx = idx;
+                                       _seen[_n].n = 1; _n++; }
+                        fprintf(stderr, "[dispatch] *** site 0x%04x  index=%u  "
+                                "-> data[0x%04x] = 0x%04x%s  A=0x%06llx insn=%u\n",
+                                exec_pc, idx, addr, hnd,
+                                (hnd == 0xa5cd) ? "  <<< ARMEMENT RX !" :
+                                (hnd == 0xab38) ? "  (slot vide, RET partage)" : "",
+                                (unsigned long long)(s->a & 0xFFFFFFULL), s->insn_count);
+                    }
+                }
+                /* --- TOUT appel indirect `cala A` (opcode 0xf4e3) --------------
+                 * Mesure du 03/08 : aucun des cinq aiguillages ne tire, et pourtant
+                 * le handler 0xa62e de la table S'EXECUTE (A=0xffa62e = l'adresse
+                 * elle-meme, signature d'un cala). Il existe donc un AUTRE chemin
+                 * d'appel. Plutot que de le deviner site par site, on trace chaque
+                 * appel indirect avec sa cible, et on nomme celles qui nous
+                 * interessent. Dedupe par (PC appelant, cible). */
+                /* [2026-08-03, ELARGI] la v1 ne tracait que `cala` sur A (0xf4e3).
+                 * Or 0xa62e s'execute SANS qu'aucun cala ne le vise, et il n'est
+                 * atteignable ni par CALL/B direct (aucune reference dans l'image)
+                 * ni par continuation (0xa62d est un ret). Il reste donc un
+                 * BRANCHEMENT calcule. tic54x-opc.c donne quatre formes, masque
+                 * 0xFEFF, le bit 8 choisissant l'accumulateur source :
+                 *     bacc  0xF4E2   baccd 0xF6E2   cala 0xF4E3   calad 0xF6E3
+                 * On les couvre toutes, sur A comme sur B. Meme erreur que mes deux
+                 * precedentes : j'avais instrumente le cas attendu, pas la classe. */
+                {
+                  uint16_t _op = prog_fetch(s, exec_pc);
+                  uint16_t _base = (uint16_t)(_op & 0xFEFF);
+                  const char *_kind = (_base==0xF4E2) ? "bacc"  :
+                                      (_base==0xF6E2) ? "baccd" :
+                                      (_base==0xF4E3) ? "cala"  :
+                                      (_base==0xF6E3) ? "calad" : NULL;
+                  if (_kind) {
+                    int64_t _src = (_op & 0x0100) ? s->b : s->a;
+                    uint16_t tgt = (uint16_t)(_src & 0xFFFF);
+                    static struct { uint16_t pc, tgt; unsigned long long n; } _c[96];
+                    static int _cn = 0;
+                    int _k = -1;
+                    for (int _j = 0; _j < _cn; _j++)
+                        if (_c[_j].pc == exec_pc && _c[_j].tgt == tgt) { _k = _j; break; }
+                    if (_k >= 0) {
+                        if (++_c[_k].n % 20000 == 0)
+                            fprintf(stderr, "[dispatch] %s 0x%04x -> 0x%04x × %llu\n",
+                                    _kind, exec_pc, tgt, _c[_k].n);
+                    } else {
+                        if (_cn < 96) { _c[_cn].pc = exec_pc; _c[_cn].tgt = tgt;
+                                        _c[_cn].n = 1; _cn++; }
+                        const char *q = (tgt==0xa5cd) ? "  <<< ARMEMENT RX !"
+                                      : (tgt==0xa62e) ? "  (desarmement DMA)"
+                                      : (tgt==0xab38) ? "  (RET partage, slot vide)"
+                                      : (tgt==0xb5a1) ? "  (greffe #2)"
+                                      : (tgt==0xa4c7) ? "  (graine go-live)" : "";
+                        fprintf(stderr, "[dispatch] *** %-5s depuis 0x%04x -> 0x%04x%s"
+                                "  (%s)  data[0x43d8]=0x%04x insn=%u\n",
+                                _kind, exec_pc, tgt, q,
+                                (_op & 0x0100) ? "src=B" : "src=A",
+                                s->data[0x43d8], s->insn_count);
+                    }
+                  }
+                }
+
+                /* --- les points remarquables, simple comptage de passage -------- */
+                {
+                    static const struct { uint16_t pc; const char *quoi; } _pt[] = {
+                      {0xa5cd, "ARMEMENT RX (tremplin 0x0158 + DMA2_AAD)"},
+                      {0xa5e8, "  ecriture DMA2_AAD"},
+                      {0xa5f6, "  ecriture DMA2_CTRL (ENABLE=1)"},
+                      {0xa620, "SPCR : RDMA_MASK=0 (mode DMA arme)"},
+                      {0xa62e, "SPCR : RDMA_MASK=1 (mode DMA coupe)"},
+                      {0xa601, "test data[0x435e] bit13 (verrou config DMA)"},
+                      {0x79e4, "publication d_fb_det (data[0x08f8] |= 1)"},
+                      {0x79e3, "  gate : data[@0x7e] doit valoir 4"},
+                      {0xb4b6, "init : recopie de la table -> data[0x4387]"},
+                      {0xb01d, "lecture du handler courant data[0x43d8]"},
+                      {0xbb00, "ECRITURE du handler courant data[0x43d8]"},
+
+                      /* ── [2026-08-03] LA CHAINE DE L'ARMEMENT RX ──────────────
+                       * Index 41 (`ld #0x29,A ; call 0xa9ea`) -> 0xa5cd. Quatre
+                       * sites le demandent, aucun n'est atteint. On sonde les
+                       * sites EUX-MEMES, l'ENTREE du bloc qui les contient, et le
+                       * CHARGEUR qui met cette entree dans A en amont — sinon on
+                       * ne saurait dire ou la chaine se rompt. */
+                      {0xb220, "site 1 : ld #0x29 -> ARMEMENT RX (AR3=0x00bf)"},
+                      {0xb216, "  entree du bloc du site 1"},
+                      {0xb2b4, "site 2 : ld #0x29 -> ARMEMENT RX (AR3=0x0097)"},
+                      {0xb2aa, "  entree du bloc du site 2"},
+                      {0xb330, "site 3 : ld #0x29 -> ARMEMENT RX (AR3=0x0030)"},
+                      {0xb35d, "site 4 : ld #0x29 -> ARMEMENT RX (AR3=0x0040)"},
+                      /* les `ld #k16,A` qui chargent l'entree du bloc 1 puis 2 */
+                      {0xaba9, "  chargeur -> 0xb216"},
+                      {0xabc9, "  chargeur -> 0xb216"},
+                      {0xabf1, "  chargeur -> 0xb2aa"},
+                      {0xabf5, "  chargeur -> 0xb2aa"},
+                      {0xabf9, "  chargeur -> 0xb2aa"},
+                      {0xabfd, "  chargeur -> 0xb2aa"},
+                      {0xb758, "  chargeur -> 0xb2aa"},
+                      /* le dispatcher lui-meme : combien de fois, quel index */
+                      {0xa9ea, "helper index->handler (A = base+index apres le add)"},
+
+                      /* ── [2026-08-03] LA FILE DE TACHES — le vrai coeur ────────
+                       * La boucle principale 0xa4ca fait `call 0xaad5` (depile) et,
+                       * si A != 0, `calad A`. 0xaad5 est un DEPILEMENT sur anneau :
+                       *     AR1 = data[0x434f] (ecriture)  AR0 = data[0x434e] (lecture)
+                       *     vide -> A = 0 -> la boucle tourne a blanc
+                       * Mesure : 31 000 tours, file vide. Donc la question n'est plus
+                       * « pourquoi tel handler ne tourne pas » mais « QUI EMPILE ».
+                       * L'empilement est 0xaac3 (39 appelants), anneau de 14, le
+                       * handler arrive dans A, debordement -> data[0x3f92] bit 5. */
+                      {0xaac3, "EMPILEMENT d'une tache (A = handler empile)"},
+                      {0xaaca, "  ecriture effective dans l'anneau"},
+                      {0xaad1, "  ⚠ FILE PLEINE (data[0x3f92] bit5)"},
+                      {0xaae3, "DEPILEMENT effectif (file non vide)"},
+                      {0xaadd, "  file VIDE -> A=0, la boucle tourne a blanc"},
+                      {0xa4cf, "boucle principale : calad du handler depile"},
+                    };
+                    for (unsigned _i = 0; _i < sizeof(_pt)/sizeof(_pt[0]); _i++) {
+                        if (exec_pc != _pt[_i].pc) continue;
+                        static unsigned long long _cnt[40];
+                        unsigned long long c = ++_cnt[_i];
+                        if (c == 1 || c % 20000 == 0 ||
+                            exec_pc == 0xaac3 || exec_pc == 0xaad1)
+                            fprintf(stderr, "[dispatch] PC=0x%04x ×%llu — %s "
+                                    "(A=0x%06llx AR1=0x%04x AR2=0x%04x AR3=0x%04x "
+                                    "d[0x3f92]=0x%04x file[r=0x%04x w=0x%04x]) insn=%u\n",
+                                    exec_pc, c, _pt[_i].quoi,
+                                    (unsigned long long)(s->a & 0xFFFFFFULL),
+                                    s->ar[1], s->ar[2], s->ar[3],
+                                    s->data[0x3f92], s->data[0x434e], s->data[0x434f],
+                                    s->insn_count);
+                    }
+                }
             }
         }
         {   /* [2026-07-30] XPCWATCH (CALYPSO_XPCWATCH, defaut 0) — le DSP change-t-il
