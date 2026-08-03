@@ -163,13 +163,52 @@ reste vraie mais designe un symptome trop en aval. Chercher « pourquoi l'index 
 n'est pas dispatche » vise un cran trop bas — c'est l'ENTREE dans la file qui
 manque, pas la selection dans la table.
 
-**QUESTION SUIVANTE, posee proprement** : le DSP LIT-IL seulement `d_task_d` ? Si le
-ROM ne lit jamais la cellule ou l'ARM depose la tache NB, il n'apprend jamais
-qu'elle existe, et tout le reste en decoule. Instrument pose le 03/08 : patte 4/4 de
-`CALYPSO_DTASKD_WATCH` (`data_read_locked`), qui surveille les lectures DSP de
-`d_task_d` **et** de `d_task_md` — ce dernier comme temoin de comparaison, pour
-qu'une patte 4 muette ne soit pas ambigue entre « d_task_d ignore » et « page W pas
-lue du tout ».
+**QUESTION SUIVANTE** : le DSP LIT-IL seulement `d_task_d` ? — **REPONDUE, cf. §14.11 :
+OUI, et il y voit meme la bonne valeur.** L'hypothese « le ROM ignore la cellule »
+est morte a la mesure suivante.
+
+### 14.11 RACINE — le DSP voit la tache et la dispatche sur un RET vide
+
+**MESURE** (`CALYPSO_MODE=native_twl_host_demod`, `DTASKD_WATCH=1`,
+`DISPATCH_PROBE=1`, run du 03/08 19:34). Patte 4/4 :
+
+| cellule | lectures DSP | valeurs echantillonnees |
+|---|---|---|
+| `d_task_d` (0x0800/0x0814) | **30 000** | **35x `0x0018`**, 6x `0x0000` |
+| `d_task_md` (0x0804/0x0818) | **30 000** | 39x `0x0000`, 2x `0x0001` |
+
+`0x0018` = 24 = `ALLC_DSP_TASK`. **Le DSP lit la cellule et y trouve la tache CCCH.**
+Cote ARM, patte 1 : 2 408 ecritures non nulles. Les deux bouts concordent.
+
+**Et pourtant il n'en fait rien.** La chaine, mesuree bout a bout :
+
+```
+1. l'ARM (ou la bequille FORCE_TASK=24) ecrit  d_task_d = 0x0018     [patte 1 : 2408 non nuls]
+2. le DSP LIT d_task_d et voit 0x0018                                 [patte 4 : 35/41 echantillons]
+3. il dispatche :  cala 0xb01e -> data[0x43d8]                        [DISPATCH_PROBE]
+4. data[0x43d8] = 0xab38 = RET PARTAGE (« slot vide »)                [DISPATCH_PROBE]
+5. -> le call retourne immediatement. Rien ne se passe.
+```
+
+Conséquences directes et toutes mesurees : un seul handler jamais empile
+(`0xb5a1` x32 559), index 41 jamais demande, armement RX jamais fait, `A_CD-WR = 0`.
+
+**Ecrivain unique de `data[0x43d8]`** : `PC=0xbb00`, **une seule fois**, a
+`insn=2166`, et il y range l'immediat `0xab38`. Rien ne le remplace ensuite. Un
+second site de dispatch (`cala 0xb0ec`) tombe sur le meme RET.
+
+**⚠️ CECI CORRIGE LA §13.3.** Elle classait `data[0x43d8]` **INVALIDE** au motif que
+« un seul ecrivain (`0xbb00`) qui y range l'immediat `0xab38` ; le dispatcher
+`0xb01c/0xb01e` qui le lit est mort par construction ». Le raisonnement inversait
+cause et effet : le dispatcher n'est pas mort, **il est vivant et atteint**, et il
+aiguille vers un slot vide. L'ecrivain unique n'est pas une raison d'ecarter la
+piste — **c'est la piste**. (Rappel utile : `0xab38` n'est pas un bouchon parasite,
+c'est la valeur LEGITIME du slot vide, cf. §12.)
+
+**QUESTION SUIVANTE, bien posee cette fois** : **qui devrait ecrire un vrai handler
+dans `data[0x43d8]`, et pourquoi ne le fait-il jamais ?** C'est un probleme
+d'INSTALLATION de handler, pas d'ordonnancement, pas de lecture de mailbox, pas de
+demodulation. Toutes les autres branches sont mesurees saines.
 
 **Corollaire** : la §13.1 (« `d_task_d` ecrite 913 fois toujours a 0 », moniteur
 mailbox) ne surveillait qu'une adresse — elle n'a vu que les remises a zero de

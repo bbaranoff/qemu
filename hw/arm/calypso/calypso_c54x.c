@@ -10292,6 +10292,45 @@ static int c54x_exec_one(C54xState *s)
         int dst = (op >> 8) & 1;
         int sub = (op >> 9) & 0x07;  /* selects LD/LDU/LD,TS/LDR within case 1 */
         uint16_t val = data_read(s, addr);
+        {   /* [2026-08-03] LD-TRACE — sous CALYPSO_DISPATCH_PROBE, LECTURE SEULE.
+             * Borne au bloc 0xb05f..0xb078 (le dispatcher de tache), donc quelques
+             * dizaines de lignes au plus.
+             *
+             * POURQUOI. Mesure du 03/08 : en 0xb060 (`10e1 0000` = LD *AR1(0), A),
+             * AR1 vaut 0x0814 (= d_task_d page W1) et la cellule pointee contient
+             * 0x0018 (= 24, ALLC) — les deux VERIFIES par la sonde CHAIN-B05F. Or
+             * l'accumulateur ressort a 0x5294. La chaine compare donc 0x5294 aux
+             * constantes 12/30/34, ne matche rien, et bailout vers 0xb077 : c'est
+             * pour ca que la resolution d'index n'est jamais atteinte et que
+             * l'armement RX n'est jamais demande.
+             *
+             * L'inspection statique ne suffit pas : `resolve_smem` traite MOD 0xC
+             * correctement (`addr = AR + lk`) et ce handler-ci lit `data_read(addr)`
+             * avec dst/sub corrects. L'ecart est donc AILLEURS sur le chemin, et
+             * il faut les trois quantites cote a cote plutot que de le deviner —
+             * deviner un decodage a coute 3 fausses pistes sur 3 le 30/07.
+             *
+             * LECTURE : si addr==0x0814 et val==0x0018 mais que l'accu final differe,
+             * le defaut est dans l'ecriture de l'accumulateur (sub/dst/sext), pas
+             * dans l'adressage. Si addr differe, c'est resolve_smem malgre tout. */
+            uint16_t _pc = s->last_exec_pc;
+            if (_pc >= 0xb05f && _pc <= 0xb078) {
+                static int _lt = -1; static unsigned _ltn = 0;
+                if (_lt < 0) _lt = calypso_gate("CALYPSO_DISPATCH_PROBE", 0);
+                if (_lt && _ltn < 60) {
+                    _ltn++;
+                    fprintf(stderr,
+                            "[dispatch] LD-TRACE pc=0x%04x op=0x%04x dst=%s sub=%d "
+                            "addr=0x%04x val_lue=0x%04x data[addr]=0x%04x "
+                            "A_avant=0x%06llx SXM=%d insn=%u\n",
+                            _pc, op, dst ? "B" : "A", sub, addr, val,
+                            s->data[addr],
+                            (unsigned long long)(s->a & 0xFFFFFFULL),
+                            (s->st1 & ST1_SXM) ? 1 : 0, s->insn_count);
+                    fflush(stderr);
+                }
+            }
+        }
         int64_t v;
         switch (sub) {
         case 0x0:  /* 0x1000: LD Smem, DST — signed (SXM honoured) */
@@ -16252,6 +16291,85 @@ int c54x_run(C54xState *s, int n_insns)
                  * mais des chargements de la base ; A y contenait deja une adresse
                  * de table resolue (0x43ac = base+37), d'ou l'`index=17324` absurde
                  * du premier run. Cinq vrais sites, donc. */
+                {   /* ──────────────────────────────────────────────────────────
+                     * [2026-08-03] CHAIN-B05F — le chainon manquant, tracé pas à pas.
+                     *
+                     * ETAT AVANT. Mesuré : l'ARM commande `d_task_d = 0x0018` (24,
+                     * ALLC) ; le DSP LIT la cellule et voit bien 0x0018 (patte 4/4,
+                     * 35 échantillons sur 41) ; la table contient le bon handler en
+                     * index 41 (`data[0x43b0] = 0xa5cd`). Et pourtant les cinq sites
+                     * `_sw[]` ci-dessous — la résolution d'index — ne sont JAMAIS
+                     * atteints, donc l'armement RX n'est jamais demandé.
+                     *
+                     * CE QUI SE TROUVE ENTRE LES DEUX. Le bloc qui lit d_task_d en
+                     * `0xb05f` enchaîne sur une chaîne de comparaisons (dump ROM) :
+                     *     0xb062: f130 7fff
+                     *     0xb064: f210 000c   0xb066: f843 b077   ; teste 12
+                     *     0xb068: f210 0022   0xb06a: f846 b077   ; teste 34
+                     *     0xb06c: f210 001e   0xb06e: f842 b070   ; teste 30
+                     *     0xb070: f200 4387                       ; base de table
+                     * La valeur lue est 24 — ni 12, ni 34, ni 30.
+                     *
+                     * POURQUOI UNE SONDE ET PAS UN DESASSEMBLAGE. Décoder f843/f846/
+                     * f842 (conditions de branchement) à la main est exactement le
+                     * geste qui a produit 3 fausses pistes sur 3 le 30/07 (§0 du
+                     * TODO). On MESURE le chemin réellement pris et l'accumulateur à
+                     * chaque pas ; la conclusion sortira du run, pas de ma lecture.
+                     *
+                     * L'ABSENCE DOIT RESTER LISIBLE : on trace TOUT le segment
+                     * 0xb05f..0xb078, donc si le bloc n'est pas exécuté du tout la
+                     * sonde est muette pour une raison différente — et le compteur
+                     * périodique le dit. Plafonnée à 200 pas + 1 résumé/20 passages. */
+                    if (exec_pc >= 0xb05f && exec_pc <= 0xb078) {
+                        static unsigned long long _cn = 0, _pass = 0;
+                        if (exec_pc == 0xb05f) _pass++;
+                        if (_cn < 200) {
+                            _cn++;
+                            /* [2026-08-03] AR ajoutes : `0xb060` est `10e1 0000`,
+                             * un LD INDIRECT. Le bloc lit son code de tache A
+                             * TRAVERS un pointeur, et la mesure donne A=0x5294 —
+                             * hors de portee des comparaisons (12/30/34), d'ou le
+                             * bailout systematique vers 0xb077. La question est donc
+                             * « sur quoi pointe le registre », pas « que vaut la
+                             * comparaison ». On imprime les AR et la cellule pointee
+                             * par AR1 (candidat le plus probable, ARP le dira). */
+                            unsigned _arp = (s->st0 >> 13) & 7;
+                            uint16_t _ea  = s->ar[_arp];
+                            fprintf(stderr,
+                                    "[dispatch] CHAIN-B05F pc=0x%04x op=0x%04x "
+                                    "A=0x%06llx (bas=0x%04x) TC=%d ARP=%u "
+                                    "AR[ARP]=0x%04x *AR[ARP]=0x%04x "
+                                    "AR0=%04x AR1=%04x AR2=%04x AR3=%04x "
+                                    /* [2026-08-03] data[0x7fff] : test d'une
+                                     * hypothese precise. En 0xb062, `f130 7fff`
+                                     * ecrase A avec 0x5294, valeur CONSTANTE quelle
+                                     * que soit l'entree (verifie avant et apres le
+                                     * correctif api_ram). Un resultat independant de
+                                     * l'operande = l'opcode ne calcule pas, il LIT.
+                                     * Si data[0x7fff] vaut 0x5294, l'immediat long
+                                     * est traite comme une ADRESSE au lieu d'une
+                                     * valeur — meme classe que le bug LDU *(0x0ffe)
+                                     * documente en tete du handler F1xx. Si ca ne
+                                     * correspond pas, l'hypothese tombe et il faudra
+                                     * instrumenter le handler lui-meme. */
+                                    "data[0x7fff]=0x%04x "
+                                    "passage=%llu insn=%u\n",
+                                    exec_pc, prog_fetch(s, exec_pc),
+                                    (unsigned long long)(s->a & 0xFFFFFFULL),
+                                    (unsigned)(s->a & 0xFFFF),
+                                    (s->st0 >> 12) & 1, _arp, _ea, s->data[_ea],
+                                    s->ar[0], s->ar[1], s->ar[2], s->ar[3],
+                                    s->data[0x7fff],
+                                    _pass, s->insn_count);
+                            fflush(stderr);
+                        } else if (exec_pc == 0xb05f && (_pass % 20) == 0) {
+                            fprintf(stderr,
+                                    "[dispatch] CHAIN-B05F resume : %llu passages en "
+                                    "0xb05f, %llu pas traces (plafond)\n", _pass, _cn);
+                            fflush(stderr);
+                        }
+                    }
+                }
                 static const uint16_t _sw[] = {0xb070,0xb08d,0xb0aa,0xb0be,0xb0d1};
                 for (unsigned _i = 0; _i < sizeof(_sw)/sizeof(_sw[0]); _i++) {
                     if (exec_pc != _sw[_i]) continue;
@@ -17003,9 +17121,45 @@ int c54x_run(C54xState *s, int n_insns)
                     uint16_t ctrl = pg ? 0x0824 : 0x0810;
                     uint16_t bid  = (uint16_t)(_fbid++ & 3u);
 
+                    /* ─────────────────────────────────────────────────────────
+                     * [2026-08-03] CORRECTIF — ces trois ecritures n'atteignaient
+                     * PAS le DSP. Elles ne touchaient que `s->data[]`, or pour
+                     * toute adresse de la fenetre API le DSP lit `s->api_ram[]` :
+                     *     data_read_locked() :
+                     *       if (addr >= C54X_API_BASE && addr < ...+C54X_API_SIZE)
+                     *           v = s->api_ram[addr - C54X_API_BASE];
+                     * La tache forcee atterrissait donc dans un tableau que
+                     * personne ne lit. Le miroir etait DEJA fait quinze lignes plus
+                     * bas pour `d_dsp_page` (data[] ET api_ram[]) — la contrainte
+                     * etait connue, elle n'avait simplement pas ete appliquee ici.
+                     *
+                     * MESURE QUI L'ETABLIT (sonde LD-TRACE, run du 03/08 19:52) :
+                     *     pc=0xb05f addr=0x0814 data[addr]=0x0018 val_lue=0x0000
+                     * L'adresse resolue est bonne, la cellule `data[]` contient
+                     * bien 24 (ALLC) — et la lecture rend 0. Consequence en chaine,
+                     * toute mesuree : le dispatcher compare 0 aux constantes
+                     * 12/30/34, sort au premier branchement vers 0xb077, la
+                     * resolution d'index n'est jamais atteinte, l'index 41
+                     * (armement RX, `0xa5cd`) n'est jamais demande, `A_CD-WR = 0`.
+                     *
+                     * ⚠️ CECI RESTE UNE BEQUILLE (marqueur BEQUILLE, cf. le bloc
+                     * FORCE_TASK ci-dessus) :
+                     *   1. c'en est une : on commande la tache a la place de l'ARM ;
+                     *   2. ce qu'elle masque : que la L1 ne commande pas le CCCH
+                     *      assez souvent par elle-meme ;
+                     *   3. quand la retirer : quand le mobile campe et commande le
+                     *      CCCH seul. Ce correctif ne fait que la rendre EFFECTIVE —
+                     *      il ne la legitime pas.
+                     * ⚠️ Ce correctif change le comportement (la bequille agit
+                     *    enfin). A valider sous charge avant d'effacer la condition. */
                     s->data[base + 0] = (uint16_t)_ft;         /* d_task_d      */
                     s->data[base + 1] = bid;                   /* d_burst_d     */
                     s->data[ctrl]    |= (uint16_t)(_ftsc & 7); /* d_ctrl_system */
+                    if (s->api_ram) {
+                        s->api_ram[base + 0 - C54X_API_BASE] = (uint16_t)_ft;
+                        s->api_ram[base + 1 - C54X_API_BASE] = bid;
+                        s->api_ram[ctrl - C54X_API_BASE]    |= (uint16_t)(_ftsc & 7);
+                    }
 
                     /* FIN DE SCENARIO — sans elle, on remplit une page que personne
                      * n'ouvre. Port exact de `dsp_end_scenario()` (osmocom-bb

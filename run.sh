@@ -102,7 +102,7 @@ _configure() {
                               hybrid calypso faketrx core)"
     mode="$(_cfg_demander     'Mode d émulation du DSP' \
                               "${CALYPSO_MODE:-shunt_legit}" \
-                              empty none bare shunt_legit shunt_legit_no_inject native native_twl native_helped)"
+                              empty none bare shunt_legit shunt_legit_no_inject native native_twl native_twl_host_demod native_helped)"
     pipeline="$(_cfg_demander 'Chaîne radio' \
                               "${CALYPSO_PIPELINE:-full-grgsm}" \
                               full-grgsm full shunt shunt-ipc bridge bare free)"
