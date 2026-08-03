@@ -18,6 +18,8 @@ arm_ss.add(when: 'CONFIG_CALYPSO', if_true: [
     'calypso_mailbox.c',
     'calypso_dma.c',
     'calypso_bsp.c',
+    'calypso_rif.c',
+    'calypso_rhea_dma.c',
     'calypso_iota.c',
     'calypso_twl3025.c',
     'l1ctl_sock.c',

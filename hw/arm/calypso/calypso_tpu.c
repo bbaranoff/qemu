@@ -270,8 +270,24 @@ void calypso_tpu_run_scenario_regs(uint16_t *tpu_ram, C54xState *dsp,
  * (ti-calypso1.pdf p.24) : l'IT trame du TPU est INT8n = IMR bit 11 = vec 27.
  * Le 30 retenu jusqu'ici est INT10n = l'IT DMA — un autre evenement, qui existe
  * bel et bien (§6 : RIF-RX a un canal DMA dedie) mais qui n'est pas celui-la.
- * Defaut corrige a C54X_IT_TPU_FRAME_VEC (27). CALYPSO_TPU_DSP_FRAME_VEC reste
- * disponible pour balayer, mais ce n'est plus un balayage a l'aveugle.
+ * [2026-08-03, MESURE] MAIS LE 27 NE PASSE PAS, ET ON SAIT POURQUOI.
+ * Run native_twl avec ce fil arme : l'IT est bien emise sur vec27/bit11, le bit 11
+ * apparait dans l'IFR (`IFR=0x1820` = bits 5+11+12) — et il y RESTE. Sur ~30 000
+ * releves, l'IMR du ROM prend six valeurs (0x52ef, 0x52ed, 0x72ed, 0x50ef, 0x50ed,
+ * 0x3000) et **aucune n'ouvre le bit 11**, alors que le bit 12 est ouvert dans
+ * toutes. Ce qui est reellement dispatche est `PC=0x00f0` = slot 28 = bit 12.
+ *
+ * Or osmocom ne signale QUE par l'IT trame du TPU (dsp_end_scenario ; AINT n'est
+ * jamais levee, son registre de controle n'est meme pas reference dans le
+ * firmware). Un DSP qui masque a vie la seule interruption par laquelle on lui
+ * parle n'a pas de sens. Conclusion : dans la zone AINT/INT8n, l'ordre de la liste
+ * en prose du §5.1 est decale d'un cran — l'IT trame TPU est **bit 12 / vec 28**,
+ * et AINT est bit 11 / vec 27 (jamais demasquee, ce qui est coherent avec le fait
+ * qu'osmocom ne s'en sert pas). Le reste de la table (TINT=bit3, SPI=bit4/5,
+ * DMA=bit14) reste confirme par ailleurs.
+ *
+ * Defaut = 28. CALYPSO_TPU_DSP_FRAME_VEC reste disponible pour re-balayer, et
+ * poser 27 reproduit l'observation ci-dessus (IT emise, jamais prise).
  *
  * GATE : CALYPSO_TPU_DSP_FRAME_IT, defaut 0 le temps de valider. Quand ce sera
  * valide, le defaut doit passer a 1 et les bequilles CALYPSO_FORCE_VEC **et
@@ -280,7 +296,7 @@ void calypso_tpu_run_scenario_regs(uint16_t *tpu_ram, C54xState *dsp,
  * FAIT QUAND : `0x728a` s'execute sans CALYPSO_FORCE_VEC. */
 static void tpu_frame_irq_to_dsp(uint32_t fn)
 {
-    static int gate = -1, vec = C54X_IT_TPU_FRAME_VEC;   /* §5.1 : INT8n */
+    static int gate = -1, vec = 28;   /* INT8n — bit 12, cf. la mesure ci-dessus */
 
     if (gate < 0) {
         gate = calypso_gate("CALYPSO_TPU_DSP_FRAME_IT", 0);

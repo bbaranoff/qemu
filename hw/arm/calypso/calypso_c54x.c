@@ -8,6 +8,7 @@
  */
 
 #include "calypso_c54x.h"
+#include "calypso_rif.h"
 #include "calypso_mailbox.h"
 #include "calypso_dma.h"
 #include "calypso_arm2dsp.h"
@@ -9602,7 +9603,14 @@ static int c54x_exec_one(C54xState *s)
         if ((op & 0xFF00) == 0x7500) {        /* PORTW Smem, PA */
             addr = resolve_smem(s, op, &ind); /* applique le post-modify AR, pose lk_used si abs */
             uint16_t pa = prog_fetch(s, s->pc + 1 + (s->lk_used ? 1 : 0));
-            (void)pa; (void)addr;             /* écriture port externe : non modélisée (TODO sémantique) */
+            /* [2026-08-03] RIF (calypso_rif.c) : SPCR/SPCX/DXR sont maintenant
+             * reellement ecrits — c'est par SPCR que le firmware ouvre RINT_MASK
+             * ou RDMA_MASK, donc qu'il CHOISIT le mode du §3.7.1. */
+            if (calypso_rif_portw(s, pa, data_read(s, addr))) {
+                consumed = 2;
+                return consumed + s->lk_used;
+            }
+            (void)pa; (void)addr;             /* autre port : non modélisé */
             consumed = 2;                     /* opcode + PA */
             return consumed + s->lk_used;
         }
@@ -9636,6 +9644,18 @@ static int c54x_exec_one(C54xState *s)
                             "=0x%04x pos=%d/%d PC=0x%04x insn=%u\n",
                             pr_n, pa, addr, iq, s->bsp_pos, s->bsp_len, s->pc,
                             s->insn_count);
+            }
+            /* [2026-08-03] RIF : PORTR n'etait un no-op que parce que le RIF
+             * n'existait pas dans le modele. Il existe maintenant (calypso_rif.c,
+             * CAL207 §12) et c'est la seule cible que le firmware interroge :
+             * 30 releves PORTR-ANY sur 30 valaient PA=0x0003 = SPCR. */
+            {
+                uint16_t rv;
+                if (calypso_rif_portr(s, pa, &rv)) {
+                    data_write(s, addr, rv);
+                    consumed = 2;
+                    return consumed + s->lk_used;
+                }
             }
             (void)pa; (void)addr;
             consumed = 2;
@@ -18307,6 +18327,12 @@ void c54x_bsp_load(C54xState *s, const uint16_t *samples, int n)
     memcpy(s->bsp_buf, samples, n * sizeof(uint16_t));
     s->bsp_len = n;
     s->bsp_pos = 0;
+
+    /* [2026-08-03] Le meme burst alimente la FIFO de reception du RIF, qui est
+     * la voie par laquelle le firmware DSP le lit reellement (PORTR DRR apres
+     * avoir vu SPCR). bsp_buf reste en place pour les sondes et pour l'ancien
+     * chemin PORTR PA=0xF430 (CALYPSO_FIX_PORTR). */
+    calypso_rif_rx_burst(s, samples, n);
 
     /* Confirm what the PORTR PA=0x0034 serving path will hand the DSP,
      * and also flag if the DSP consumed less than half of the previous

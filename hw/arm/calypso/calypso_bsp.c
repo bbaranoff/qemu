@@ -948,24 +948,71 @@ static int calypso_bsp_vec30_int3_on(void)
     return c;
 }
 
+/* [2026-08-03] CALYPSO_BSP_RX_VEC=<n> — le vecteur de LIVRAISON RX, en clair.
+ *
+ * MESURE DU 03/08 (profil native_twl, run avec l'IT trame cablee) :
+ *     [bsp] DELIVER resume : vec21=24644 vec19=24857 vec30=0
+ * Soit ~49 000 bursts RX annonces au DSP sur vec21 et vec19. Or CAL000 §5.1 :
+ *     vec21 = XINT  = SPI TRANSMIT
+ *     vec19 = TINT  = timer du DSP
+ * Ni l'un ni l'autre n'a le moindre rapport avec la radio, et le ROM y a des
+ * stubs RETE. Le correlateur n'est donc jamais prevenu qu'un burst est arrive —
+ * ce que confirme le compteur du firmware : fb0_att=37, fb0_ret=0.
+ *
+ * Les deux vecteurs que le §3.7.1 autorise pour le RIF, selon le mode :
+ *   vec16 / bit 0  = INT0n  « RIF receive interrupt »  — mode XIO mot-a-mot
+ *   vec30 / bit 14 = INT10n « DMA interrupt »          — mode DMA (§6 : canal
+ *                    dedie RIF-RX ; « an end-DMA request is sent »)
+ * Les DEUX sont demasques dans l'IMR mesuree (0x52ef : bit0=1, bit14=1), et le
+ * modele n'emettait sur AUCUN des deux.
+ *
+ * Ce gate remplace le booleen BSP_VEC30 par un numero, pour pouvoir departager
+ * les deux modes du §3.7.1 en un run chacun au lieu d'un balayage. Absent =
+ * comportement historique strictement inchange (BSP_VEC30 continue de marcher).
+ * bit = vec - 16 (formule de calypso_c54x.h, confirmee par la mesure vec28/bit12). */
+static int calypso_bsp_rx_vec(void)
+{
+    static int v = -2;
+    if (v == -2) {
+        const char *e = getenv("CALYPSO_BSP_RX_VEC");
+        v = (e && *e) ? (int)strtol(e, NULL, 0) : -1;
+        if (v >= 0 && (v < 16 || v >= 32)) {
+            fprintf(stderr, "[bsp] BSP_RX_VEC=%d hors plage 16..31 — ignore\n", v);
+            v = -1;
+        }
+        if (v >= 0)
+            fprintf(stderr, "[bsp] BSP_RX_VEC=%d (IMR bit %d) : livraison RX forcee "
+                    "sur ce vecteur. CAL000 §5.1/§3.7.1 : 16=INT0n RIF receive "
+                    "(mode XIO), 30=INT10n DMA (mode buffered, canal dedie RIF-RX). "
+                    "Les vecteurs historiques 21/19 sont SPI transmit et timer DSP.\n",
+                    v, v - 16);
+    }
+    return v;
+}
+
 /* Livraison RX : choisit le vecteur selon le gate, et compte ce qui part ou. */
 static void calypso_bsp_deliver(C54xState *dsp, int vec, int bit)
 {
     int src_vec = vec;
-    if ((vec == 21 && calypso_bsp_vec30_on()) ||
+    int forced = calypso_bsp_rx_vec();
+    if (forced >= 0) {
+        vec = forced;
+        bit = forced - 16;
+    } else if ((vec == 21 && calypso_bsp_vec30_on()) ||
         (vec == 19 && calypso_bsp_vec30_int3_on())) {
         vec = 30;
         bit = 14;
     }
     {
-        static unsigned long long n21 = 0, n19 = 0, n30 = 0;
-        if (vec == 30) n30++;
+        static unsigned long long n21 = 0, n19 = 0, nre = 0;
+        if (vec != src_vec) nre++;          /* reroute (BSP_RX_VEC ou BSP_VEC30) */
         else if (src_vec == 21) n21++;
         else n19++;
-        if (((n21 + n19 + n30) % 500) == 1)
-            fprintf(stderr, "[bsp] DELIVER resume : vec21=%llu vec19=%llu vec30=%llu\n",
+        if (((n21 + n19 + nre) % 500) == 1)
+            fprintf(stderr, "[bsp] DELIVER resume : vec21=%llu vec19=%llu "
+                    "reroute->vec%d=%llu\n",
                     (unsigned long long)n21, (unsigned long long)n19,
-                    (unsigned long long)n30);
+                    vec, (unsigned long long)nre);
     }
     c54x_interrupt_ex(dsp, vec, bit);
 }

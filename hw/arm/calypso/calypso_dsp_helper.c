@@ -165,6 +165,8 @@ uint32_t rp_base(uint8_t page_idx) {
 
 bool shunt_is_canned(unsigned bit) { return (g_canned & bit) != 0; }
 
+static uint16_t shunt_snr_val(void);   /* cf. @BEQUILLE SNR FABRIQUE, plus bas */
+
 /* [2026-07-22] Echo de d_burst_d pour RP_D_BURST_D. Le shunt echo le burst
  * COMMANDE (WP_D_BURST_D), mais l1s_nb_resp attend le burst DEMODULE (decale du
  * pipeline cmd->resp + toggle w_page/r_page) -> mismatch systematique +1
@@ -281,7 +283,7 @@ void shunt_dispatch_fb(uint8_t page_idx)
     shunt_write_w(BASE_API_NDB + NDB_A_SYNC_DEMOD + D_TOA   * 2, shunt_toa_val());
     shunt_write_w(BASE_API_NDB + NDB_A_SYNC_DEMOD + D_PM    * 2, shunt_is_canned(CAN_PM)    ? SHUNT_CANNED_PM    : g_shunt.last_pm);
     shunt_write_w(BASE_API_NDB + NDB_A_SYNC_DEMOD + D_ANGLE * 2, shunt_is_canned(CAN_ANGLE) ? SHUNT_CANNED_ANGLE : 0);
-    shunt_write_w(BASE_API_NDB + NDB_A_SYNC_DEMOD + D_SNR   * 2, (shunt_is_canned(CAN_SNR) || g_shunt.sb_valid) ? SHUNT_CANNED_SNR : 0);
+    shunt_write_w(BASE_API_NDB + NDB_A_SYNC_DEMOD + D_SNR   * 2, shunt_snr_val());
 
     /* Ack on the read page (echo). Not strictly required for the FB path
      * (firmware reads d_fb_det from NDB, not read-page) but mirrors the
@@ -292,6 +294,50 @@ void shunt_dispatch_fb(uint8_t page_idx)
         "ANGLE=%d SNR=0x%x (NDB only)\n",
         page_idx, SHUNT_CANNED_TOA, SHUNT_CANNED_PM,
         SHUNT_CANNED_ANGLE, SHUNT_CANNED_SNR);
+}
+
+/* [2026-08-03] @BEQUILLE — SNR FABRIQUE  (CALYPSO_SHUNT_SNR_CANNED, defaut 1)
+ *
+ *   (1) C'EST UNE BEQUILLE : le SNR ecrit dans a_sync_demod / a_serv_demod n'est
+ *       PAS mesure. C'est la constante SHUNT_CANNED_SNR = 0x7000 — le meme mot que
+ *       celui repere dans le champ de puissance sous le nom des « 448 dBm », et qui
+ *       se trouve etre l'adresse de base de PROM0. Une adresse dans un champ de
+ *       grandeur physique.
+ *
+ *   (2) CE QU'ELLE MASQUE : le DSP n'ecrit jamais son propre SNR. Le raisonnement
+ *       d'origine — « gr-gsm a decode, donc le SNR etait forcement suffisant » —
+ *       est defendable ; ce qui ne l'est pas, c'est de le traduire par une
+ *       constante magique ET de la faire echapper a l'interrupteur prevu pour ca.
+ *
+ *   (3) LE DEFAUT CORRIGE ICI : l'expression etait
+ *           (shunt_is_canned(CAN_SNR) || g_shunt.sb_valid) ? SHUNT_CANNED_SNR : 0
+ *       Le `|| sb_valid` ecrivait la valeur cannee des que gr-gsm avait decode,
+ *       SANS PASSER par CALYPSO_SHUNT_NO_CANNED. Mesure du 03/08, profil
+ *       native_twl avec NO_CANNED=1 et CALYPSO_CANNED vide : `snr=0x7000` present
+ *       dans data[] ET api[] a chaque releve, pendant que `pm` (20929/20595/19927)
+ *       et `ang` (-186/-710) variaient — eux sont reels. Un profil qui declare
+ *       « jamais de valeur fabriquee » en fabriquait une.
+ *
+ *   (4) QUAND LA RETIRER : quand le DSP ecrit a_sync_demod[D_SNR] lui-meme.
+ *
+ *   DEFAUT = 1 = comportement historique STRICTEMENT inchange. C'est deliberé :
+ *   le basculer pendant un bissect en cours melangerait deux variables. Poser
+ *   CALYPSO_SHUNT_SNR_CANNED=0 fait ecrire 0 a la place — a tester dans un run
+ *   DEDIE, parce qu'un SNR nul peut faire rejeter la SB et casser le camp en
+ *   shunt_legit. */
+static uint16_t shunt_snr_val(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = calypso_gate("CALYPSO_SHUNT_SNR_CANNED", 1);
+        if (!on)
+            fprintf(stderr, "[shunt] SNR_CANNED=0 : plus de SNR fabrique "
+                    "(0x%04x) — on ecrit 0. Le firmware peut rejeter la SB.\n",
+                    SHUNT_CANNED_SNR);
+    }
+    if (!on)
+        return 0;
+    return (shunt_is_canned(CAN_SNR) || g_shunt.sb_valid) ? SHUNT_CANNED_SNR : 0;
 }
 
 /* ---- DISPATCH : SB writes READ PAGE only ---- */
@@ -407,7 +453,7 @@ void shunt_dispatch_sb(uint8_t page_idx)
     shunt_write_w(rp + RP_A_SERV_DEMOD + D_TOA   * 2, shunt_toa_val());
     shunt_write_w(rp + RP_A_SERV_DEMOD + D_PM    * 2, shunt_is_canned(CAN_PM)    ? SHUNT_CANNED_PM    : g_shunt.last_pm);
     shunt_write_w(rp + RP_A_SERV_DEMOD + D_ANGLE * 2, shunt_is_canned(CAN_ANGLE) ? SHUNT_CANNED_ANGLE : 0);
-    shunt_write_w(rp + RP_A_SERV_DEMOD + D_SNR   * 2, (shunt_is_canned(CAN_SNR) || g_shunt.sb_valid) ? SHUNT_CANNED_SNR : 0);
+    shunt_write_w(rp + RP_A_SERV_DEMOD + D_SNR   * 2, shunt_snr_val());
 
     /* Ack on read page. */
     shunt_write_w(rp + RP_D_TASK_MD, SB_DSP_TASK);
