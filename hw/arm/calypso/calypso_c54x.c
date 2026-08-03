@@ -9,6 +9,8 @@
 
 #include "calypso_c54x.h"
 #include "calypso_rif.h"
+#include "hw/arm/calypso/calypso_rhea_dma.h"
+#include "hw/arm/calypso/calypso_xio.h"   /* arbitrage SAM/HOM */
 #include "calypso_mailbox.h"
 #include "calypso_dma.h"
 #include "calypso_arm2dsp.h"
@@ -4304,6 +4306,47 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
     /* API RAM (shared with ARM) */
     if (addr >= C54X_API_BASE && addr < C54X_API_BASE + C54X_API_SIZE) {
         uint16_t woff = addr - C54X_API_BASE;
+        /* [2026-08-03] ARBITRAGE SAM / HOM — CAL000 §7.2.1, CAL207 §9.1.
+         *
+         * « In HOM mode (Host Only Mode), the API RAM is dedicated to external
+         * access under the control of either the ARM or the DMA controller. »
+         * Autrement dit : en HOM, le DSP N'A PLUS ACCES a cette fenetre. Le
+         * modele n'en avait aucune notion — les deux cotes ecrivaient sans arbitre.
+         *
+         * MESURE qui a motive ce bloc : le firmware DSP bascule HOM<->SAM UNE FOIS
+         * PAR TRAME (API_CONF=0x0002 en 0xa693, retour a 0x0000 en 0xa4e7).
+         *
+         * DEUX ETAGES, deliberement separes :
+         *   - OBSERVATION (CALYPSO_API_HOM_WATCH, defaut 1) : on COMPTE et on
+         *     journalise les ecritures DSP faites pendant HOM, sans rien changer.
+         *     Tant qu'on ne sait pas si ca arrive, arbitrer serait speculer.
+         *   - APPLICATION (CALYPSO_API_HOM_STRICT, defaut 0) : on ABANDONNE
+         *     l'ecriture, comme le ferait le silicium. C'est un vrai changement de
+         *     comportement, donc opt-in et a valider sous charge.
+         * Le doc ne dit PAS ce que le DSP lit en HOM ; on ne touche donc pas au
+         * chemin de lecture, inventer une valeur serait fabriquer une mesure. */
+        {
+            static int watch = -1, strict = -1;
+            if (watch < 0) {
+                watch  = calypso_gate("CALYPSO_API_HOM_WATCH", 1);
+                strict = calypso_gate("CALYPSO_API_HOM_STRICT", 0);
+                if (strict)
+                    fprintf(stderr, "[c54x] API_HOM_STRICT=1 : les ecritures DSP "
+                            "dans la fenetre API sont ABANDONNEES pendant HOM "
+                            "(CAL000 §7.2.1). Changement de comportement — a "
+                            "valider sous charge.\n");
+            }
+            if ((watch || strict) && calypso_xio_api_hom()) {
+                static unsigned long long n_hom = 0;
+                if (n_hom++ == 0 || (n_hom % 5000) == 0)
+                    fprintf(stderr, "[c54x] API-HOM : ecriture DSP dans la fenetre "
+                            "API pendant HOM #%llu — data[0x%04x] <- 0x%04x "
+                            "PC=0x%04x (%s)\n", n_hom, addr, val, s->pc,
+                            strict ? "ABANDONNEE" : "laissee passer, observation");
+                if (strict)
+                    return;
+            }
+        }
         if (s->api_ram)
             s->api_ram[woff] = val;
         {   /* [2026-07-28] FBDET-API (a) cote DSP : voir en-tete du patch. */
@@ -9610,6 +9653,17 @@ static int c54x_exec_one(C54xState *s)
                 consumed = 2;
                 return consumed + s->lk_used;
             }
+            {   /* fenetre DMA cote DSP — cf. PORTR ci-dessous */
+                uint16_t wv = data_read(s, addr);
+                if (calypso_rhea_dma_xio(true, pa, &wv, s->pc)) {
+                    consumed = 2;
+                    return consumed + s->lk_used;
+                }
+                if (calypso_xio_misc(true, pa, &wv, s->pc)) {
+                    consumed = 2;
+                    return consumed + s->lk_used;
+                }
+            }
             (void)pa; (void)addr;             /* autre port : non modélisé */
             consumed = 2;                     /* opcode + PA */
             return consumed + s->lk_used;
@@ -9652,6 +9706,22 @@ static int c54x_exec_one(C54xState *s)
             {
                 uint16_t rv;
                 if (calypso_rif_portr(s, pa, &rv)) {
+                    data_write(s, addr, rv);
+                    consumed = 2;
+                    return consumed + s->lk_used;
+                }
+                /* [2026-08-03] Fenetre DMA vue du DSP (XIO:FC00..FCFF, §11.1).
+                 * L'ARM a cede les canaux du RIF au DSP (ALLOC_CONFIG=0x000C
+                 * mesure) : c'est donc ICI que passe la config du transfert. */
+                rv = 0;
+                if (calypso_rhea_dma_xio(false, pa, &rv, s->pc)) {
+                    data_write(s, addr, rv);
+                    consumed = 2;
+                    return consumed + s->lk_used;
+                }
+                /* API Control (F900) + INTH du DSP (FA00) — cf. calypso_xio.c */
+                rv = 0;
+                if (calypso_xio_misc(false, pa, &rv, s->pc)) {
                     data_write(s, addr, rv);
                     consumed = 2;
                     return consumed + s->lk_used;

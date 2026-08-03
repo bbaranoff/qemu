@@ -117,24 +117,47 @@
  * §5.1 : « The DSP subchip owns 17 interrupt lines with 11 of which INT0n to
  * INT10n are dedicated for external peripherals. »
  *
- *  bit  vec  ligne     source (§5.1)
- *  ---  ---  --------  ---------------------------------------------------------
- *   0    16  INT0n     RIF receive interrupt          (niveau)
- *   1    17  INT1n     RIF transmit interrupt         (niveau)
- *   2    18  INT2n     UART interrupt                 (niveau)
- *   3    19  TINT      Timer interrupts               ← PAS « INT3 »
- *   4    20  RINT      SPI receive interrupt          ← PAS « TINT0 »
- *   5    21  XINT      SPI transmit interrupt         ← PAS « BRINT0 »
- *   6    22  INT3n     MCSI receive interrupt         (niveau)
- *   7    23  INT4n     MCSI transmit interrupt        ← PAS « DMAC0 »
- *   8    24  INT5n     MCSI frame duration error      (niveau)
- *   9    25  INT6n     MCSI DAI interrupt             (niveau)
- *  10    26  INT7n     CYPHER interrupts              (front)
- *  11    27  INT8n     TPU FRAME interrupt            (front)
- *  12    28  AINT      API interrupts (ARM ↔ DSP)
- *  13    29  INT9n     TPU programmable interrupt     (front)
- *  14    30  INT10n    DMA interrupt                  (niveau)
- *       nMIN          Abort on Rhea bus OR INT4n redirection
+ * [2026-08-03, DEUXIÈME CORRECTION] La première version de ce bloc suivait l'ORDRE
+ * DE LA LISTE EN PROSE de CAL000 §5.1, faute de mieux. Cette liste est FAUSSE à
+ * partir du bit 6 : elle plaçait AINT en bit 12. La table qui fait autorité est
+ * CAL207 §15.1, « DSP interrupts Mapping », qui donne l'EMPLACEMENT EN HEXA de
+ * chaque vecteur — pas un ordre à interpréter. vec = Location / 4.
+ *
+ *  bit  vec  Loc.  ligne     source (CAL207 §15.1)              sens
+ *  ---  ---  ----  --------  ---------------------------------  ------
+ *   0    16  0x40  INT0n     RIF receive interrupt              niveau
+ *   1    17  0x44  INT1n     RIF transmit interrupt             niveau
+ *   2    18  0x48  INT2n     UART interrupt                     niveau
+ *   3    19  0x4C  TINT      Timer interrupts
+ *   4    20  0x50  RINT      SPI receive interrupt
+ *   5    21  0x54  XINT      SPI transmit interrupt
+ *   6    22  0x58  INT4n     MCSI transmit interrupt            niveau
+ *   7    23  0x5C  INT5n     MCSI frame duration error          niveau
+ *   8    24  0x60  INT3n     MCSI receive interrupt             niveau
+ *   9    25  0x64  AINT      API interrupts (ARM ↔ DSP)
+ *  10    26  0x68  INT6n     MCSI DAI interrupt                 niveau
+ *  11    27  0x6C  INT7n     CYPHER interrupts                  FRONT
+ *  12    28  0x70  INT8n     TPU FRAME interrupt                FRONT
+ *  13    29  0x74  INT9n     TPU programmable interrupt         FRONT
+ *  14    30  0x78  INT10n    DMA interrupt                      niveau
+ *        1   0x04  nMIN      Abort on Rhea bus OR redirection INT4n (= NMI)
+ *
+ * CE QUI CHANGE PAR RAPPORT À LA LISTE EN PROSE : INT3n/INT4n/INT5n sont permutés,
+ * **AINT est en bit 9 (pas 12)**, INT6n en bit 10, INT7n en bit 11, et l'IT TRAME
+ * du TPU (INT8n) est en **bit 12 / vec 28**.
+ *
+ * VÉRIFIÉ PAR LA MESURE, et c'est ce qui rend cette table crédible : l'IMR du ROM
+ * vaut 0x52ef = bits 0,1,2,3,5,6,7,9,12,14, soit RIF rx + RIF tx + UART + timer +
+ * SPI tx + MCSI tx/err + **AINT** + **IT trame TPU** + DMA. Les bits laissés
+ * masqués sont CYPHER (11), MCSI rx (8), TPU programmable (13) et SPI rx (4) —
+ * exactement ce qu'un L1 GSM n'utilise pas à ce stade. Sous l'ancienne lecture, le
+ * bit 11 « IT trame » n'était JAMAIS ouvert alors qu'osmocom ne signale que par
+ * lui : l'incohérence venait de la table, pas du firmware.
+ *
+ * CONFIRMATION CROISÉE (§15.2.1) : le firmware écrit 0x0380 dans CNTRL_REG
+ * (XIO:FA00), qui assigne edge/niveau par canal — bits 7, 8, 9 → canaux 7, 8, 9
+ * en FRONT. Or §15.1 marque exactement INT7n, INT8n et INT9n comme « edge ». Le
+ * canal N est donc bien INTNn.
  *
  * Formule inchangée et confirmée : vec = imr_bit + 16.
  * Note §5.1 sur INT9n : « a facility offered to the DSP programmer in order to
@@ -162,19 +185,23 @@
 #define C54X_IT_SPI_RX_BIT      4
 #define C54X_IT_SPI_TX_VEC     21   /* XINT   SPI transmit             */
 #define C54X_IT_SPI_TX_BIT      5
-#define C54X_IT_MCSI_RX_VEC    22   /* INT3n  MCSI receive             */
-#define C54X_IT_MCSI_RX_BIT     6
-#define C54X_IT_MCSI_TX_VEC    23   /* INT4n  MCSI transmit            */
-#define C54X_IT_MCSI_TX_BIT     7
-#define C54X_IT_CRYPT_VEC      26   /* INT7n  CYPHER                   */
-#define C54X_IT_CRYPT_BIT      10
-#define C54X_IT_TPU_FRAME_VEC  27   /* INT8n  TPU frame interrupt      */
-#define C54X_IT_TPU_FRAME_BIT  11
-#define C54X_IT_API_VEC        28   /* AINT   API (ARM ↔ DSP)          */
-#define C54X_IT_API_BIT        12
-#define C54X_IT_TPU_PROG_VEC   29   /* INT9n  TPU programmable         */
+#define C54X_IT_MCSI_TX_VEC    22   /* INT4n  MCSI transmit     (0x58) */
+#define C54X_IT_MCSI_TX_BIT     6
+#define C54X_IT_MCSI_ERR_VEC   23   /* INT5n  MCSI frame dur.   (0x5C) */
+#define C54X_IT_MCSI_ERR_BIT    7
+#define C54X_IT_MCSI_RX_VEC    24   /* INT3n  MCSI receive      (0x60) */
+#define C54X_IT_MCSI_RX_BIT     8
+#define C54X_IT_API_VEC        25   /* AINT   API (ARM ↔ DSP)   (0x64) */
+#define C54X_IT_API_BIT         9
+#define C54X_IT_MCSI_DAI_VEC   26   /* INT6n  MCSI DAI          (0x68) */
+#define C54X_IT_MCSI_DAI_BIT   10
+#define C54X_IT_CRYPT_VEC      27   /* INT7n  CYPHER            (0x6C) */
+#define C54X_IT_CRYPT_BIT      11
+#define C54X_IT_TPU_FRAME_VEC  28   /* INT8n  TPU frame         (0x70) */
+#define C54X_IT_TPU_FRAME_BIT  12
+#define C54X_IT_TPU_PROG_VEC   29   /* INT9n  TPU programmable  (0x74) */
 #define C54X_IT_TPU_PROG_BIT   13
-#define C54X_IT_DMA_VEC        30   /* INT10n DMA                      */
+#define C54X_IT_DMA_VEC        30   /* INT10n DMA               (0x78) */
 #define C54X_IT_DMA_BIT        14
 
 /* SAS — CALYPSO_IT_TABLE_DOC=1 : bascule les émetteurs d'IT encore câblés sur

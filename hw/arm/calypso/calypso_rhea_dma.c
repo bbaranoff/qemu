@@ -10,6 +10,22 @@
  * Elles doivent arriver en MÉMOIRE — §3.7.1 : « API interface for radio data in
  * DMA mode (buffered mode with data block transfer) ».
  *
+ * [MESURE 03/08, run native_twl] L'ARM ecrit UNE seule chose dans cette fenetre :
+ *     ALLOC_CONFIG <- 0x000C  ->  canal1=DSP canal2=DSP canal3=ARM canal4=ARM
+ * Il CEDE les deux canaux du RIF au DSP et garde les deux canaux UART. Croise avec
+ * la Table 2 du §6 (canaux 0..3 : 0=RIF_DMA_REQ_X, 1=RIF_DMA_REQ_R, 2/3=UARTs) et
+ * le §11 (registres DMA1..DMA4), la lecture coherente est DMA1=RIF TX, DMA2=RIF RX,
+ * DMA3/DMA4=UARTs — le §6 numerote a partir de 0, le §11 a partir de 1. L'autre
+ * lecture (DMA1=RIF RX, DMA2=UART) donnerait un canal UART au DSP, ce qui n'a pas
+ * de sens pour ce firmware ; elle reste possible et se departagera sur les valeurs
+ * de RAD/AAD reellement ecrites.
+ *
+ * CONSEQUENCE (§11.3) : « The DMA transfer configuration registers are connected to
+ * either the ARM Rhea bus OR TO THE DSP RHEA BUS regarding the corresponding
+ * DMA_ALLOC flag. » L'ARM n'ecrira donc JAMAIS DMA1_AAD : les registres des canaux
+ * cedes vivent desormais en XIO:FC10 / XIO:FC20, cote DSP. D'ou le pont
+ * calypso_rhea_dma_xio() plus bas — meme banc de registres, deuxieme bus.
+ *
  * Or la configuration DMA se fait « from the MCU only » (§3.5.15) sur cette
  * fenêtre, et le modèle n'y avait qu'un `add_stub` MUET : lectures à 0, écritures
  * jetées. Toute la programmation DMA de l'ARM disparaissait sans un mot — d'où
@@ -117,7 +133,7 @@ static void rhea_dma_init(void)
         rd.ch[i].ctrl = CTRL_RESET;
     fprintf(stderr, "[rhea-dma] controleur DMA RHEA arme (CAL207 §11) @0xFFFFFC00 : "
             "4 canaux, reset CTRL=0x%04x (DIRECTION=1 Rhea->API, MAS=1 16 bits, "
-            "IRQ_MODE=1, ENABLE=0). Canal 1 = RIF_DMA_REQ_R (§6 Table 2). "
+            "IRQ_MODE=1, ENABLE=0). Canaux RIF : DMA1=TX DMA2=RX (§6 Table 2). "
             "ENREGISTREMENT SEUL : aucun transfert n'est execute.\n", CTRL_RESET);
 }
 
@@ -219,6 +235,7 @@ void calypso_rhea_dma_write(void *opaque, hwaddr off, uint64_t val, unsigned siz
             fprintf(stderr, "[rhea-dma] DMA%d_RDPTH <- %u octets\n", n + 1, v & 0x7FF);
             break;
         case RD_AAD:
+            /* Jamais plafonne : c'est LA reponse a « ou le burst doit-il atterrir ». */
             rd.ch[n].aad = v & 0x0FFF;
             log_aad(n, v);
             break;
@@ -229,7 +246,27 @@ void calypso_rhea_dma_write(void *opaque, hwaddr off, uint64_t val, unsigned siz
             break;
         case RD_CTRL: {
             uint16_t keep = rd.ch[n].ctrl & CTRL_RO_MASK;
+            uint16_t before = rd.ch[n].ctrl;
             rd.ch[n].ctrl = (uint16_t)((v & ~CTRL_RO_MASK & 0x1FFF) | keep);
+            /* [2026-08-03, CORRIGE PAR LE DESASSEMBLAGE] La v1 de ce commentaire
+             * disait « le firmware scrute, il n'arme pas ». FAUX. PROM0 0xa640 :
+             *     portr *(0x4356), 0xfc28    ; lit DMA2_CTRL
+             *     andm  *(0x4356), #0xfffe   ; EFFACE le bit 0 = ENABLE
+             *     portw *(0x4356), 0xfc28    ; reecrit
+             * C'est un DESARMEMENT explicite du canal, pas une scrutation. Si
+             * l'ecriture ne change rien, c'est seulement parce que ENABLE valait
+             * deja 0 chez nous. On compte ces passages au lieu de les repeter, et
+             * on journalise tout ce qui CHANGE l'etat ou pose ENABLE/DMA_START. */
+            bool inerte = (rd.ch[n].ctrl == before) && !(v & CTRL_DMA_START);
+            if (inerte) {
+                static unsigned long long n_rmw[4];
+                if (n_rmw[n]++ == 0 || (n_rmw[n] % 20000) == 0)
+                    fprintf(stderr, "[rhea-dma] DMA%d_CTRL DESARMEMENT x%llu "
+                            "(0xa643 andm #0xfffe = efface ENABLE ; sans effet ici, "
+                            "ENABLE valait deja 0 — relu/reecrit 0x%04x)\n",
+                            n + 1, n_rmw[n], v);
+                break;
+            }
             log_ctrl(n, v);
             if (v & CTRL_DMA_START) {
                 rd.n_start++;
@@ -254,4 +291,54 @@ void calypso_rhea_dma_write(void *opaque, hwaddr off, uint64_t val, unsigned siz
 
     fprintf(stderr, "[rhea-dma] WR  +0x%02x = 0x%04x (hors carte §11)\n",
             (unsigned)off, v);
+}
+
+/* Pont XIO : le MEME banc de registres, vu du bus Rhea du DSP.
+ * §11.1 donne les deux adresses pour chaque registre (FFFF:FCxx et XIO:FCxx) ;
+ * lequel des deux bus y accede depend de DMA_ALLOC. Puisque l'ARM a cede les
+ * canaux du RIF au DSP (ALLOC_CONFIG=0x000C mesure), c'est par ici que passera
+ * la programmation du transfert de reception. */
+bool calypso_rhea_dma_xio(bool write, uint16_t pa, uint16_t *val, uint16_t pc)
+{
+    if (pa < 0xFC00 || pa > 0xFCFF)
+        return false;
+    if (!rhea_dma_on())
+        return false;
+    hwaddr off = pa - 0xFC00;
+    /* [2026-08-03] DEDUPE, PAS PLAFOND. La v1 coupait a 40 lignes et la boucle
+     * de scrutation de CTRL (a640/a646/a652) l'a saturee en quelques trames — on
+     * ne pouvait donc PAS conclure « AAD n'est jamais ecrit », le journal etant
+     * tronque par l'instrument lui-meme. On journalise desormais chaque triplet
+     * (sens, PA, PC) UNE fois, puis on resume periodiquement. Rien n'est perdu :
+     * une premiere ecriture d'AAD, meme tardive, sortira toujours. */
+    {
+        struct seen { uint16_t pa, pc; uint8_t wr; unsigned long long n; };
+        static struct seen tab[64];
+        static int ntab = 0;
+        int i, found = -1;
+        for (i = 0; i < ntab; i++)
+            if (tab[i].pa == pa && tab[i].pc == pc && tab[i].wr == (write ? 1 : 0))
+                { found = i; break; }
+        if (found < 0) {
+            if (ntab < 64) { tab[ntab].pa = pa; tab[ntab].pc = pc;
+                             tab[ntab].wr = write ? 1 : 0; tab[ntab].n = 1;
+                             found = ntab++; }
+            fprintf(stderr, "[rhea-dma] XIO %s PA=0x%04x (+0x%02x) %s0x%04x PC=0x%04x "
+                    "— NOUVEAU site (acces DSP, canal cede par ALLOC_CONFIG)\n",
+                    write ? "PORTW" : "PORTR", pa, (unsigned)off,
+                    write ? "<- " : "-> ", val ? *val : 0, pc);
+        } else {
+            tab[found].n++;
+            if ((tab[found].n % 20000) == 0)
+                fprintf(stderr, "[rhea-dma] XIO %s PA=0x%04x PC=0x%04x : %llu passages "
+                        "(valeur courante 0x%04x)\n", write ? "PORTW" : "PORTR",
+                        pa, pc, tab[found].n, val ? *val : 0);
+        }
+    }
+    if (write) {
+        calypso_rhea_dma_write(NULL, off, *val, 2);
+    } else {
+        *val = (uint16_t)calypso_rhea_dma_read(NULL, off, 2);
+    }
+    return true;
 }

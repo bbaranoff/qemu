@@ -286,6 +286,12 @@ void calypso_tpu_run_scenario_regs(uint16_t *tpu_ram, C54xState *dsp,
  * qu'osmocom ne s'en sert pas). Le reste de la table (TINT=bit3, SPI=bit4/5,
  * DMA=bit14) reste confirme par ailleurs.
  *
+ * [2026-08-03, RESOLU PAR LE DOC] Cette deduction etait juste, et on a depuis
+ * trouve la table qui fait autorite : CAL207 §15.1 donne l'EMPLACEMENT de chaque
+ * vecteur en hexa (INT8n = 0x70 -> vec 28 -> bit 12) au lieu d'un ordre en prose
+ * a interpreter. AINT est en 0x64 -> vec 25 -> bit 9, et le bit 11 est INT7n =
+ * CYPHER — d'ou le fait qu'il ne soit jamais demasque. Voir calypso_c54x.h.
+ *
  * Defaut = 28. CALYPSO_TPU_DSP_FRAME_VEC reste disponible pour re-balayer, et
  * poser 27 reproduit l'observation ci-dessus (IT emise, jamais prise).
  *
@@ -296,7 +302,7 @@ void calypso_tpu_run_scenario_regs(uint16_t *tpu_ram, C54xState *dsp,
  * FAIT QUAND : `0x728a` s'execute sans CALYPSO_FORCE_VEC. */
 static void tpu_frame_irq_to_dsp(uint32_t fn)
 {
-    static int gate = -1, vec = 28;   /* INT8n — bit 12, cf. la mesure ci-dessus */
+    static int gate = -1, vec = C54X_IT_TPU_FRAME_VEC;   /* INT8n, CAL207 §15.1 */
 
     if (gate < 0) {
         gate = calypso_gate("CALYPSO_TPU_DSP_FRAME_IT", 0);
