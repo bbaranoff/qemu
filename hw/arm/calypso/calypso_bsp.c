@@ -902,8 +902,26 @@ static void bsp_replay_cb(void *opaque)
  * Returns number loaded, 0 on failure. */
 
 /* [2026-07-30] BSP_VEC30 — livrer sur le vecteur que le ROM a reellement cable.
- * Voir l'en-tete du patch : vec21 (BRINT0) et vec19 (INT3) sont des STUBS RETE dans
- * la table PDROM ; le chemin RX cable est vec30 -> FB 0x0158.
+ * Voir l'en-tete du patch : vec21 et vec19 sont des STUBS RETE dans la table PDROM ;
+ * le chemin RX cable est vec30 -> FB 0x0158.
+ *
+ * [2026-08-03] REQUALIFIE d'apres CAL000 (ti-calypso1.pdf) — CE N'EST PAS UNE
+ * BEQUILLE, c'est le cablage du silicium, et l'etiquette "BEQUILLE" du log etait
+ * FAUSSE :
+ *   §5.1  vec30 = INT10n = "DMA interrupt" (IMR bit 14).
+ *   §6    "The RIF-RX and RIF-TX have a dedicated channel each" (canal 1 = RIF_DMA_REQ_R).
+ *   §3.7.1 le DSP echange avec le RIF soit par XIO (mot a mot, IT par transfert),
+ *         soit par l'API "for radio data in DMA mode (buffered mode with data block
+ *         transfer)" ; "a DMA request and an 'end-DMA' request is sent to ARM".
+ * Donc : arrivee du burst RX -> canal DMA RIF-RX -> fin de transfert -> INT10n ->
+ * vec30 -> tremplin 0x0158. Router la livraison RX sur vec30 REPRODUIT cette chaine.
+ *
+ * En revanche les deux vecteurs de depart etaient faux : §5.1 donne vec21 = XINT =
+ * SPI TRANSMIT et vec19 = TINT = timer DSP. Ni l'un ni l'autre n'a jamais eu de
+ * rapport avec le RIF. Le vecteur de l'autre mode du §3.7.1 (XIO mot a mot) serait
+ * INT0n = "RIF receive interrupt" = bit 0 / vec 16 — que le modele n'emet nulle part,
+ * alors que l'IMR mesuree (0x52ed) a justement le bit 0 DEMASQUE.
+ *
  * Gate CALYPSO_BSP_VEC30 (defaut 0), CALYPSO_BSP_VEC30_ALSO_INT3 pour vec19. */
 static int calypso_bsp_vec30_on(void)
 {
@@ -911,9 +929,9 @@ static int calypso_bsp_vec30_on(void)
     if (c < 0) {
         c = calypso_gate("CALYPSO_BSP_VEC30", 0);
         if (c)
-            fprintf(stderr, "[bsp] BSP_VEC30=1 (BEQUILLE) : livraison RX routee de "
-                    "vec21/bit5 (STUB RETE dans le ROM) vers vec30/bit14 "
-                    "(flag 0x3fcf -> FB 0x0158, le tremplin RX du ROM)\n");
+            fprintf(stderr, "[bsp] BSP_VEC30=1 (CABLAGE FIDELE, CAL000 §5.1+§6+§3.7.1) : "
+                    "livraison RX routee de vec21/bit5 (= XINT/SPI transmit, stub RETE) "
+                    "vers vec30/bit14 (= INT10n/DMA, canal dedie RIF-RX -> FB 0x0158)\n");
     }
     return c;
 }

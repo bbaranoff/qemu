@@ -615,19 +615,28 @@ static void shunt_route_to_c54x_run(void)
             c54x_interrupt_ex(dsp, 28, 12);   /* scheduler frame IT, tick propre */
         else
             c54x_interrupt_ex(dsp, C54X_INT_FRAME_VEC, C54X_INT_FRAME_BIT);
-        /* [2026-07-23] TINT0 MASTER CLOCK sync frame : fire TINT0 vec20/bit4 au
-         * MEME tick TDMA (pas per-2000-insn). Handler 0x72d3 = driver slots op. */
+        /* [2026-07-23] TINT MASTER CLOCK sync frame : fire TINT au MEME tick TDMA
+         * (pas per-2000-insn). Handler 0x72d3 = driver slots op.
+         * [2026-08-03] CAL000 §5.1 : TINT = bit3/vec19, pas bit4/vec20 (= RINT/SPI
+         * receive). Bascule sous le sas CALYPSO_IT_TABLE_DOC, cf. calypso_c54x.c. */
         {
             /* @BEQUILLE — TINT0_MASTER (fire au frame-tick)  (CALYPSO_TINT0_MASTER, EXISTS,
              *              defaut OFF hors profil WIRE)
              *   masque  : la configuration/demarrage du TIMER0 par le ROM. Le firmware arrete
-             *             le timer (TSS=1) dans une init non-tournee ; on fabrique TINT0
-             *             (vec20/bit4) a la cadence trame.
+             *             le timer (TSS=1) dans une init non-tournee ; on fabrique TINT
+             *             a la cadence trame.
              *   retirer : quand la sequence d'init TIMER0 du ROM s'execute (TCR programme).
              */
             static int _t0m = -1;
             if (_t0m < 0) _t0m = calypso_gate("CALYPSO_TINT0_MASTER", 0);
-            if (_t0m) c54x_interrupt_ex(dsp, 20, 4);   /* TINT0 : vec20, IMR bit4 */
+            if (_t0m) {
+                static int _doc = -1;
+                if (_doc < 0) _doc = calypso_gate("CALYPSO_IT_TABLE_DOC", 0);
+                if (_doc)   /* §5.1 : TINT = IMR bit 3 / vec 19 */
+                    c54x_interrupt_ex(dsp, C54X_IT_TINT_VEC, C54X_IT_TINT_BIT);
+                else        /* legacy SPRU131 : en fait RINT / SPI receive */
+                    c54x_interrupt_ex(dsp, C54X_IT_SPI_RX_VEC, C54X_IT_SPI_RX_BIT);
+            }
         }
     }
     c54x_wake(dsp);

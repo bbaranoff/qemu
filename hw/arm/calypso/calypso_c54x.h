@@ -102,29 +102,95 @@
 /* Interrupt vectors */
 #define C54X_INT_RESET   0
 #define C54X_INT_NMI     1
-/* TMS320C54x interrupt mapping: vector = IMR_bit + 2
- * IMR bit 0 → INT0 → vec 2    IMR bit 5 → BRINT0 → vec 7
- * IMR bit 1 → INT1 → vec 3    IMR bit 6 → BXINT0 → vec 8
- * IMR bit 2 → INT2 → vec 4    IMR bit 7 → DMAC0  → vec 9
- * IMR bit 3 → INT3 → vec 5    IMR bit 8 → DMAC1  → vec 10
- * IMR bit 4 → TINT0→ vec 6    IMR bit 9 → INT4   → vec 11
- *                              IMR bit 10→ INT5   → vec 12 */
-/* TMS320C54x interrupt vector mapping (SPRU131):
- * Vec 0: RESET     Vec 16: INT0 (IMR bit 0)
- * Vec 1: NMI       Vec 17: INT1 (IMR bit 1)
- * Vec 2: SINT17    Vec 18: INT2 (IMR bit 2)
- * Vec 3: SINT18    Vec 19: INT3 (IMR bit 3)
- * Vec 4: SINT19    Vec 20: TINT0 (IMR bit 4)
- * Vec 5: SINT20    Vec 21: BRINT0 (IMR bit 5)
- * ...              Vec 22: BXINT0 (IMR bit 6)
- *                  Vec 23: DMAC0 (IMR bit 7)
- *                  Vec 24: DMAC1 (IMR bit 8)
- * Formula: vec = imr_bit + 16 */
-/* Calypso DSP firmware enables IMR bits 3 + 7 + upper (observed IMR=0xFF88).
- * Bit 3 = INT3 = vec 19 — this is the external frame-sync line from the TPU,
- * the only "frame" interrupt the firmware actually unmasks. Use it. */
-#define C54X_INT_FRAME_VEC   19  /* INT3 = vec (3+16) */
-#define C54X_INT_FRAME_BIT   3   /* IMR bit 3 */
+/* ============================================================================
+ * TABLE DES INTERRUPTIONS DU DSP CALYPSO — SOURCE : CAL000 §5.1 (ti-calypso1.pdf,
+ * « DSP INTERRUPTS », p.24). Ver 1.3, HERCROM400G2.
+ *
+ * [2026-08-03] CE BLOC REMPLACE LA TABLE SPRU131 QUI ÉTAIT ICI. C'ÉTAIT L'ERREUR
+ * SOURCE DE TOUTE LA CASCADE : SPRU131 décrit le TMS320C54x GÉNÉRIQUE, alors que
+ * le sous-chip DSP du Calypso (S28C128) a son propre mapping de périphériques.
+ * Les deux tables divergent à partir du bit 3 : le C54x générique a QUATRE lignes
+ * externes (INT0..INT3) avant TINT, le Calypso n'en a que TROIS (INT0n..INT2n).
+ * D'où un décalage de 1 sur tout le reste, et des noms faux (BRINT0/BXINT0/DMAC0
+ * n'existent pas sur Calypso).
+ *
+ * §5.1 : « The DSP subchip owns 17 interrupt lines with 11 of which INT0n to
+ * INT10n are dedicated for external peripherals. »
+ *
+ *  bit  vec  ligne     source (§5.1)
+ *  ---  ---  --------  ---------------------------------------------------------
+ *   0    16  INT0n     RIF receive interrupt          (niveau)
+ *   1    17  INT1n     RIF transmit interrupt         (niveau)
+ *   2    18  INT2n     UART interrupt                 (niveau)
+ *   3    19  TINT      Timer interrupts               ← PAS « INT3 »
+ *   4    20  RINT      SPI receive interrupt          ← PAS « TINT0 »
+ *   5    21  XINT      SPI transmit interrupt         ← PAS « BRINT0 »
+ *   6    22  INT3n     MCSI receive interrupt         (niveau)
+ *   7    23  INT4n     MCSI transmit interrupt        ← PAS « DMAC0 »
+ *   8    24  INT5n     MCSI frame duration error      (niveau)
+ *   9    25  INT6n     MCSI DAI interrupt             (niveau)
+ *  10    26  INT7n     CYPHER interrupts              (front)
+ *  11    27  INT8n     TPU FRAME interrupt            (front)
+ *  12    28  AINT      API interrupts (ARM ↔ DSP)
+ *  13    29  INT9n     TPU programmable interrupt     (front)
+ *  14    30  INT10n    DMA interrupt                  (niveau)
+ *       nMIN          Abort on Rhea bus OR INT4n redirection
+ *
+ * Formule inchangée et confirmée : vec = imr_bit + 16.
+ * Note §5.1 sur INT9n : « a facility offered to the DSP programmer in order to
+ * allow the generation of a DSP interrupt at a dedicated time with a quarter of
+ * GSM bit accuracy. The interrupt is set in a scenario by using a time-stamped
+ * instruction. » → c'est exactement le MOVE TPUI_DSP_INT_PG du séquenceur TPU.
+ *
+ * RECOUPEMENTS DE MESURE (ce qui rend la table crédible, pas seulement lue) :
+ *   • vec21 = XINT/SPI TX → périphérique inutilisé en L1 GSM, et le ROM y a bien
+ *     un stub RETE ; idem vec20 = RINT/SPI RX.
+ *   • vec28 = AINT et vec30 = INT10n/DMA : deux slots déjà mesurés dans le ROM.
+ *   • IMR mesurée 0x52ed → bits 0,2,3,5,6,7,9,12,14 = RIF RX, UART, TINT, SPI TX,
+ *     MCSI RX/TX, MCSI DAI, AINT, DMA. Un L1 GSM plausible.
+ *   • le ROM fait IMR |= 0x3000 = bits 12+13 = AINT + TPU programmable.
+ * ==========================================================================*/
+#define C54X_IT_RIF_RX_VEC     16   /* INT0n  RIF receive              */
+#define C54X_IT_RIF_RX_BIT      0
+#define C54X_IT_RIF_TX_VEC     17   /* INT1n  RIF transmit             */
+#define C54X_IT_RIF_TX_BIT      1
+#define C54X_IT_UART_VEC       18   /* INT2n  UART                     */
+#define C54X_IT_UART_BIT        2
+#define C54X_IT_TINT_VEC       19   /* TINT   timer DSP                */
+#define C54X_IT_TINT_BIT        3
+#define C54X_IT_SPI_RX_VEC     20   /* RINT   SPI receive              */
+#define C54X_IT_SPI_RX_BIT      4
+#define C54X_IT_SPI_TX_VEC     21   /* XINT   SPI transmit             */
+#define C54X_IT_SPI_TX_BIT      5
+#define C54X_IT_MCSI_RX_VEC    22   /* INT3n  MCSI receive             */
+#define C54X_IT_MCSI_RX_BIT     6
+#define C54X_IT_MCSI_TX_VEC    23   /* INT4n  MCSI transmit            */
+#define C54X_IT_MCSI_TX_BIT     7
+#define C54X_IT_CRYPT_VEC      26   /* INT7n  CYPHER                   */
+#define C54X_IT_CRYPT_BIT      10
+#define C54X_IT_TPU_FRAME_VEC  27   /* INT8n  TPU frame interrupt      */
+#define C54X_IT_TPU_FRAME_BIT  11
+#define C54X_IT_API_VEC        28   /* AINT   API (ARM ↔ DSP)          */
+#define C54X_IT_API_BIT        12
+#define C54X_IT_TPU_PROG_VEC   29   /* INT9n  TPU programmable         */
+#define C54X_IT_TPU_PROG_BIT   13
+#define C54X_IT_DMA_VEC        30   /* INT10n DMA                      */
+#define C54X_IT_DMA_BIT        14
+
+/* SAS — CALYPSO_IT_TABLE_DOC=1 : bascule les émetteurs d'IT encore câblés sur
+ * l'ancienne table SPRU131 vers la table §5.1 ci-dessus. Défaut 0 : comportement
+ * strictement inchangé, parce que ces émetteurs-là sont sur le chemin du shunt qui
+ * campe. Protocole : tester SOUS CHARGE (camp + LU + SMS), puis effacer LA
+ * CONDITION — pas le correctif. */
+
+/* ⚠ LEGACY — valeur MAL MAPPÉE, conservée le temps du sas ci-dessus.
+ * L'ancien commentaire disait « bit 3 = INT3 = la ligne frame-sync du TPU » :
+ * FAUX deux fois. Le bit 3 est TINT (le timer du DSP), et l'IT trame du TPU est
+ * INT8n = bit 11 = vec 27 (C54X_IT_TPU_FRAME_*). L'IMR 0xFF88 citée à l'appui
+ * n'est plus celle qu'on mesure (0x52ed). Utiliser C54X_IT_TPU_FRAME_* pour tout
+ * nouveau câblage. */
+#define C54X_INT_FRAME_VEC   19  /* LEGACY : en réalité TINT, pas l'IT trame  */
+#define C54X_INT_FRAME_BIT   3   /* LEGACY : voir C54X_IT_TPU_FRAME_BIT = 11 */
 #define C54X_NUM_INTS        16
 
 typedef struct C54xState {

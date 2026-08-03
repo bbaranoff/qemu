@@ -5441,6 +5441,35 @@ static bool calypso_fix_enabled(const char *name)
     return false;
 }
 
+/* [2026-08-03] CAL000 §5.1 : le TIMER du DSP est TINT = IMR bit 3 = vec 19.
+ * Le modele tirait sur vec20/bit4, qui est RINT = SPI RECEIVE. L'erreur vient de
+ * la table SPRU131 (C54x generique) qui etait dans calypso_c54x.h : elle a QUATRE
+ * lignes externes avant TINT, le Calypso n'en a que TROIS — d'ou un decalage de 1.
+ *
+ * SAS `CALYPSO_IT_TABLE_DOC` (defaut 0, comportement inchange) : ce site tourne sur
+ * le chemin du shunt qui campe, et la correction n'est PAS inerte. L'IMR mesuree
+ * (0x52ed) a le bit 3 DEMASQUE et le bit 4 MASQUE : aujourd'hui l'IT timer est
+ * silencieusement jetee par c54x_interrupt_ex (qui respecte l'IMR), demain elle
+ * sera reellement dispatchee sur vec19 a chaque underflow. Le handler ROM de vec19
+ * est un stub RETE, donc l'effet attendu est benin — mais « attendu » n'est pas
+ * « mesure », et la symetrie de pile RETE est deja un point sensible connu.
+ * PROTOCOLE : tester sous charge (camp + LU + SMS), puis effacer LA CONDITION. */
+static void c54x_fire_tint(C54xState *s)
+{
+    static int doc = -1;
+    if (doc < 0) {
+        doc = calypso_gate("CALYPSO_IT_TABLE_DOC", 0);
+        if (doc)
+            fprintf(stderr, "[c54x] IT_TABLE_DOC=1 : TINT emise sur vec%d/bit%d "
+                    "(CAL000 §5.1) au lieu de vec20/bit4 (= RINT/SPI receive)\n",
+                    C54X_IT_TINT_VEC, C54X_IT_TINT_BIT);
+    }
+    if (doc)
+        c54x_interrupt_ex(s, C54X_IT_TINT_VEC, C54X_IT_TINT_BIT);
+    else
+        c54x_interrupt_ex(s, C54X_IT_SPI_RX_VEC, C54X_IT_SPI_RX_BIT);  /* legacy */
+}
+
 static int c54x_exec_one(C54xState *s)
 {
     if (c54x_irq_level_check(s)) {
@@ -15715,10 +15744,10 @@ int c54x_run(C54xState *s, int n_insns)
                     if (_int0) {
                         static unsigned _n = 0;
                         if (_n++ < 40)
-                            fprintf(stderr, "[c54x] INTM_ACK TINT0 tick (vec20/bit4) "
+                            fprintf(stderr, "[c54x] INTM_ACK TINT tick "
                                     "IMR=0x%04x IFR=0x%04x insn=%u\n",
                                     s->imr, s->ifr, s->insn_count);
-                        c54x_interrupt_ex(s, 20, 4);   /* respecte l'IMR */
+                        c54x_fire_tint(s);   /* respecte l'IMR ; §5.1 : bit3/vec19 */
                     }
                     _busy = 0;
                 }
@@ -17382,7 +17411,7 @@ int c54x_run(C54xState *s, int n_insns)
                 /* [2026-07-23] fire crude per-2000-insn REMPLACE par sync frame-tick
                  * (dsp_shunt.c:430). Ce bloc desactive (garde pour A/B legacy). */
                 /* @BEQUILLE — TINT0_PERINSN  (CALYPSO_TINT0_PERINSN, EXISTS, defaut OFF)
-                 *   masque  : l'absence de base de temps DSP. Fire TINT0 (vec20/bit4) toutes les
+                 *   masque  : l'absence de base de temps DSP. Fire TINT toutes les
                  *             2000 insns, sans aucun rapport avec la cadence TDMA.
                  *   retirer : remplace par le tick TIMER0 fidele juste en dessous.
                  *   ATTENTION : le commentaire "Ce bloc desactive" est FAUX — le code est execute,
@@ -17390,7 +17419,7 @@ int c54x_run(C54xState *s, int n_insns)
                  */
                 if (getenv("CALYPSO_TINT0_PERINSN")) {
                     static unsigned _t0c = 0;
-                    if (++_t0c >= 2000) { _t0c = 0; c54x_interrupt_ex(s, 20, 4); }
+                    if (++_t0c >= 2000) { _t0c = 0; c54x_fire_tint(s); }
                 }
             }
             static int _tmr = -1;
@@ -17410,8 +17439,8 @@ int c54x_run(C54xState *s, int n_insns)
             /* [2026-07-23] TIMER0 FIDELE : le firmware arrete le timer (TCR TSS=1) dans
              * l'init op non-tournee. En mode TINT0_MASTER on modelise le ROM ayant
              * configure+demarre le timer : on tick malgre TSS. PRD non configure (0/0xFFFF
-             * reset) -> underflow ~65536 insns ~= frame TDMA (13MHz). Fire TINT0 vec20/bit4
-             * a l'underflow ; c54x_interrupt_ex RESPECTE l'IMR (pas de forcing IMR/IFR). */
+             * reset) -> underflow ~65536 insns ~= frame TDMA (13MHz). Fire TINT a
+             * l'underflow via c54x_fire_tint(), qui RESPECTE l'IMR (pas de forcing). */
             if (_t0master && s->data[PRD_ADDR] == 0) s->data[PRD_ADDR] = 0xFFFF;
             if (_tmr && (_t0master || !(s->data[TCR_ADDR] & TCR_TSS))) {
                 if (s->timer_psc == 0) {
@@ -17420,11 +17449,11 @@ int c54x_run(C54xState *s, int n_insns)
                         s->data[TIM_ADDR] = s->data[PRD_ADDR];
                         static unsigned _tn = 0;
                         if (_tn++ < 8)
-                            fprintf(stderr, "[c54x] DSP-TIMER TINT fire (vec20/bit4) "
+                            fprintf(stderr, "[c54x] DSP-TIMER TINT fire "
                                     "PRD=0x%04x TDDR=%u IMR=0x%04x INTM=%d insn=%u\n",
                                     s->data[PRD_ADDR], (unsigned)(s->data[TCR_ADDR] & TCR_TDDR_MASK),
                                     s->imr, (s->st1 & ST1_INTM) ? 1 : 0, s->insn_count);
-                        c54x_interrupt_ex(s, 20, 4);   /* TINT : vec20, IMR bit4 */
+                        c54x_fire_tint(s);   /* §5.1 : TINT = bit3/vec19 */
                     } else {
                         s->data[TIM_ADDR]--;
                     }
