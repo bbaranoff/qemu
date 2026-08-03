@@ -346,9 +346,25 @@ static void shunt_latch_task(uint16_t new_d_dsp_page)
     if (g_shunt.d_task_md == PM_DSP_TASK)
         shunt_dispatch_pm(page_idx);
 
-    SHUNT_LOG("LATCH page=%u task_md=%u task_d=%u task_u=%u task_ra=%u fn=%u\n",
-        page_idx, g_shunt.d_task_md, g_shunt.d_task_d, g_shunt.d_task_u,
-        g_shunt.d_task_ra, g_shunt.d_fn);
+    /* [2026-08-03] meme traitement que DISPATCH SB : on n'imprime que les
+     * changements. 2 554 lignes sur 20 000 pour un contenu qui ne bouge pas. */
+    {
+        static uint32_t l_key = 0xFFFFFFFFu; static unsigned long long rep = 0;
+        uint32_t key = ((uint32_t)page_idx << 24)
+                     ^ ((uint32_t)g_shunt.d_task_md << 16)
+                     ^ ((uint32_t)g_shunt.d_task_d  << 8)
+                     ^ ((uint32_t)g_shunt.d_task_u)
+                     ^ ((uint32_t)g_shunt.d_task_ra << 12);
+        if (key != l_key) {
+            if (rep) SHUNT_LOG("LATCH × %llu (identique, non repete)\n", rep);
+            l_key = key; rep = 0;
+            SHUNT_LOG("LATCH page=%u task_md=%u task_d=%u task_u=%u task_ra=%u fn=%u\n",
+                page_idx, g_shunt.d_task_md, g_shunt.d_task_d, g_shunt.d_task_u,
+                g_shunt.d_task_ra, g_shunt.d_fn);
+        } else if (++rep % 2000 == 0) {
+            SHUNT_LOG("LATCH × %llu (identique, fn=%u)\n", rep, g_shunt.d_fn);
+        }
+    }
 }
 
 /* ---- Canned tuning ----

@@ -61,9 +61,29 @@ void calypso_fbsb_reset(CalypsoFbsb *s)
 void calypso_fbsb_on_dsp_task_change(CalypsoFbsb *s, uint16_t d_task_md,
                                      uint64_t fn)
 {
-    fprintf(stderr, "[calypso-fbsb] on_dsp_task_change task=%u fn=%lu state=%d\n",
-            d_task_md, (unsigned long)fn, s ? (int)s->state : -1);
-    fflush(stderr);
+    /* [2026-08-03] DEDUPE — meme motif que DISPATCH SB et LATCH : 2 554 lignes
+     * sur 20 000, pour une tache et un etat qui ne changent pas d'une trame a
+     * l'autre. On n'imprime que les transitions (c'est tout l'interet de la
+     * sonde : voir la tache CHANGER) plus un resume periodique. Le `fflush`
+     * par ligne coutait en plus a chaque appel. */
+    {
+        static uint32_t l_key = 0xFFFFFFFFu; static unsigned long long rep = 0;
+        uint32_t key = ((uint32_t)d_task_md << 8) ^ (uint32_t)(s ? s->state : 0xFF);
+        if (key != l_key) {
+            if (rep)
+                fprintf(stderr, "[calypso-fbsb] on_dsp_task_change × %llu "
+                        "(identique, non repete)\n", rep);
+            l_key = key; rep = 0;
+            fprintf(stderr, "[calypso-fbsb] on_dsp_task_change task=%u fn=%lu state=%d\n",
+                    d_task_md, (unsigned long)fn, s ? (int)s->state : -1);
+            fflush(stderr);
+        } else if (++rep % 2000 == 0) {
+            fprintf(stderr, "[calypso-fbsb] on_dsp_task_change × %llu "
+                    "(task=%u state=%d, fn=%lu)\n",
+                    rep, d_task_md, s ? (int)s->state : -1, (unsigned long)fn);
+            fflush(stderr);
+        }
+    }
     if (!s) return;
     switch (d_task_md) {
     case DSP_TASK_FB:

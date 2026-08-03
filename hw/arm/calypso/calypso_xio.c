@@ -148,23 +148,38 @@ bool calypso_xio_misc(bool write, uint16_t pa, uint16_t *val, uint16_t pc)
         return true;
     }
 
-    uint16_t before = bank[off];
     bank[off] = *val;
 
     char b[24];
     bits16(*val, b);
-    static unsigned nw = 0;
-    bool notable = (before != *val);
-    if (notable || nw < 30) {
-        nw++;
+    /* [2026-08-03] DEDUPE — la v1 journalisait « toute écriture dont la valeur
+     * diffère de la précédente ». Or le firmware fait BASCULER API_CONF entre
+     * 0x0002 (HOM) et 0x0000 (SAM) à CHAQUE TRAME : chaque écriture différait
+     * donc de la précédente, et la condition était toujours vraie. Résultat
+     * mesuré : 2 238 lignes sur 20 000, soit 11 % du journal QEMU, pour deux
+     * valeurs qui alternent. On dédoublonne sur le triplet (registre, valeur,
+     * PC) : chaque combinaison sort UNE fois, puis un résumé périodique. */
+    static struct { uint16_t pa, val, pc; unsigned long long n; } seen[32];
+    static int nseen = 0;
+    int i, k = -1;
+    for (i = 0; i < nseen; i++)
+        if (seen[i].pa == pa && seen[i].val == *val && seen[i].pc == pc) { k = i; break; }
+    if (k >= 0) {
+        if (++seen[k].n % 5000 == 0)
+            fprintf(stderr, "[xio] %s PA=0x%04x <- 0x%04x PC=0x%04x × %llu\n",
+                    nom, pa, *val, pc, seen[k].n);
+        return true;
+    }
+    if (nseen < 32) { seen[nseen].pa = pa; seen[nseen].val = *val;
+                      seen[nseen].pc = pc; seen[nseen].n = 1; nseen++; }
+    {
         if (is_apic) {
             fprintf(stderr, "[xio] API_CONF PORTW PA=0x%04x <- 0x%04x [%s] "
                     "API_HOM=%d(%s) BRIDGE_CLK_EN=%d PC=0x%04x%s\n",
                     pa, *val, b, !!(*val & APIC_HOM),
                     (*val & APIC_HOM) ? "HOM: API reservee ARM/DMA"
                                       : "SAM: acces partage",
-                    !!(*val & APIC_BRIDGE_CLK_EN), pc,
-                    notable ? "" : " (repetition)");
+                    !!(*val & APIC_BRIDGE_CLK_EN), pc);
         } else {
             if (off == INTH_CNTRL_REG) {
                 fprintf(stderr, "[xio] *** INTH CNTRL_REG <- 0x%04x [%s] : canaux en "

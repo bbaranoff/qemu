@@ -458,9 +458,29 @@ void shunt_dispatch_sb(uint8_t page_idx)
     /* Ack on read page. */
     shunt_write_w(rp + RP_D_TASK_MD, SB_DSP_TASK);
 
-    SHUNT_LOG("DISPATCH SB page=%u → sb=0x%08x BSIC=%u FN=%u %s TOA=%d\n",
-        page_idx, sb, bsic, fn,
-        g_shunt.sb_valid ? "(gr-gsm REEL)" : "(canned legacy)", shunt_toa_val());
+    /* [2026-08-03] DEDUPE. Cette ligne pesait 62 % du journal QEMU (12 421 sur
+     * 20 000 lignes releves), pour 55 ko/s au total : tmux, qui est mono-thread,
+     * passait son temps a la rendre et le defilement devenait pateux.
+     *
+     * Le contenu est IDENTIQUE d'une trame a l'autre — c'est le meme SB republie
+     * (cf. la note « fraicheur de la SB » plus haut : ~10 rejeux par SCH). On
+     * n'imprime donc que ce qui CHANGE, plus un resume periodique pour garder la
+     * cadence visible. Aucune information n'est perdue : chaque SB distinct
+     * sort toujours. Diagnostic seul, zero effet sur le comportement. */
+    {
+        static uint32_t l_sb = 0xFFFFFFFFu; static uint8_t l_bsic = 0xFF;
+        static uint32_t l_fn = 0xFFFFFFFFu; static unsigned long long rep = 0;
+        if (sb != l_sb || bsic != l_bsic || fn != l_fn) {
+            if (rep)
+                SHUNT_LOG("DISPATCH SB × %llu (identique, non repete)\n", rep);
+            rep = 0; l_sb = sb; l_bsic = bsic; l_fn = fn;
+            SHUNT_LOG("DISPATCH SB page=%u → sb=0x%08x BSIC=%u FN=%u %s TOA=%d\n",
+                page_idx, sb, bsic, fn,
+                g_shunt.sb_valid ? "(gr-gsm REEL)" : "(canned legacy)", shunt_toa_val());
+        } else if (++rep % 2000 == 0) {
+            SHUNT_LOG("DISPATCH SB × %llu (meme SB rejoue, FN=%u)\n", rep, fn);
+        }
+    }
 }
 
 void shunt_dispatch_allc(uint8_t page_idx)
