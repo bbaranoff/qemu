@@ -17524,6 +17524,87 @@ int c54x_run(C54xState *s, int n_insns)
             static int _fr = -1;
             if (_fr < 0) _fr = calypso_gate("CALYPSO_FBROUTE", 0);
             if (_fr) {
+                {   /* ─────────────────────────────────────────────────────────
+                     * [2026-08-03] FBGATE-TRACE — le dernier verrou, pas a pas.
+                     *
+                     * OU ON EN EST. Depuis que le DMA livre les echantillons, la
+                     * routine FB s'execute (elle n'etait JAMAIS entree avant) et la
+                     * machine a etats `@0x7e` avance 0 -> 1 -> 2 -> 3. Le scan du
+                     * ROM donne les CINQ seuls ecrivains de cette cellule :
+                     *     0x77a8 ST #1   0x77ae ST #2   0x77b4 ST #3
+                     *     0x795d ST #4   <- le seul qui satisferait la garde 0x79e3
+                     * Les quatre premiers sont MESURES (FBCNT-WR). `0x795d` ne l'est
+                     * jamais : le high-water plafonne a `0x794e`, quinze mots avant.
+                     *
+                     * CE QU'IL Y A EN 0x794e (dump ROM) :
+                     *     0x7949 f310 0005   SUB #5
+                     *     0x794b 6ff8 0c3d   acces absolu a data[0x0c3d]
+                     *     0x794e fc47        RETOUR CONDITIONNEL — toujours pris
+                     * La routine ne manque pas de donnees : elle DECIDE de sortir.
+                     *
+                     * ⚠️ POURQUOI UNE SONDE ET PAS UN DESASSEMBLAGE. Je lis `0xfc47`
+                     * comme un retour conditionnel par analogie avec `0xfc00` (RET) et
+                     * `0xfc45` vu dans le dispatcher juste avant ; et `6ff8 0c3d` comme
+                     * un acces absolu. Ces DEUX lectures sont des hypotheses. Decoder
+                     * des conditions a la main est exactement ce qui a produit 3
+                     * fausses pistes sur 3 le 30/07. On mesure le chemin REEL et les
+                     * drapeaux ; la conclusion sortira du run.
+                     *
+                     * A LIRE : si l'execution passe 0x794e une seule fois, la
+                     * condition n'est pas constante et il faudra correler. Si elle
+                     * sort a chaque passage, les drapeaux (TC/C) et data[0x0c3d]
+                     * diront laquelle. `data[0x0c3d]` n'est PAS dans la plage que le
+                     * DMA remplit (0x0cce..0x0cce+296) — 145 mots avant. */
+                    if (exec_pc >= 0x7944 && exec_pc <= 0x7962) {
+                        static unsigned _n = 0;
+                        if (_n < 120) {
+                            _n++;
+                            fprintf(stderr,
+                                    /* [2026-08-03] AR4 ajoute — c'est LUI qui decide.
+                                     * Desassemblage croise (table binutils + tic54x-dis) :
+                                     *     0x7944 add *AR4, A ; 0x7945 sub #2, A
+                                     *     0x794e rc ALEQ      (retour si A <= 0)
+                                     * Mesure : *AR4 donne 1 puis 2 (mot haut), donc
+                                     * A = -1 puis 0 -> la garde sort a chaque fois.
+                                     * Il faut *AR4 > 2. Ressemble a un compteur de
+                                     * correlations qui doit depasser un seuil de 2 :
+                                     * le DSP detecte quelque chose, pas assez.
+                                     * On imprime le POINTEUR et la CELLULE pointee —
+                                     * la question est desormais « qui remplit ce
+                                     * tampon », pas « que vaut la condition ».
+                                     * ⚠️ J'ai d'abord ecrit que la condition ne
+                                     * dependait pas du signal : FAUX, *AR4 varie. */
+                                    "[c54x] FBGATE pc=0x%04x op=0x%04x A=0x%06llx "
+                                    "B=0x%06llx TC=%d C=%d AR4=0x%04x *AR4=0x%04x "
+                                    "(data[]=0x%04x) data[0x0c3d]=0x%04x "
+                                    "data[0x41fe]=0x%04x insn=%u\n",
+                                    exec_pc, prog_fetch(s, exec_pc),
+                                    (unsigned long long)(s->a & 0xFFFFFFULL),
+                                    (unsigned long long)(s->b & 0xFFFFFFULL),
+                                    (s->st0 >> 12) & 1, (s->st0 >> 11) & 1,
+                                    /* [2026-08-03] CORRIGE : la v1 lisait
+                                     * `s->data[AR4]`. FAUX pour toute adresse de la
+                                     * fenetre API — le DSP y lit `api_ram[]`, un
+                                     * AUTRE tableau (cf. data_read_locked). AR4 vaut
+                                     * 0x0cd0, donc en pleine fenetre API et en plein
+                                     * tampon DMA : la v1 affichait 0x0000 alors que
+                                     * la cellule est alimentee. C'est EXACTEMENT le
+                                     * defaut corrige le matin meme pour FORCE_TASK,
+                                     * reproduit dans mon propre instrument. On
+                                     * imprime les DEUX vues pour que la divergence
+                                     * reste visible au lieu d'etre supposee. */
+                                    s->ar[4],
+                                    (s->api_ram && s->ar[4] >= C54X_API_BASE &&
+                                     s->ar[4] < C54X_API_BASE + C54X_API_SIZE)
+                                        ? s->api_ram[s->ar[4] - C54X_API_BASE]
+                                        : s->data[s->ar[4]],
+                                    s->data[s->ar[4]],
+                                    s->data[0x0c3d], s->data[0x41fe],
+                                    s->insn_count);
+                            fflush(stderr);
+                        }
+                    }
+                }
                 static unsigned _in = 0, _hi = 0, _n76fb = 0;
                 if (exec_pc >= 0x7700 && exec_pc <= 0x79f0) {
                     _in++;
