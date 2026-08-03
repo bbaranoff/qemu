@@ -175,7 +175,7 @@ bool calypso_xio_misc(bool write, uint16_t pa, uint16_t *val, uint16_t pc)
     {
         if (is_apic) {
             fprintf(stderr, "[xio] API_CONF PORTW PA=0x%04x <- 0x%04x [%s] "
-                    "API_HOM=%d(%s) BRIDGE_CLK_EN=%d PC=0x%04x%s\n",
+                    "API_HOM=%d(%s) BRIDGE_CLK_EN=%d PC=0x%04x\n",
                     pa, *val, b, !!(*val & APIC_HOM),
                     (*val & APIC_HOM) ? "HOM: API reservee ARM/DMA"
                                       : "SAM: acces partage",
@@ -184,9 +184,9 @@ bool calypso_xio_misc(bool write, uint16_t pa, uint16_t *val, uint16_t pc)
             if (off == INTH_CNTRL_REG) {
                 fprintf(stderr, "[xio] *** INTH CNTRL_REG <- 0x%04x [%s] : canaux en "
                         "FRONT =", *val, b);
-                for (int i = 0; i <= 11; i++)
-                    if (*val & (1u << i))
-                        fprintf(stderr, " INT%dn", i);
+                for (int ch = 0; ch <= 11; ch++)
+                    if (*val & (1u << ch))
+                        fprintf(stderr, " INT%dn", ch);
                 fprintf(stderr, " ; INT4_switch=%d (%s) PC=0x%04x\n",
                         !!(*val & INTH_INT4_SWITCH),
                         (*val & INTH_INT4_SWITCH) ? "canal 4 -> nNMI"
@@ -195,9 +195,9 @@ bool calypso_xio_misc(bool write, uint16_t pa, uint16_t *val, uint16_t pc)
             } else {
                 fprintf(stderr, "[xio] *** INTH CLEAR_REG <- 0x%04x [%s] : efface les "
                         "canaux", *val, b);
-                for (int i = 0; i <= 11; i++)
-                    if (*val & (1u << i))
-                        fprintf(stderr, " INT%dn", i);
+                for (int ch = 0; ch <= 11; ch++)
+                    if (*val & (1u << ch))
+                        fprintf(stderr, " INT%dn", ch);
                 fprintf(stderr, " PC=0x%04x\n", pc);
             }
         }

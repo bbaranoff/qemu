@@ -15,6 +15,96 @@
 
 ---
 
+---
+
+# MISE A JOUR 2026-08-03 — la chaine RX est saine, le blocage est en amont
+
+> Statut de reference : `doc/ETAT_ACTUEL.md` **§13** (prime sur la §12).
+> Documents materiels acquis ce jour : `doc/ti-calypso1.pdf` (CAL000) et
+> `doc/ti-calypso2.pdf` (CAL207), index dans `doc/DOC_TI_INDEX.md`.
+>
+> **CE QUI CHANGE POUR LA SUITE DU TODO** : la §2 (chaine FB, « le maillon
+> manquant est l'invocation du slot 30 ») est **PERIMEE**. Il n'y a pas de maillon
+> manquant : la chaine RX complete existe dans le ROM, elle est saine, et elle
+> n'est jamais demandee. Ne pas repartir de la §2 sans lire d'abord la §13.
+
+## A. LE SEUL VERROU RESTANT — pourquoi `d_fb_det` n'est jamais publie
+
+**Ce qu'il faut faire.** Resoudre l'adresse reelle de `@0x7e` et observer sa valeur.
+
+```
+0x79e0  ld  @0x7e, A
+0x79e1  sub #0x0004, A
+0x79e3  rc  ANEQ                 ; retourne si data[@0x7e] != 4
+0x79e4  orm *(0x08f8), #0x0001   ; sinon : d_fb_det = 1
+```
+
+**Pourquoi.** C'est le dernier maillon non explique. Tout l'aval est verifie sain
+(§13.2) et n'attend que cette publication : pas de `d_fb_det` -> la L1 reste en
+synchro -> elle ne commande jamais de reception (`d_task_d` = 0, 913 fois mesure)
+-> l'armement RX (index 41) n'est jamais dispatche.
+
+**Comment on saura que c'est fait.** Une sonde imprime, a chaque passage en
+`0x79e3`, la valeur de DP, l'adresse effective, et le contenu de la cellule. On
+saura alors si la condition `==4` est proche d'etre remplie ou jamais approchee.
+
+**Piege.** `@0x7e` est un adressage DIRECT relatif a DP : l'adresse n'est PAS
+`0x007e`. Ne pas sonder `data[0x007e]` en croyant sonder le gate — c'est
+exactement le type d'erreur qui a coute trois iterations le 03/08 (§13.6).
+
+## B. Retirer les gates devenus inutiles
+
+`CALYPSO_BSP_RX_VEC` et `CALYPSO_BSP_VEC30` injectent une interruption de
+reception que le firmware **masque par conception** (`RINT_MASK`/`RDMA_MASK`
+restent a 1, le RX du DSP est du polling). Ils n'ont plus d'objet.
+
+**Comment on saura que c'est fait.** Ils ne figurent plus au manifeste et
+`doc/VARIABLES_ENVIRONNEMENT.md` ne les liste plus.
+
+## C. Sas a vider — `CALYPSO_IT_TABLE_DOC`
+
+Le correctif TINT (bit3/vec19 au lieu de bit4/vec20) attend une validation SOUS
+CHARGE (camp + LU + SMS). Non inerte : l'IMR mesuree a le bit 3 demasque et le
+bit 4 masque, donc l'IT passe de « jetee » a « dispatchee ».
+
+**Comment on saura que c'est fait.** Un run de charge complet sans regression ->
+on efface **la condition**, pas le correctif (protocole `fixes.env`).
+
+## D. Arbitrage SAM/HOM — decider
+
+**MESURE** : le firmware bascule `API_HOM` (XIO:F900 bit1) a **chaque trame**. En
+HOM, le DSP n'a normalement plus acces a la fenetre API (CAL000 §7.2.1). Le modele
+l'ignore : les deux cotes ecrivent sans arbitre.
+
+`CALYPSO_API_HOM_WATCH=1` (defaut) compte les ecritures DSP pendant HOM sans rien
+changer. Si le compteur est non nul, `CALYPSO_API_HOM_STRICT=1` les abandonne —
+c'est un vrai changement de comportement, a valider sous charge.
+
+**Candidat d'explication** pour les ecrasements de page R deja documentes.
+
+## E. Implementer le transfert DMA — SEULEMENT si A debloque
+
+`calypso_rhea_dma.c` enregistre et journalise mais **n'execute aucun transfert**.
+Le jour ou `DMA2_AAD` est reellement ecrit (donc apres A), il faudra lire `DRR` en
+boucle vers l'API, poser `IRQ_STATE` et lever `INT10n` si `IRQ_MODE` le demande.
+C'est un changement de nature : d'instrument a piece de materiel. Ne pas le faire
+avant, il n'y aurait rien a transferer.
+
+## F. Le mode « signal synthetique » (idee reprise du fork DCT3)
+
+`nokia-dct3-emulator` fabrique la porteuse cote hote : tonalite FCCH, burst SB
+reellement code puis module en GMSK au bon FN/BSIC, bloc BCCH. Le DSP demodule
+donc une onde vraie, sans SDR ni derive.
+
+**Pourquoi ca vaut le coup.** Il manque un mode entre le shunt (le DSP ne fait
+rien) et le natif (le DSP doit tout faire avec une chaine RF incertaine). Avec un
+signal parfait et connu, un echec devient imputable au DSP sans discussion.
+
+**Comment on saura que c'est fait.** Un profil `synth` injecte par
+`c54x_bsp_load()`, sans toucher au shunt ni au natif.
+
+---
+
 ## 0. ⚠️ LE RENDU DU DÉSASSEMBLEUR EST LE PREMIER PRODUCTEUR D'ERREURS DU PROJET
 
 **Devant le DSP lui-même.** Le 30/07, **3 fausses pistes sur 3** viennent de là, pas

@@ -1,7 +1,7 @@
 # ETAT ACTUEL — QEMU-Calypso (source de verite unique)
 
-> Document de reference courant. Ancre sur les mesures du **2026-07-30** (§12,
-> qui PRIME sur la §11 et sur tout le reste).
+> Document de reference courant. Ancre sur les mesures du **2026-08-03** (§13,
+> qui PRIME sur la §12 et sur tout le reste).
 > **Regle de resolution de conflit :** ce document prime sur tout fait extrait d'un autre
 > doc. Le STATUT DEPEND DU MODE : ne jamais citer un statut sans le mode. Toute
 > affirmation technique doit nommer son INSTRUMENT. Les autres documents sont dans
@@ -9,6 +9,132 @@
 >
 > Convention de marquage utilisee partout ci-dessous : **MESURE** (instrument nomme),
 > **HYPOTHESE** (testable, non tranchee), **INVALIDE** (mesure contraire, cf. §8).
+
+---
+
+## 13. ETAT AU 2026-08-03 — la chaine RX est SAINE ; le blocage est en amont
+
+> Cette section PRIME sur la §12 et sur toutes les precedentes. Chaque fait nomme
+> son instrument. Toute affirmation sans instrument est une HYPOTHESE, y compris
+> si elle vient de moi.
+>
+> **Documents materiels acquis ce jour** : `doc/ti-calypso1.pdf` (CAL000, spec
+> systeme) et `doc/ti-calypso2.pdf` (CAL207, Register Mapping). Index et carte
+> section->code : `doc/DOC_TI_INDEX.md`. Ils PRIMENT sur tout commentaire du code.
+
+### 13.1 CONCLUSION PRINCIPALE — rien n'est casse, rien n'est demande
+
+**MESURE** (moniteur mailbox, run `native_twl`, journal de 16 Mo) :
+
+| cellule | ecritures ARM | valeurs |
+|---|---|---|
+| `d_task_d` (reception descendante / NB) | 913 | **toujours 0x0000** |
+| `d_task_u` (montante) | 0 | jamais ecrite |
+| `d_task_ra` (RACH) | 0 | jamais ecrite |
+| `d_task_md` (FB/SB/PM) | 70 | 0x0001 x14, 0x0005 x28, 0x0006 x28 |
+
+**L'ARM ne commande QUE des taches FB/SB/PM.** La file de taches du DSP recoit donc
+5720 fois le meme handler `0xb5a1` (index 37) et **jamais** l'index 41 (`0xa5cd`,
+l'armement RX). Le DSP se comporte correctement : il n'arme pas un recepteur qu'on
+ne lui demande pas d'armer.
+
+**Cause amont** : `fb0_att=22, fb0_ret=0` (sonde `[fbsb]`). La L1 est encore en
+phase de SYNCHRONISATION et ne commandera de reception qu'apres detection de la FB.
+Dependance circulaire : pas de FB -> pas de commande RX -> pas d'armement.
+
+### 13.2 LA CHAINE RX, CARTOGRAPHIEE ET VERIFIEE SAINE
+
+Instrument : `CALYPSO_DISPATCH_PROBE=1` (lecture seule, `calypso_c54x.c`).
+
+```
+boucle principale  0xa4ca : ssbx INTM ; call 0xaad5 ; bc AEQ ; calad A ; b 0xa4ca
+selecteur          0xaad5 : depilement d'un anneau de 14  (r=data[0x434e] w=data[0x434f])
+empilement         0xaac3 : 39 appelants ; handler dans A ; debordement -> d[0x3f92] bit5
+helper index       0xa9ea : add #0x4387,A ; stlm AR7 ; ld *AR7,A ; BACC A
+table              program[0xaae7..0xab34] -> data[0x4387..0x43d4], copiee par 0xb4b6
+armement RX        index 41 = data[0x43b0] = 0xa5cd
+desarmement        index 42 = data[0x43b1] = 0xa62e
+```
+
+`0xa5cd` fait **les deux choses** qu'on cherchait separement depuis des semaines :
+installe le tremplin `data[0x0158..0x015b]` (`call 0x7242`) ET programme
+`DMA2_AAD`/`ALGTH`/`CTRL` avec `ENABLE=1` (`sub #0x0800,A` = mot DSP -> offset API,
+CAL207 §11.3.3). Quatre sites la demandent : `0xb220`, `0xb2b4`, `0xb330`, `0xb35d`,
+tous par `ld #0x29,A ; call 0xa9ea`. **MESURE : aucun n'est atteint.**
+
+**Verifie sain et simplement inactif** : le RIF (suit le protocole RRST du §12.6 a
+la lettre, sequence a deux ecritures a chaque trame), le DMA (canaux RIF cedes au
+DSP par `ALLOC_CONFIG=0x000C`, `DMA2_RAD=0x7002` = l'adresse de `DRR`), la table
+(copiee, `data[0x43b0]=0xa5cd` verifie a l'execution), la file (empilee 5720 fois,
+consommee a chaque tour, `r==w` a chaque empilement).
+
+### 13.3 PISTES ELIMINEES PAR LA MESURE
+
+| piste | verdict | instrument |
+|---|---|---|
+| `data[0x43d8]` = « qui publie le handler courant » | **INVALIDE** — un seul ecrivain (`0xbb00`) qui y range l'**immediat** `0xab38` ; le dispatcher `0xb01c/0xb01e` qui le lit est mort par construction | watch d'ecriture sur la cellule |
+| `0x79e4` publie `data[0x43d8]` | **INVALIDE** — il publie `d_fb_det` (`data[0x08f8] \|= 1`) | desassemblage |
+| `data[0x435e]` bit13 = verrou de config DMA | **INVALIDE** — vaut 0, ne coupe rien | sonde `[dispatch]` |
+| « aucun chemin materiel de livraison du burst » | **INVALIDE** — le chemin existe, complet, dans le ROM | desassemblage `0xa5cd` |
+| AINT (`vec28/bit12`) = voie de signalisation ARM->DSP | **INVALIDE** — `REG_API_CONTROL`/`APIC_W_DSPINT` sont definis et **jamais utilises** dans osmocom-bb (1 seul hit = le `#define`) | grep firmware |
+
+### 13.4 LE SEUL VERROU RESTANT
+
+```
+0x79e0  ld  @0x7e, A
+0x79e1  sub #0x0004, A
+0x79e3  rc  ANEQ                 ; retourne si data[@0x7e] != 4
+0x79e4  orm *(0x08f8), #0x0001   ; sinon : d_fb_det = 1
+```
+
+`d_fb_det` n'est publie que si `data[@0x7e] == 4`. **HYPOTHESE non tranchee** :
+`@0x7e` est adresse par DP, donc l'adresse reelle depend de DP au passage — a
+resoudre par sonde, pas au desassembleur.
+
+### 13.5 TABLE D'INTERRUPTIONS DU DSP — corrigee deux fois
+
+`calypso_c54x.h` portait la table **SPRU131 du C54x GENERIQUE**. Le sous-chip du
+Calypso a son propre mapping : CAL000 §5.1 donne la liste, **CAL207 §15.1 donne
+les emplacements en hexa** et fait autorite (`vec = Location/4`).
+
+Correction finale : bit3=TINT, bit4=RINT/SPI rx, bit5=XINT/SPI tx, bit6=INT4n,
+bit7=INT5n, bit8=INT3n, **bit9=AINT**, bit10=INT6n, bit11=INT7n/CYPHER,
+**bit12=INT8n/IT trame TPU**, bit13=INT9n/TPU prog, bit14=INT10n/DMA.
+
+**MESURE de recoupement** : l'IMR du ROM (0x52ef) ouvre exactement bits
+0,1,2,3,5,6,7,9,12,14 = RIF rx+tx, UART, timer, SPI tx, MCSI, **AINT**, **IT trame**,
+DMA. Et le firmware ecrit `0x0380` dans `CNTRL_REG` (XIO:FA00) = canaux 7,8,9 en
+FRONT, exactement les trois que le §15.1 marque « edge ».
+
+### 13.6 LECON DE METHODE — 3 erreurs identiques dans la journee
+
+1. viser l'**operande** au lieu de l'instruction (`0xb0f1`/`0xb0ff` au lieu des
+   `add #0x4387` ; `0xbb01` au lieu de `0xbb00`) ;
+2. tracer `cala` (0xF4E3) au lieu de la **classe** des transferts calcules
+   (`bacc` 0xF4E2, `baccd` 0xF6E2, `cala` 0xF4E3, `calad` 0xF6E3, bit8 = A ou B) ;
+3. prendre `0xa9ea` pour LE dispatcher alors que c'est un helper index->handler ;
+   le vrai selecteur est `0xaad5`, appele par la boucle `0xa4ca`.
+
+**A chaque fois la correction est venue d'ELARGIR l'instrument, jamais de
+l'ajuster.** Regle : sonder la CLASSE du phenomene, pas le cas attendu. Et
+surveiller une CELLULE plutot qu'un PC quand c'est possible — c'est insensible aux
+erreurs d'adresse.
+
+### 13.7 CE QUI A CHANGE DANS LE MODELE (tout compile, defauts inchanges)
+
+| module | apport | gate |
+|---|---|---|
+| `calypso_rif.c` (nouveau) | registres RIF vus du DSP (CAL207 §12) : DXR/DRR/SPCX/SPCR, FIFO, reset RRST | `CALYPSO_RIF_XIO`, defaut 1 |
+| `calypso_rhea_dma.c` (nouveau) | controleur DMA RHEA (§11), MCU **et** bus DSP (pont XIO) ; enregistre et journalise, **n'execute aucun transfert** | `CALYPSO_RHEA_DMA`, defaut 1 |
+| `calypso_xio.c` (nouveau) | `API_CONF` @F900 (§9.1) et INTH du DSP @FA00 (§15.2) | `CALYPSO_XIO_MISC`, defaut 1 |
+| `calypso_c54x.c` | `PORTR`/`PORTW` routes vers ces trois blocs (etaient des **no-op**) ; sonde DISPATCH-PROBE | `CALYPSO_DISPATCH_PROBE`, defaut 0 |
+| `calypso_c54x.h` | table d'IT refaite sur CAL207 §15.1 | — |
+| arbitrage SAM/HOM | observation des ecritures DSP dans l'API pendant HOM | `CALYPSO_API_HOM_WATCH`=1, `_STRICT`=0 |
+
+**MESURE annexe** : le firmware bascule `API_HOM` (XIO:F900 bit1) **a chaque trame**
+— l'API passe en HOM puis revient en SAM. Le modele n'a aucune notion de cet
+arbitrage ; en HOM le DSP n'a normalement plus acces a la fenetre API (CAL000
+§7.2.1). Effet non evalue.
 
 ---
 
