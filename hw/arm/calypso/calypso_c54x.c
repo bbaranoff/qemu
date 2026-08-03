@@ -2773,10 +2773,14 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
                  */
                 static int _tp = -1, _tgt = -60;
                 if (_tp < 0) {
-                    const char *d = getenv("CALYPSO_TRF_RXLEV");
+                    /* [2026-08-03] `CALYPSO_TRF_RXLEV=0` ne coupait PAS sous SHUNT_LEGIT=1 :
+                 * l'idiome `(d=='1') || (l=='1')` laisse le parapluie ecraser un 0
+                 * explicite. Or la note de suivi dit « TRF_RXLEV est OFF en natif » —
+                 * ce qui etait infaisable des que le parapluie etait leve. calypso_gate :
+                 * le parapluie devient le DEFAUT, le 0 explicite gagne. */
                     const char *l = getenv("CALYPSO_SHUNT_LEGIT");
                     const char *t = getenv("CALYPSO_TRF_TARGET_RF");
-                    _tp = ((d && *d=='1') || (l && *l=='1')) ? 1 : 0;
+                    _tp = calypso_gate("CALYPSO_TRF_RXLEV", (l && *l == '1') ? 1 : 0);
                     if (t && *t) _tgt = atoi(t);
                 }
                 /* DSP 33-36 : db_r = {..d_task_ra(7), a_serv_demod[4](8..11),

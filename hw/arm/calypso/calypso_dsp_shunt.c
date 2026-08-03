@@ -110,6 +110,20 @@ static void __attribute__((constructor)) shunt_env_value_list(void)
             setenv("CALYPSO_DSP_RUN_C54X", "1", 1);        /* lance le c54x en // */
         if (strstr(v, "NO_CANNED") || strstr(v, "no_canned"))
             setenv("CALYPSO_SHUNT_NO_CANNED", "1", 1);     /* mode sans cannes */
+        /* [2026-08-03] NO_CANNED EST DESORMAIS LE DEFAUT SOUS PARAPLUIE.
+         * Avant, il fallait l'ecrire : `CALYPSO_SHUNT_LEGIT=NO_CANNED`. Un simple
+         * `=1` (ou une surcharge CLI, l'idiome `:=` laissant la CLI gagner) faisait
+         * retomber le banc en mode canne SANS LE DIRE — c'est-a-dire avec des
+         * sorties DSP fabriquees (d_fb_det=1, TOA=23, PM/SNR=0x7000) qui masquent
+         * les echecs de decode. Le defaut sur = pas de valeur fabriquee.
+         * Seul un `=0` EXPLICITE re-canne ; une variable absente OU VIDE compte ici
+         * comme non posee (on ne peut pas distinguer "vide" de "declaree" dans les
+         * .env, cf. armdsp.env qui ecrit `: "${CALYPSO_SHUNT_NO_CANNED:=}"`). */
+        {
+            const char *nc = getenv("CALYPSO_SHUNT_NO_CANNED");
+            if (!nc || !*nc)
+                setenv("CALYPSO_SHUNT_NO_CANNED", "1", 1);
+        }
         setenv(keys[k], "1", 1);   /* canonicalise -> checks *e=='1' OK */
     }
     /* Manifeste de run : dump les CALYPSO_* EFFECTIVES (post value-list) en tete
@@ -966,10 +980,10 @@ void calypso_dsp_shunt_on_frame_tick(void)
                 {
                     static int trf = -1, target = -60;
                     if (trf < 0) {
-                        const char *d = getenv("CALYPSO_TRF_RXLEV");
+                        /* [2026-08-03] cf. calypso_c54x.c : `=0` explicite doit couper. */
                         const char *l = getenv("CALYPSO_SHUNT_LEGIT");
                         const char *t = getenv("CALYPSO_TRF_TARGET_RF");
-                        trf = ((d && *d == '1') || (l && *l == '1')) ? 1 : 0;
+                        trf = calypso_gate("CALYPSO_TRF_RXLEV", (l && *l == '1') ? 1 : 0);
                         if (t && *t) target = atoi(t);
                     }
                     if (trf) {
@@ -1705,6 +1719,7 @@ static void shunt_sch_read(void *opaque)
         g_shunt.sb_fn    = (uint32_t)fn;
         g_shunt.sb_toa   = (int16_t)toa;
         g_shunt.sb_valid = true;
+        g_shunt.sb_capture_fn = calypso_trx_get_fn();   /* horodatage : cf. fraicheur */
         static unsigned schlog = 0;
         if (first || schlog++ < 20 || (schlog % 200) == 0)
             SHUNT_LOG("SCH reel (gr-gsm): BSIC=%d "
@@ -2134,7 +2149,12 @@ void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
          *             RIEN.
          */
         static int real_fb = -1;
-        if (real_fb < 0) { const char *e = getenv("CALYPSO_SHUNT_REAL_FB"); const char *dm = getenv("CALYPSO_DECAN"); real_fb = ((e && *e == '1') || (dm && dm[0] == '1')) ? 1 : 0; }  /* master DECAN implique REAL_FB */
+        /* [2026-08-03] `CALYPSO_SHUNT_REAL_FB=0` ne coupait pas quand DECAN=1 :
+         * un maitre a le droit d'IMPLIQUER un sous-gate, pas d'ECRASER un 0 pose a
+         * la main. DECAN devient le DEFAUT. */
+        if (real_fb < 0) { const char *dm = getenv("CALYPSO_DECAN");
+                           real_fb = calypso_gate("CALYPSO_SHUNT_REAL_FB",
+                                                  (dm && dm[0] == '1') ? 1 : 0); }
         if (real_fb) {
             int nc = n / 2;
             if (nc >= 8) {

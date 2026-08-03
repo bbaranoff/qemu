@@ -136,6 +136,11 @@ struct dsp_shunt_state {
     uint32_t   sb_fn;                 /* FN reelle du SCH */
     int16_t    sb_toa;                /* TOA reel mesure du SCH (base 23 = on-time) */
     bool       sb_valid;              /* gr-gsm a poste au moins un SCH reel */
+    uint32_t   sb_capture_fn;         /* FN TRX au moment ou ce SCH a ete recu —
+                                       * sert a mesurer l'AGE de la SB publiee.
+                                       * NB : compare a calypso_trx_get_fn(), PAS a
+                                       * sb_fn : les deux horloges sont decalees d'un
+                                       * offset fixe (FN-ALIGN, mesure -2283). */
     /* AGCH (#11) : IMM ASSIGN (si_bridge GSMTAP AGCH 0x04). Stocke a part des SI
      * (pas de clobber) ; presente dans a_cd sur un bloc CCCH -> firmware chan_nr=0x90. */
     uint8_t    agch_buf[23];

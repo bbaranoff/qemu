@@ -302,7 +302,17 @@ void shunt_dispatch_sb(uint8_t page_idx)
      *             ici l'encodage vient du SCH decode par gr-gsm.
      *   retirer : quand le correlateur natif enchaine FB -> SB.
      */
-    { static int _ginj = -1; if (_ginj < 0) { const char *_e = getenv("CALYPSO_INJECT_SB"); _ginj = (_e && *_e == '1') ? 1 : 0; if (!_ginj) { const char *_l = getenv("CALYPSO_SHUNT_LEGIT"); _ginj = (_l && *_l == '1') ? 1 : 0; } } if (!_ginj) return; }  /* [2026-07-23] HACK injection sortie, DEFAUT OFF ; CALYPSO_INJECT_SB=1 OU CALYPSO_SHUNT_LEGIT=1 (option3: ecrit le SB au format db_r read-page natif) */
+    /* [2026-08-03] CONVERTI a calypso_gate — un `=0` EXPLICITE doit couper.
+     * Avant : `_ginj = (INJECT_SB=='1'); if (!_ginj) _ginj = (SHUNT_LEGIT=='1');`
+     * donc le parapluie ECRASAIT le 0 pose a la main : sous SHUNT_LEGIT=1 il etait
+     * IMPOSSIBLE d'eteindre l'injection SB, et un banc qui posait INJECT_SB=0 au
+     * manifeste mesurait quand meme le SB fabrique. C'est le bug corrige sur
+     * INJECT_ACD le 30/07 (cf. shunt_dispatch_allc juste en dessous) ; ce site-la
+     * etait reste en arriere. Desormais le parapluie n'est qu'un DEFAUT. */
+    { static int _ginj = -1;
+      if (_ginj < 0) { const char *_l = getenv("CALYPSO_SHUNT_LEGIT");
+                       _ginj = calypso_gate("CALYPSO_INJECT_SB", (_l && *_l == '1') ? 1 : 0); }
+      if (!_ginj) return; }
     uint32_t rp = rp_base(page_idx);
 
     /* gr-gsm (= le DSP) a-t-il poste un vrai SCH (BSIC/FN reels via UDP 4731) ?
@@ -320,6 +330,50 @@ void shunt_dispatch_sb(uint8_t page_idx)
             SHUNT_LOG("SB: pas encore de SCH reel (gr-gsm) "
                     "-> pas de dispatch (no-canned, le firmware attend)\n");
         return;
+    }
+
+    /* ---- FRAICHEUR DE LA SB (2026-08-03) -----------------------------------
+     * DEFAUT CONSTATE : `sb_valid` ne redescend JAMAIS. Une fois qu'un seul SCH est
+     * arrive, ce dispatch republie indefiniment le MEME (bsic, fn, toa) a chaque
+     * tache SB, sur les deux pages de lecture. Mesure sur run sain : 7039 dispatches
+     * pour 690 FN distinctes (x10 de replay) — benin, la SB a ~10 trames d'age.
+     * Mesure sur un run degrade : `FN=20278` republie pendant que l'horloge trame
+     * atteignait 22534, soit ~2250 trames (~10 s) de peremption, SANS AUCUN SIGNAL.
+     * Le firmware recale son horloge sur cette FN a chaque re-sync : il se recale
+     * donc dans le passe, et decroche. Candidat direct au « ca marche puis on perd
+     * au bout de quelques secondes ».
+     *
+     * On mesure l'age TOUJOURS (diagnostic gratuit, plafonne). L'EXPIRATION, elle,
+     * est gatee : CALYPSO_SHUNT_SB_MAX_AGE=<trames>, absente/0 = comportement
+     * historique inchange. Quand elle est posee et l'age depasse, on ne dispatch
+     * PAS — le firmware voit « pas de SB » et continue de chercher, comme un vrai
+     * mobile, au lieu de recevoir une FN fausse. Meme philosophie que le no-canned
+     * juste au-dessus : un echec VISIBLE plutot qu'un succes fabrique.
+     * Valeur raisonnable : 104 (= 2 multitrames de 51, ~0,48 s ; le SCH arrive
+     * toutes les 10 trames en regime normal, la marge est large). */
+    if (g_shunt.sb_valid) {
+        static int max_age = -1;
+        if (max_age < 0) {
+            const char *e = getenv("CALYPSO_SHUNT_SB_MAX_AGE");
+            max_age = (e && *e) ? atoi(e) : 0;
+            if (max_age > 0)
+                SHUNT_LOG("SB-FRAICHEUR : peremption armee a %d trames "
+                          "(au-dela -> pas de dispatch, echec visible)\n", max_age);
+        }
+        uint32_t age = calypso_trx_get_fn() - g_shunt.sb_capture_fn;   /* wrap-safe */
+        int seuil = (max_age > 0) ? max_age : 104;   /* seuil de SIGNALEMENT */
+        if ((int)age > seuil) {
+            static unsigned stale_log = 0;
+            if (stale_log++ < 20 || (stale_log % 500) == 0)
+                SHUNT_LOG("SB PERIMEE : age=%u trames (SCH capture a trx_fn=%u, "
+                          "FN publiee=%u) — %s\n", age, g_shunt.sb_capture_fn,
+                          g_shunt.sb_fn,
+                          (max_age > 0) ? "PAS de dispatch (peremption armee)"
+                                        : "republiee quand meme (peremption NON armee, "
+                                          "poser CALYPSO_SHUNT_SB_MAX_AGE=104)");
+            if (max_age > 0)
+                return;
+        }
     }
 
     /* BSIC/FN : REELS (gr-gsm decode_sch) si dispo, sinon canned (legacy only).
@@ -792,10 +846,12 @@ void shunt_dispatch_pm(uint8_t page_idx)
              */
             static int trf = -1, target = -60;
             if (trf < 0) {
-                const char *d = getenv("CALYPSO_TRF_RXLEV");
+                /* [2026-08-03] `CALYPSO_TRF_RXLEV=0` ne coupait pas sous
+                 * SHUNT_LEGIT=1 : le parapluie ecrasait un 0 explicite. Il
+                 * devient un DEFAUT (cf. calypso_c54x.c, meme correction). */
                 const char *t = getenv("CALYPSO_TRF_TARGET_RF");
                 const char *l = getenv("CALYPSO_SHUNT_LEGIT");
-                trf = ((d && *d == '1') || (l && *l == '1')) ? 1 : 0;
+                trf = calypso_gate("CALYPSO_TRF_RXLEV", (l && *l == '1') ? 1 : 0);
                 if (t && *t) target = atoi(t);
             }
             pm_val = trf ? calypso_trf6151_apm_for_rf(target) : SHUNT_CANNED_PM;
