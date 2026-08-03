@@ -3134,6 +3134,43 @@ static void dio_note(C54xState *s, const char *rw, uint16_t addr, uint16_t val)
 static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
 {
     {   /* ─────────────────────────────────────────────────────────────────────
+         * [2026-08-03] FBCNT-WATCH — CALYPSO_FBROUTE=1 (meme gate que FBROUTE,
+         * dont c'est la suite directe). LECTURE SEULE, plafonnee.
+         *
+         * CE QU'ON CHERCHE. Depuis que le DMA livre les echantillons, la routine
+         * FB s'execute enfin (FBROUTE : ENTER x2, high-water 0x794e — la zone
+         * n'etait JAMAIS entree avant). Et la garde de `0x79e3` devient mesurable :
+         *     jalon 0x7720 : DP=0x083 -> dma(0x7e) = data[0x41fe] = 1, 2, 3, 3, 3, 3
+         *     la garde exige == 4.
+         * Le compteur plafonne a 3. Il manque exactement une unite.
+         *
+         * PISTE A VERIFIER, PAS A SUPPOSER : le DMA livre le burst en 4 PAGES
+         * (ALGTH=192 -> 96 mots, burst=296) et le compteur en compte 3. La
+         * coincidence est trop belle pour etre citee sans preuve — ce watch dit
+         * QUI ecrit la cellule et QUAND, ce qui la confirmera ou la tuera.
+         *
+         * ⚠️ LIMITE ASSUMEE : `0x41fe` est l'adresse resolue en `0x7720` (DP=0x083).
+         * La garde est en `0x79e3`, qui n'est JAMAIS atteint — on ne peut donc pas
+         * verifier qu'elle lit la meme cellule. L'inference est raisonnable (meme
+         * adressage direct @0x7e, meme routine, DP constant sur 6 releves) mais
+         * NON PROUVEE. Si le watch montre un ecrivain incoherent, c'est cette
+         * inference qu'il faut suspecter en premier, pas le compteur. */
+        static int _fc = -1;
+        if (_fc < 0) _fc = calypso_gate("CALYPSO_FBROUTE", 0);
+        if (_fc && addr == 0x41fe) {
+            static unsigned _n = 0;
+            if (_n < 60) {
+                _n++;
+                fprintf(stderr,
+                        "[c54x] FBCNT-WR #%u data[0x41fe] 0x%04x -> 0x%04x "
+                        "PC=0x%04x A=0x%06llx insn=%u\n",
+                        _n, s->data[0x41fe], val, s->last_exec_pc,
+                        (unsigned long long)(s->a & 0xFFFFFFULL), s->insn_count);
+                fflush(stderr);
+            }
+        }
+    }
+    {   /* ─────────────────────────────────────────────────────────────────────
          * [2026-08-03] DTASKD-WATCH, patte 3/3 — CALYPSO_DTASKD_WATCH=1, defaut 0.
          * LECTURE SEULE, plafonnee. Voir les pattes 1 et 2 dans calypso_trx.c.
          *
