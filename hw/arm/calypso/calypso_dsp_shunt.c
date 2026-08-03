@@ -825,7 +825,9 @@ void calypso_dsp_shunt_on_frame_tick(void)
          * demande explicitement PUBLISH_FB=1 — donc `legit=0` tuait tout le
          * bloc, transport COMPRIS (AFC ferme, a_pm, rx_toa). Mesure du 30/07 :
          *   [shunt] PUBLISH_FB = 1 (transport=0)
-         *   [fbsb]  fb0_att=13 sb_att=8 fb0_ret=0  api[](det=0 ...)
+         *   [fbsb]  fb0_att=13 sb_att=8  api[](det=0 ...)
+         * ([2026-08-03] le `fb0_ret=0` de cette trace est retire : compteur mort,
+         *  jamais incremente. C'est `api[](det=0)` qui portait la demonstration.)
          * L'hote ne publiait donc RIEN, alors que le profil promet « FB/SB =
          * TWL ». Le mobile recevait un SB (INJECT_SB -> BSIC=7) mais jamais de
          * detection FB, d'ou une reselection de cellule en boucle toutes les 10 s.
@@ -890,7 +892,9 @@ void calypso_dsp_shunt_on_frame_tick(void)
                  * mesuree le 30/07 en `native_twl` :
                  *     api[] (det=1 toa=23 pm=20929 ang=-186 snr=0x735b)
                  *     data[](det=0 toa=0  pm=0     ang=0    snr=0x0000)
-                 *     fb0_att=17  sb_att=9  fb0_ret=0
+                 *     fb0_att=17  sb_att=9
+                 * ([2026-08-03] `fb0_ret=0` retire de cette trace : compteur
+                 *  mort. La divergence api[]/data[] ci-dessus est la mesure.)
                  * L'hote a dit a l'ARM que la FB etait trouvee, et ne l'a JAMAIS
                  * dit au DSP : sa machine d'etat reste bloquee a l'etape FB,
                  * cherche 17 fois, et n'atteint jamais le CCCH — c'est-a-dire la

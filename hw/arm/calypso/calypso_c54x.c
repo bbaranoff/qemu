@@ -1823,6 +1823,60 @@ static void rmap_note(uint16_t addr, uint16_t pc)
 
 static uint16_t data_read_locked(C54xState *s, uint16_t addr)
 {
+    {   /* ─────────────────────────────────────────────────────────────────────
+         * [2026-08-03] DTASKD-WATCH, patte 4/4 — CALYPSO_DTASKD_WATCH=1, defaut 0.
+         * LECTURE SEULE, plafonnee. Pattes 1-2 dans calypso_trx.c, patte 3 dans
+         * data_write_locked.
+         *
+         * CE QU'ON CHERCHE. Mesure du run de 19:22 (`CALYPSO_DISPATCH_PROBE=1`) :
+         * la file de taches du DSP ne recoit JAMAIS qu'un seul handler, `0xb5a1`,
+         * 32 559 fois ; le helper index->handler `0xa9ea` n'est appele qu'UNE fois
+         * sur tout le run, et avec l'index 42 (DESARMEMENT). L'index 41 (armement
+         * RX, `0xa5cd`) n'est jamais demande, et ni ses quatre sites d'appel, ni
+         * les entrees de bloc, ni les chargeurs ne sont atteints.
+         *
+         * Autrement dit le chemin NB/CCCH n'est jamais mis dans la file. La
+         * question descend donc d'un cran : **le DSP LIT-IL seulement la cellule
+         * ou l'ARM depose la tache ?** Si le ROM ne lit jamais `d_task_d`, il
+         * n'apprend jamais qu'une tache NB existe, et tout le reste en decoule
+         * mecaniquement — inutile de chercher plus bas.
+         *
+         * CELLULES (pages W, cote MCU->DSP ; cf. dsp_api.h:22-23) :
+         *     W p0 = data[0x0800]     W p1 = data[0x0814]
+         * On surveille AUSSI `d_task_md` (data[0x0804]/[0x0818]), la tache que le
+         * DSP consomme REELLEMENT aujourd'hui : c'est le temoin de comparaison.
+         * Sans lui, une patte 4 muette serait ambigue entre « le DSP ne lit pas
+         * d_task_d » et « le DSP ne lit rien du tout dans la page W ».
+         *
+         * LECTURE DU RESULTAT :
+         *   md lu, d lu       -> le DSP voit la tache NB : le verrou est apres.
+         *   md lu, d PAS lu   -> RACINE. Le ROM ignore d_task_d dans ce chemin.
+         *   ni l'un ni l'autre-> la page W n'est pas lue du tout ; remonter au
+         *                        selecteur 0xaad5 et a ce qui alimente 0xaac3. */
+        static int _dw = -1;
+        if (_dw < 0) {
+            _dw = calypso_gate("CALYPSO_DTASKD_WATCH", 0);
+            if (_dw) {
+                fprintf(stderr, "[dtaskd] patte 4/4 armee (lectures DSP page W) : "
+                        "d_task_d=data[0x0800]/[0x0814]  d_task_md=data[0x0804]/[0x0818]\n");
+                fflush(stderr);
+            }
+        }
+        if (_dw && (addr == 0x0800 || addr == 0x0814 ||
+                    addr == 0x0804 || addr == 0x0818)) {
+            static unsigned long long _nd = 0, _nmd = 0;
+            int is_d = (addr == 0x0800 || addr == 0x0814);
+            unsigned long long _n = is_d ? ++_nd : ++_nmd;
+            if (_n <= 30 || (_n % 5000) == 0) {
+                fprintf(stderr,
+                        "[dtaskd] DSP<RD  %-9s data[0x%04x] = 0x%04x  "
+                        "(d_task_d lus=%llu  d_task_md lus=%llu)  PC=0x%04x insn=%u\n",
+                        is_d ? "d_task_d" : "d_task_md", addr, s->data[addr],
+                        _nd, _nmd, s->last_exec_pc, s->insn_count);
+                fflush(stderr);
+            }
+        }
+    }
     rmap_note(addr, s->pc);
     {   /* [2026-07-28] WZREAD : voir en-tete du patch (gate CALYPSO_WZWRITE). */
         static int _wr = -1; static unsigned _wrn = 0;
@@ -3079,6 +3133,59 @@ static void dio_note(C54xState *s, const char *rw, uint16_t addr, uint16_t val)
 
 static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
 {
+    {   /* ─────────────────────────────────────────────────────────────────────
+         * [2026-08-03] DTASKD-WATCH, patte 3/3 — CALYPSO_DTASKD_WATCH=1, defaut 0.
+         * LECTURE SEULE, plafonnee. Voir les pattes 1 et 2 dans calypso_trx.c.
+         *
+         * CE QU'ON CHERCHE. La console du firmware (osmocon.log) montre, a chaque
+         * cycle : `l1s_nb_cmd()` commande une reception, puis `l1s_nb_resp()`
+         * imprime `EMPTY` (prim_rx_nb.c:74), dont le test est
+         *     if (dsp_api.db_r->d_task_d == 0) { puts("EMPTY\n"); return 0; }
+         *
+         * PIEGE A NE PAS REPRODUIRE. `db_w->d_task_d` et `db_r->d_task_d` ne sont
+         * PAS la meme cellule — ce sont deux structures distinctes du firmware :
+         *     db_w = T_DB_MCU_TO_DSP @ 0xFFD00000 (p0) / 0xFFD00028 (p1)
+         *     db_r = T_DB_DSP_TO_MCU @ 0xFFD00050 (p0) / 0xFFD00078 (p1)
+         * (osmocom-bb, include/calypso/dsp_api.h:20-23 ; d_task_d est a l'offset 0
+         * des DEUX structures.) Donc `EMPTY` ne veut PAS dire « l'ecriture de
+         * l'ARM s'est perdue » : il veut dire « le DSP n'a jamais recopie la tache
+         * dans sa page REPONSE ». C'est cette patte-ci qui tranche.
+         *
+         * Mots DSP correspondants (api = data[0x0800 + offset_ARM/2]) :
+         *     W p0 = data[0x0800]   W p1 = data[0x0814]   <- ecrit par l'ARM
+         *     R p0 = data[0x0828]   R p1 = data[0x083C]   <- doit etre ecrit ICI
+         *
+         * INDICE DEJA AU JOURNAL : la sonde DISPATCH-PROBE montre AR2 alternant
+         * entre 0x0828 et 0x083c dans les lignes EMPILEMENT — soit exactement les
+         * deux bases de page R. Le DSP a donc le bon pointeur en main ; reste a
+         * voir s'il ECRIT la cellule.
+         *
+         * L'ABSENCE DOIT ETRE LISIBLE (lecon §13.6) : le resume periodique imprime
+         * les compteurs meme a zero, pour qu'aucune ligne ne soit ambigue entre
+         * « le DSP n'ecrit pas » et « la sonde n'est pas armee ». */
+        static int _dw = -1;
+        if (_dw < 0) {
+            _dw = calypso_gate("CALYPSO_DTASKD_WATCH", 0);
+            if (_dw) {
+                fprintf(stderr, "[dtaskd] patte 3/3 armee (ecritures DSP) : "
+                        "R p0=data[0x0828] R p1=data[0x083C]\n");
+                fflush(stderr);
+            }
+        }
+        if (_dw && (addr == 0x0828 || addr == 0x083C)) {
+            static unsigned long long _n0 = 0, _n1 = 0, _nz = 0;
+            unsigned long long _n = (addr == 0x0828) ? ++_n0 : ++_n1;
+            if (val) _nz++;
+            if (_n <= 40 || (_n % 5000) == 0) {
+                fprintf(stderr,
+                        "[dtaskd] DSP>WR  R p%d  data[0x%04x] <- 0x%04x  "
+                        "(non_nuls=%llu  p0=%llu p1=%llu)  PC=0x%04x insn=%u\n",
+                        (addr == 0x0828) ? 0 : 1, addr, val,
+                        _nz, _n0, _n1, s->last_exec_pc, s->insn_count);
+                fflush(stderr);
+            }
+        }
+    }
     dio_note(s, "W", addr, val);
     wmap_note(addr, val, s->pc);
     flow_log("W", addr, val, s->pc, s->insn_count);

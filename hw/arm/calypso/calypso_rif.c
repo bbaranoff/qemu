@@ -4,8 +4,10 @@
  * POURQUOI CE FICHIER EXISTE (2026-08-03).
  * ----------------------------------------
  * Mesure sur un run native_twl : le DSP prend bien son interruption de reception
- * (`PC=0x00c0`, 16 330 entrees), puis n'en sort rien — `fb0_att=37 fb0_ret=0`,
- * `A_CD-WR=0`. La sonde PORTR-ANY donne la raison, et elle est unanime :
+ * (`PC=0x00c0`, 16 330 entrees), puis n'en sort rien — `fb0_att=37`, `A_CD-WR=0`.
+ * ([2026-08-03] `fb0_ret=0` etait aussi cite ici : compteur MORT, jamais
+ * incremente, retire — il n'etayait rien.)
+ * La sonde PORTR-ANY donne la raison, et elle est unanime :
  *
  *     PORTR-ANY PA=0x0003 addr=0x000e PC=0xa675      <- 30 releves sur 30
  *

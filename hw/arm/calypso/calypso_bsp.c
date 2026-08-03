@@ -782,7 +782,9 @@ static void bsp_trxd_readable(void *opaque)
     /* [2026-07-22] Option 2 GATED (CALYPSO_BSP_DIRECT_FEED=1) : restaure le wire
      * mort. En full, bsp_enqueue->deliver_buffered ne livre JAMAIS (device_fn
      * temps-reel >> cur_fn virtuel qui traine sous icount=auto -> match FN +/-64
-     * echoue -> DARAM 0x2a00 jamais ecrite -> correlateur affame, fb0_ret=0).
+     * echoue -> DARAM 0x2a00 jamais ecrite -> correlateur affame).
+     * [2026-08-03] « fb0_ret=0 » retire de cette phrase : compteur mort, il
+     * n'attestait pas la famine du correlateur.
      * Gate ON : feed DARAM 0x2a00 DIRECTEMENT via calypso_bsp_rx_burst (write
      * immediat + c54x_bsp_load + INT3, SANS match FN). Gate OFF : inchange. */
     {
@@ -956,8 +958,12 @@ static int calypso_bsp_vec30_int3_on(void)
  *     vec21 = XINT  = SPI TRANSMIT
  *     vec19 = TINT  = timer du DSP
  * Ni l'un ni l'autre n'a le moindre rapport avec la radio, et le ROM y a des
- * stubs RETE. Le correlateur n'est donc jamais prevenu qu'un burst est arrive —
- * ce que confirme le compteur du firmware : fb0_att=37, fb0_ret=0.
+ * stubs RETE. Le correlateur n'est donc jamais prevenu qu'un burst est arrive.
+ *
+ * [2026-08-03] ⚠ CE PARAGRAPHE CITAIT « fb0_att=37, fb0_ret=0 » comme
+ * confirmation. `fb0_ret` etait un compteur MORT (jamais incremente, donc
+ * toujours 0) : il ne confirmait rien. Retire. Le reste du raisonnement tient
+ * sur vec21/vec19/vec30, qui sont, eux, mesures.
  *
  * Les deux vecteurs que le §3.7.1 autorise pour le RIF, selon le mode :
  *   vec16 / bit 0  = INT0n  « RIF receive interrupt »  — mode XIO mot-a-mot

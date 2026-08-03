@@ -1,7 +1,7 @@
 # ETAT ACTUEL — QEMU-Calypso (source de verite unique)
 
-> Document de reference courant. Ancre sur les mesures du **2026-08-03** (§13,
-> qui PRIME sur la §12 et sur tout le reste).
+> Document de reference courant. Ancre sur les mesures du **2026-08-03 au soir**
+> (**§14**, qui PRIME sur la §13, laquelle prime sur la §12).
 > **Regle de resolution de conflit :** ce document prime sur tout fait extrait d'un autre
 > doc. Le STATUT DEPEND DU MODE : ne jamais citer un statut sans le mode. Toute
 > affirmation technique doit nommer son INSTRUMENT. Les autres documents sont dans
@@ -12,7 +12,299 @@
 
 ---
 
+## 14. ETAT AU 2026-08-03 (SOIR) — la L1 DEPASSE la synchro et commande bien une reception
+
+> Cette section PRIME sur la §13. Elle la corrige sur un point central : la §13.1
+> conclut « l'ARM ne commande QUE des taches FB/SB/PM » et impute cela a une L1
+> « encore en phase de SYNCHRONISATION ». **Les deux moities de cette conclusion
+> sont fausses**, et l'instrument qui le montre n'avait jamais ete lu.
+>
+> ⚠️ **MODE** : tout ce qui suit est mesure en **`native_twl`**, pas en `native`.
+> En `native_twl`, `CALYPSO_SHUNT_PUBLISH_FB=1` **substitue** le resultat FB dans
+> la fenetre API (`calypso_dsp_shunt.c:807`). C'est donc le **TWL/hote qui fournit
+> le FBSB, pas le DSP emule**. Ne jamais citer les faits ci-dessous comme un
+> succes du DSP.
+
+### 14.1 L'INSTRUMENT MANQUANT — la console du firmware
+
+Toutes les sondes du projet sont cote **emulateur** : elles disent ce que le DSP
+fait, jamais ce que la L1 de l'ARM **croit**. Or osmocom-bb multiplexe sa console
+sur l'UART MODEM via `sercomm`, et osmocon la journalise depuis toujours dans
+`$LOG_DIR/osmocon.log`. **Ce fichier n'avait jamais servi au diagnostic.**
+
+Il repond en clair a la question que la §13 attaquait au desassembleur.
+
+### 14.2 CE QUE DIT LE FIRMWARE (instrument : `osmocon.log`, run du 03/08 18:45)
+
+Le cycle suivant se repete a l'identique, en boucle :
+
+```
+L1CTL_RESET_REQ: FULL!
+L1CTL_PM_REQ start=514 end=514
+PM MEAS: ARFCN=514, 448  dBm at baseband, 310  dBm at RF     <- poison a_pm=0x7000
+L1CTL_FBSB_REQ (arfcn=514, flags=0x7)
+Starting FCCH Recognition
+FB0 (3428:10): TOA=23, Power=184dBm, Angle=-933Hz            <- FB0 ABOUTIT
+FB1 (3437:7):  TOA=23, Power=184dBm, Angle=-477Hz            <- FB1 ABOUTIT
+  scheduling next FB/SB detection task with delay 3
+Synchronize_TDMA
+SB1 (6873:1): TOA=23, Power=191dBm, Angle=0Hz
+=> SB 0x004e001c: BSIC=7 fn=1163(0/19/41) qbits=0            <- SB ABOUTIT, BSIC extrait
+Synchronize_TDMA
+EMPTY                                                         <- prim_rx_nb.c:74
+nb_cmd(0) and rxnb.msg != NULL                                <- prim_rx_nb.c:183
+L1CTL_RESET_REQ: FULL!                                        <- et on recommence
+```
+
+**MESURE 1 — la L1 depasse la synchro.** FB0, FB1 puis SB aboutissent a chaque
+cycle, `Synchronize_TDMA` est appele deux fois, le BSIC=7 est extrait. La §13.1
+(« la L1 est encore en phase de SYNCHRONISATION ») est **INVALIDE**. (Rappel du
+mode : ce succes est fourni par le TWL, il ne dit rien du DSP.)
+
+**MESURE 2 — la L1 commande bien une reception.** `nb_cmd(0) and rxnb.msg != NULL`
+est imprime **depuis l'interieur de `l1s_nb_cmd()`** (`prim_rx_nb.c:183`). Cette
+fonction est donc executee, et son corps appelle :
+
+```c
+dsp_load_rx_task(dsp_task_iq_swap(ALLC_DSP_TASK, arfcn, 0), burst_id, tsc);
+   -> calypso/dsp.c:481 :  dsp_api.db_w->d_task_d = task;   /* NON NUL */
+```
+
+**MESURE 3 — `EMPTY` est SPORADIQUE, pas un mur.** `EMPTY` est imprime par
+`l1s_nb_resp()` (`prim_rx_nb.c:74`), dont le test est exactement :
+
+```c
+if (dsp_api.db_r->d_task_d == 0) { puts("EMPTY\n"); return 0; }
+```
+
+> 🛑 **CORRECTION [2026-08-03, run de 19:08] — j'avais conclu ici que « la commande
+> RX s'evapore entre `db_w` et `db_r` ». C'est REFUTE par la mesure.** La sonde
+> `CALYPSO_DTASKD_WATCH` (trois pattes, cf. §14.6) montre la chaine SAINE de bout
+> en bout. L'erreur : j'ai lu 10 occurrences de `EMPTY` dans un journal et j'en ai
+> fait un etat permanent, sans jamais les COMPTER ni regarder ce qu'il y avait
+> autour. Elles sont noyees dans un flux continu de `hdlc_recv(dlci=5)` — la L1
+> livre des donnees en permanence. **Regle violee : compter avant de conclure ;
+> une trace d'erreur n'est un mur que si elle est la SEULE chose qui se passe.**
+
+### 14.6 LA CHAINE `d_task_d` EST SAINE — mesure a trois pattes
+
+Instrument : `CALYPSO_DTASKD_WATCH=1` (lecture seule, defaut 0, declaree
+`environnement/armdsp.env`). Run `native_twl` du 19:08.
+
+| patte | ce qu'elle observe | resultat |
+|---|---|---|
+| 1/3 `ARM>WR` | l'ARM ecrit `db_w->d_task_d` (off 0x0000/0x0028) | total=14 500, **non nuls=760** |
+| 3/3 `DSP>WR` | le DSP ecrit `db_r->d_task_d` (data[0x0828]/[0x083C]) | p0=2 050, p1=20 000, **non nuls=19 409**, valeur **0x0018** depuis `PC=0xb001` |
+| 2/3 `ARM<RD` | ce que `l1s_nb_resp()` lit reellement | total=500, **non nuls=492**, valeur **0x0018** |
+
+`0x0018` = 24 = `ALLC_DSP_TASK`. **L'ARM commande, le DSP acquitte, l'ARM relit
+l'acquittement.** Les trois pattes concordent.
+
+⚠️ La valeur 24 n'est **pas** la bequille du chemin de LECTURE
+(`calypso_trx.c`, `if (val == 0) val = 24;`) : celle-ci est conditionnee a
+`SHUNT_LEGIT || SHUNT_NO_LEGIT`, tous deux a **0** au manifeste de ce run.
+
+> ⚠️ **CORRECTION [2026-08-03] — j'ai ecrit ici « C'est un acquittement REEL ».
+> C'est trop fort.** Il existe une SECONDE bequille sur ces memes cellules :
+> `CALYPSO_TWL_ACK_ARM=1` (actif dans ces runs) fait
+> `dd[0x0828] = dd[0x083C] = d_task_md` par **affectation directe du tableau**
+> (`calypso_dsp_shunt.c:975`), donc **sans passer par `data_write_locked`**, ou la
+> patte 3 est accrochee. Consequence exacte :
+> * ce que la patte 3 prouve : le DSP ecrit bien `0x0018` par opcode (`PC=0xb001`,
+>   19 409 fois) — ca, c'est mesure ;
+> * ce qu'elle NE peut PAS trancher : **laquelle des deux ecritures l'ARM relit**,
+>   puisque les deux visent la meme cellule.
+> Pour le trancher il faudrait horodater les deux ecrivains sur la meme cellule,
+> ou couper `TWL_ACK_ARM` — ce dernier etant un vrai changement de comportement
+> (le mode le pose exprès), a faire sous protocole, pas en passant.
+
+### 14.9 QUI FAIT QUOI EN `native_twl_host_demod` — le partage des roles, mesure
+
+Le mode a recu un nom le 03/08 (`environnement/modes.env`) parce qu'il etait lance
+a la main depuis des jours **sans nom**, et qu'un mode sans nom se re-decouvre a
+chaque session. Il franchit deliberement la « regle de frontiere » de `native_twl`
+(« des que les SI viennent de gr-gsm, ce n'est plus ce mode »).
+
+| | mesure |
+|---|---|
+| **Le DSP FAIT** | sa boucle et sa file (**32 559** empilements), la sequence RRST du RIF a chaque trame, la bascule `API_HOM` a chaque trame, des ecritures dans d'autres zones (`BLOB-WR` 5 000, `PMST-WR` 300, `BK-WR` 40, `READY-WR` 40) |
+| **Le DSP NE FAIT PAS** | aucune detection FB (`0x79e4` jamais execute) ; **aucune demodulation** (`A_CD-WR = 0`, identique avec ET sans la recette) ; **un seul handler empile**, `0xb5a1`, jamais le chemin NB |
+| **L'HOTE FOURNIT** | FB/SB (`REAL_FB`+`INJECT_SB`+`PUBLISH_FB`), le contenu de `a_cd` (`INJECT_ACD`, via `dma_memory_write` dans l'espace ARM — il **contourne** le DSP), les SI (`FEED_SI`), a chaque bloc CCCH au lieu d'1 sur 8 (`SI_ROT_MASK=0`) |
+
+**Ce qu'il prouve** : la plomberie ARM↔DSP de bout en bout — `C3 camped normally`,
+SI 1/2/3/4 (`lai=001-01-1`), Location Update.
+**Ce qu'il ne prouve pas** : que le DSP traite le moindre signal. **Ne jamais citer
+un camp obtenu ici comme un succes du DSP.**
+
+⚠️ **Ce n'est pas du truquage pour autant.** `NO_CANNED=1` : le code REFUSE
+d'injecter un SI3 en conserve et n'injecte que si `si_valid`, c'est-a-dire quand
+gr-gsm a reellement decode un SI depuis l'I/Q du BTS. Le contenu est **vrai**, il
+est seulement demodule par l'hote. Si le demod casse, rien ne campe.
+
+### 14.10 LE DSP N'EXECUTE QU'UN SEUL HANDLER — le chemin NB n'est jamais mis en file
+
+**MESURE** (`CALYPSO_DISPATCH_PROBE=1`, run du 19:22, 21 978 lignes de sonde) :
+
+```
+handlers empiles dans la file (site 0xaac3) :  0xb5a1  x32 559   <- et RIEN d'autre
+helper index->handler 0xa9ea appele :          1 fois, index 42 = DESARMEMENT
+index 41 (armement RX, 0xa5cd) :               jamais
+ses 4 sites (0xb220/0xb2b4/0xb330/0xb35d) :    jamais atteints
+entrees de bloc (0xb216/0xb2aa) :              jamais atteintes
+chargeurs (0xaba9/0xabc9/0xabf1/...) :         jamais atteints
+```
+
+**Le DSP tourne en boucle sur un seul handler.** L'armement RX n'est donc pas
+« non dispatche » : il n'est jamais **demande**, parce que rien ne met jamais le
+chemin NB/CCCH dans la file.
+
+**Ce que ca perime** : la formulation du §13.2 (« aucun des 4 sites n'est atteint »)
+reste vraie mais designe un symptome trop en aval. Chercher « pourquoi l'index 41
+n'est pas dispatche » vise un cran trop bas — c'est l'ENTREE dans la file qui
+manque, pas la selection dans la table.
+
+**QUESTION SUIVANTE, posee proprement** : le DSP LIT-IL seulement `d_task_d` ? Si le
+ROM ne lit jamais la cellule ou l'ARM depose la tache NB, il n'apprend jamais
+qu'elle existe, et tout le reste en decoule. Instrument pose le 03/08 : patte 4/4 de
+`CALYPSO_DTASKD_WATCH` (`data_read_locked`), qui surveille les lectures DSP de
+`d_task_d` **et** de `d_task_md` — ce dernier comme temoin de comparaison, pour
+qu'une patte 4 muette ne soit pas ambigue entre « d_task_d ignore » et « page W pas
+lue du tout ».
+
+**Corollaire** : la §13.1 (« `d_task_d` ecrite 913 fois toujours a 0 », moniteur
+mailbox) ne surveillait qu'une adresse — elle n'a vu que les remises a zero de
+`l1s_nb_resp` (`prim_rx_nb.c:160`) et a manque les 760 commandes non nulles.
+
+### 14.7 OU EST LE MUR, ALORS — le CONTENU, pas l'ordonnancement
+
+Etat du mobile sur ce meme run (`mobile.log`) :
+
+```
+Channel synched. (ARFCN=514(DCS), snr=28, BSIC=7)
+Starting CS timer with 4 seconds.
+...
+Cell search finished without result.        <- puis boucle
+```
+
+**MESURE** : zero `SYSTEM INFORMATION` dans `mobile.log`. Le mobile se synchronise
+(BSIC=7, rxlev 63) mais n'obtient aucun SI, le timer CS de 4 s expire, et la
+recherche de cellule recommence.
+
+Or ce run a `CALYPSO_INJECT_ACD=0` et `CALYPSO_SHUNT_FEED_SI=0` au manifeste —
+c'est-a-dire **sans** la recette du 30/07 qui faisait remonter les SI. L'absence de
+SI est donc attendue dans cette configuration ; elle ne constitue pas un fait
+nouveau.
+
+**La question suivante n'est plus « la tache RX est-elle commandee » (oui) mais
+« que contiennent les bursts livres »** — soit `a_cd` et la chaine de demodulation.
+Ne pas repartir sur l'ordonnancement : il est mesure sain.
+
+### 14.8 LE MUR EST LA DEMODULATION ALLC — lecture croisee des deux pattes `a_cd`
+
+**MESURE** (run `native_twl` du 19:14, les deux sondes sans gate) :
+
+| patte | instrument | resultat |
+|---|---|---|
+| DSP ecrit `a_cd` | `A_CD-WR` (`watch_write_zone_check`, 0x09d0..0x09de, **sans gate**) | **0** |
+| ARM lit `a_cd` | `ARM RD a_cd` (`calypso_trx.c`, degatee le 03/08) | **> 2 000 lectures** |
+
+Valeurs relues : 185x `0x0000` et 17x `0x0040` — des reliquats, pas une sortie de
+demodulation. **L'ARM interroge activement `a_cd` ; le DSP n'y ecrit jamais rien.**
+
+Combine au §14.6 (la tache ALLC est commandee ET acquittee par le DSP), le mur est
+localise : **le DSP accepte la tache de demodulation CCCH et n'en produit aucun
+resultat.** Ce n'est ni l'ordonnancement, ni la livraison, ni la fenetre API.
+
+**Controle positif** (indispensable, cf. §13.6) : `watch_write_zone_check` est
+partage par plusieurs zones et les autres parlent sur ce meme run — `BLOB-WR`
+5 000, `PMST-WR` 300, `BK-WR` 40, `READY-WR` 40. Le helper est vivant ; `A_CD-WR=0`
+et `COEFFS-WR=0` sont des mesures, pas des sondes eteintes.
+
+**⚠ AVERTISSEMENT DE METHODE — un temoin gate ment comme un compteur mort.**
+`ARM RD a_cd` passait par `TRX_LOG`, donc par `CALYPSO_DEBUG=TRX`, eteint dans tous
+les runs courants : son compteur valait 0 au journal QUOI QU'IL ARRIVE. Lu sans
+precaution, ce zero disait « l'ARM ne lit jamais `a_cd` » — l'exact contraire de la
+verite (2 000 lectures). C'est le **troisieme** temoin de ce type trouve en une
+journee, apres `fb0_ret` (§14.3) et `CALYPSO_IRDA_CAPTURE` (gate declare, aucun
+consommateur). **Regle : avant de citer un compteur a zero, verifier qu'il peut
+etre non nul** — soit par un controle positif sur le meme instrument, soit en
+lisant le site d'emission.
+
+**Reserve sur la configuration** : ce run a `INJECT_ACD=0` et `SHUNT_FEED_SI=0`,
+donc sans la recette du 30/07. Le §14.8 dit ou est le mur du chemin NATIF ; il ne
+dit pas si la recette a bequilles le franchit encore.
+
+### 14.3 CE QUE CA CHANGE
+
+| affirmation | statut |
+|---|---|
+| §13.1 « la L1 est encore en phase de SYNCHRONISATION » | **INVALIDE** — FB0/FB1/SB aboutissent, BSIC=7 |
+| §13.1 « dependance circulaire : pas de FB -> pas de commande RX » | **INVALIDE** — il y a une FB (fournie par le TWL) ET une commande RX |
+| §13.1 « l'ARM ne commande QUE des taches FB/SB/PM » | **A REQUALIFIER** — `l1s_nb_cmd` ecrit bien `d_task_d` non nul dans `db_w` ; la mailbox n'en voyait que la remise a zero de `l1s_nb_resp` (`prim_rx_nb.c:160`) |
+| §13.4 « le seul verrou restant = `data[@0x7e]==4` » | **HORS SUJET** — voir §14.4 |
+| `fb0_ret=0` comme mesure | **INVALIDE** — compteur mort, cf. ci-dessous |
+| ~~« la commande RX s'evapore entre `db_w` et `db_r` »~~ (ma conclusion du 03/08 au soir) | 🛑 **REFUTE par ma propre sonde** — chaine saine, cf. §14.6 |
+
+**Le compteur `fb0_ret` etait mort.** `fb0_retries` (et `afc_retries`) etaient
+declares dans `calypso_fbsb.h`, remis a 0 dans `calypso_fbsb_reset()`, imprimes
+dans `calypso_fbsb_dump()` — et **incrementes nulle part dans tout l'arbre**. Ils
+valaient structurellement 0. Ce zero a ete cite comme mesure dans **six**
+endroits : `ETAT_ACTUEL.md` §13.1, `RAPPORT_DFBDET.md`, `calypso_bsp.c`,
+`calypso_dsp_shunt.c` (x2), `calypso_rif.c`. Les deux champs sont **supprimes**
+(pas cables : il n'existe aucune notion de retry dans ce module, en inventer une
+fabriquerait une mesure de plus). Note aggravante : le commentaire de
+`calypso_fbsb.h:116` documente un menage anterieur qui avait supprime quatre
+champs `last_*` **pour ce motif exact** — ces deux-la y avaient survecu.
+
+### 14.4 LA ZONE `0x7700-0x79f0` N'EST JAMAIS EXECUTEE — la §13.4 est mal posee
+
+Instrument : `CALYPSO_FBROUTE=1` (lecture seule, defaut 0), run de ~24 M
+d'instructions, 54 tentatives FB. La sonde est **totalement muette** : aucun
+`ENTER @0x76fb`, aucun high-water, aucun jalon.
+
+Contrôle positif : le bloc `FBROUTE` (`calypso_c54x.c:17114`) et le bloc
+`DISPATCH-PROBE` (`calypso_c54x.c:16104`) ouvrent a la **meme indentation**, freres
+dans la section par-instruction de `c54x_run()` ; le second a emis 28 579 lignes
+sur ce meme run. Le high-water imprime au **premier** passage, sans plafond amont.
+Le silence est donc une mesure.
+
+**Consequence** : `data[@0x7e]` n'est pas « jamais egal a 4 », la garde n'est
+**jamais evaluee**. Resoudre DP ne donnera rien. La §13.4 decrit un verrou situe
+en aval du point de rupture reel, et la tache A du TODO est a reecrire.
+
+### 14.5 LES DEUX MANQUES SONT DISTINCTS — ne pas les confondre
+
+1. **Le DSP ne publie jamais la FB lui-meme** (`0x79e4` jamais atteint, §14.4).
+   En `native_twl` ce manque est **masque** par la bequille `PUBLISH_FB=1`.
+2. ~~**Meme quand la FB lui est donnee, la commande RX s'evapore** entre `db_w` et
+   `db_r`.~~ 🛑 **REFUTE** par `CALYPSO_DTASKD_WATCH` — la chaine est saine (§14.6).
+   Le manque 2 n'existe pas.
+
+Ce qui reste vrai de ce paragraphe : le manque 1 est bien **masque** en
+`native_twl` par la bequille `PUBLISH_FB=1`, et ce banc reste le seul ou la L1
+depasse la synchro. Mais il n'y a pas de « second manque » cote ordonnancement :
+l'ARM commande, le DSP acquitte, l'ARM relit. Le mur suivant est le **contenu**
+des bursts livres (§14.7), pas leur ordonnancement.
+
+**LECON DE METHODE (la 4e du meme genre en deux jours).** L'hypothese « page W/R »
+etait seduisante — elle recyclait un historique reel (overlay du shunt sur
+`d_dsp_page`, page R ecrasee avant lecture) et expliquait joliment `EMPTY`. Elle
+etait fausse. Ce qui l'a tuee : avoir sonde la CELLULE dans les trois sens, y
+compris **le sens auquel je ne croyais pas** (le DSP ecrit-il ?). Si la sonde
+n'avait eu que les deux pattes ARM que j'avais annoncees, elle aurait montre
+« l'ARM ecrit X, l'ARM lit 24 » sans jamais dire QUI ecrit 24 — et la bequille
+`val=24` aurait fourni une explication plausible et fausse. **Sonder aussi la
+patte qu'on croit inutile.**
+
+---
+
 ## 13. ETAT AU 2026-08-03 — la chaine RX est SAINE ; le blocage est en amont
+
+> ⚠️ **[2026-08-03 soir] LIRE LA §14 D'ABORD.** Elle invalide la « cause amont »
+> de la §13.1 (la L1 depasse la synchro et commande bien une reception) et rend
+> la §13.4 hors sujet (la zone `0x7700-0x79f0` n'est jamais executee, donc la
+> garde `@0x7e` n'est jamais evaluee). La cartographie de la chaine RX (§13.2) et
+> les pistes eliminees (§13.3, §13.5) restent valides.
 
 > Cette section PRIME sur la §12 et sur toutes les precedentes. Chaque fait nomme
 > son instrument. Toute affirmation sans instrument est une HYPOTHESE, y compris
@@ -38,9 +330,17 @@
 l'armement RX). Le DSP se comporte correctement : il n'arme pas un recepteur qu'on
 ne lui demande pas d'armer.
 
-**Cause amont** : `fb0_att=22, fb0_ret=0` (sonde `[fbsb]`). La L1 est encore en
+~~**Cause amont** : `fb0_att=22, fb0_ret=0` (sonde `[fbsb]`). La L1 est encore en
 phase de SYNCHRONISATION et ne commandera de reception qu'apres detection de la FB.
-Dependance circulaire : pas de FB -> pas de commande RX -> pas d'armement.
+Dependance circulaire : pas de FB -> pas de commande RX -> pas d'armement.~~
+
+> 🛑 **INVALIDE — [2026-08-03 soir], cf. §14.2.** Deux defauts. (1) `fb0_ret` est un
+> **compteur mort** (jamais incremente, toujours 0) : il n'etayait rien. (2) La
+> console du firmware montre FB0, FB1 puis SB qui **aboutissent** (BSIC=7,
+> `Synchronize_TDMA` x2), puis `l1s_nb_cmd()` qui **commande bien une reception**.
+> La L1 ne reste donc pas en synchro, et la dependance circulaire n'existe pas.
+> Le vrai point de rupture est en aval : `db_w->d_task_d` est ecrit NON NUL et
+> `db_r->d_task_d` est relu a **0** (`EMPTY`, `prim_rx_nb.c:74`).
 
 ### 13.2 LA CHAINE RX, CARTOGRAPHIEE ET VERIFIEE SAINE
 
@@ -236,8 +536,10 @@ run.** Sans `DISPATCH_INSTALL`, IT cablee et emise 20 fois :
 
 ```
 data[0x43d8] : 0xab38, 2 fois, PC=0xbb00, insn 2166/3093 — RIEN D'AUTRE
-0x728a : 0 entree     WMAP : dans plages=0     fb0_ret=0, data[] et api[] a zero
+0x728a : 0 entree     WMAP : dans plages=0     data[] et api[] a zero
 ```
+> ⚠️ **[2026-08-03]** cette trace citait `fb0_ret=0` : compteur mort (§14.3),
+> retire. `data[]`/`api[] a zero` porte seul la demonstration.
 Reproduit a l'identique en `MODE=shunt_legit` : le mode n'y change rien.
 
 **L'IT trame et l'installateur de handler sont deux trous INDEPENDANTS.** Le premier

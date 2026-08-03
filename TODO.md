@@ -28,7 +28,90 @@
 > manquant : la chaine RX complete existe dans le ROM, elle est saine, et elle
 > n'est jamais demandee. Ne pas repartir de la §2 sans lire d'abord la §13.
 
-## A. LE SEUL VERROU RESTANT — pourquoi `d_fb_det` n'est jamais publie
+## A. ~~LE SEUL VERROU RESTANT~~ — **PERIMEE le 03/08 au soir, cf. §14**
+
+> ⚠️ **NE PAS FAIRE.** Mesure `CALYPSO_FBROUTE=1` (24 M d'instructions, 54
+> tentatives FB) : la zone `0x7700-0x79f0` **n'est jamais executee**. La garde
+> `data[@0x7e]==4` n'est donc pas « jamais satisfaite », elle n'est **jamais
+> evaluee**. Resoudre DP ne donnera rien. Contrôle positif de la sonde et detail :
+> `doc/ETAT_ACTUEL.md` §14.4.
+
+### A-bis. ~~la commande RX s'evapore~~ — 🛑 **REFUTEE le 03/08 a 19:08, SOLDEE**
+
+> **Mesuree, puis refutee par la mesure meme qui devait la confirmer.** La sonde
+> `CALYPSO_DTASKD_WATCH=1` (trois pattes, `doc/ETAT_ACTUEL.md` §14.6) montre :
+> l'ARM ecrit `db_w->d_task_d` non nul **760 fois**, le DSP ecrit `db_r->d_task_d`
+> = `0x0018` (ALLC_DSP_TASK) **19 409 fois** depuis `PC=0xb001`, et l'ARM relit
+> `0x0018` **492 fois sur 500**. La chaine est SAINE. Les `EMPTY` sont
+> **sporadiques** (10 occurrences, noyees dans un flux continu de `hdlc_recv`),
+> pas un mur — je les avais pris pour un etat permanent sans les compter.
+>
+> **Ne pas rouvrir cette piste.** Ne pas non plus soupconner la bequille
+> `val = 24` du chemin de lecture : elle est ETEINTE ici (`SHUNT_LEGIT` et
+> `SHUNT_NO_LEGIT` a 0 au manifeste), c'est bien le DSP qui ecrit 24.
+
+### A-ter. LA VRAIE QUESTION — le CONTENU des bursts, pas leur ordonnancement
+
+**Ce qu'on sait.** Le mobile se synchronise (`Channel synched. ARFCN=514, snr=28,
+BSIC=7`, rxlev 63) puis : `Starting CS timer with 4 seconds` → `Cell search
+finished without result` → boucle. **Zero `SYSTEM INFORMATION`** dans `mobile.log`.
+L'ordonnancement RX etant mesure sain (A-bis), ce qui manque est ce que les bursts
+CONTIENNENT — donc `a_cd` et la chaine de demodulation.
+
+**⚠ Avant de conclure quoi que ce soit** : ce run a `CALYPSO_INJECT_ACD=0` et
+`CALYPSO_SHUNT_FEED_SI=0`, c'est-a-dire **sans** la recette du 30/07 qui faisait
+remonter les SI jusqu'a la couche 3. L'absence de SI y est donc **attendue** et ne
+prouve rien de neuf. Premier geste : refaire le point avec la recette connue
+(`INJECT_ACD=1 SHUNT_FEED_SI=1 SHUNT_SI_ROT_MASK=0`) pour savoir si on regarde une
+regression ou la configuration nue.
+
+### ~~A-bis (texte d'origine, conserve)~~ — la commande RX s'evapore entre `db_w` et `db_r`
+
+**Ce qu'on sait** (instrument : `osmocon.log`, la console du firmware — jamais
+lue jusqu'au 03/08 au soir, cf. §14.1) : la L1 **depasse la synchro** (FB0, FB1,
+SB, BSIC=7) et **commande bien une reception** — `l1s_nb_cmd()` s'execute et
+ecrit `db_w->d_task_d` NON NUL via `dsp_load_rx_task()`. Puis `l1s_nb_resp()`
+relit `db_r->d_task_d` et y trouve **0**, d'ou son `EMPTY`. Le firmware annote
+lui-meme ce test : `/* just for debugging, d_task_d should not be 0 */`.
+
+**Ce qu'il faut faire.** Une sonde sur la **CELLULE** `d_task_d` — les deux pages,
+en ECRITURE et en LECTURE, avec le numero de page effectif a chaque acces. Pas sur
+un PC : le §13.6 rappelle que surveiller une cellule est insensible aux erreurs
+d'adresse, et c'est exactement le piege dans lequel la §13.4 est tombee.
+
+**Hypothese a tester en premier** (la plus economique) : le mecanisme de page W/R.
+Le firmware bascule ses index (`sync.c` : `r_page ^= 1`) et publie
+`d_dsp_page = B_GSM_TASK|w_page`. Le modele a un historique documente sur cette
+cellule — overlay 2 octets du shunt qui latchait la page a 0 (§12) et page R
+ecrasee avant lecture. Si W et R ne designent pas la meme moitie de la fenetre
+API, l'ecriture atterrit la ou la lecture ne va pas : `EMPTY` en decoule
+mecaniquement.
+
+**Comment on saura que c'est fait.** La sonde montre, pour une meme trame, l'adresse
+ecrite par `l1s_nb_cmd` et l'adresse lue par `l1s_nb_resp`. Soit elles coincident
+(et l'hypothese page tombe, il faut chercher qui remet la cellule a zero entre les
+deux), soit elles different — et on a la racine.
+
+**⚠ MODE.** Tout ceci est mesure en `native_twl`, ou `PUBLISH_FB=1` **substitue**
+le resultat FB : c'est le TWL qui fournit le FBSB, **pas le DSP**. Le manque « le
+DSP ne publie jamais la FB » (A d'origine) reste entier, il est seulement masque
+par la bequille. Les deux manques sont **distincts** (§14.5) — celui-ci n'est
+observable QUE parce que la bequille porte la L1 au-dela de la synchro.
+
+### A-ter. Cabler ou retirer les temoins morts — FAIT pour `fb0_ret`
+
+`fb0_retries` / `afc_retries` etaient declares, remis a 0, imprimes, et
+**incrementes nulle part**. Le `fb0_ret=0` qui en sortait a ete cite comme mesure
+dans six endroits, dont le statut de reference. **Supprimes le 03/08** (§14.3).
+Meme classe de defaut, non corrigee : `CALYPSO_IRDA_CAPTURE` est declare dans
+`environnement/calypso.env:28` et n'a **aucun consommateur** dans tout l'arbre
+(`.c`, `.h`, `.sh`, `.py`) — `fw-irda.log` est cree vide et personne ne l'ecrit.
+Le commentaire du fichier en donne la raison : « firmware IrDA perdu au reclone ».
+**A faire** : soit retirer le gate, soit dire au manifeste qu'il est inerte.
+
+---
+
+### A (texte d'origine, conserve pour memoire)
 
 **Ce qu'il faut faire.** Resoudre l'adresse reelle de `@0x7e` et observer sa valeur.
 
@@ -1073,8 +1156,10 @@ réarmé faute d'IT ; câbler l'IT devrait faire tomber les deux béquilles. »
 
 ```
 data[0x43d8] : 0xab38, deux fois, PC=0xbb00, insn 2166 et 3093 — RIEN D'AUTRE
-0x728a       : 0 entrée      WMAP : dans plages=0      fb0_ret=0, data[] et api[] à zéro
+0x728a       : 0 entrée      WMAP : dans plages=0      data[] et api[] à zéro
 ```
+> ⚠️ **[2026-08-03]** `fb0_ret=0` retiré de cette trace : compteur mort
+> (`doc/ETAT_ACTUEL.md` §14.3). `data[]`/`api[] à zéro` porte seul la démonstration.
 
 Reproduit à l'identique en `MODE=shunt_legit` (63 s, 20 émissions, mêmes zéros) : le
 mode n'y change rien.

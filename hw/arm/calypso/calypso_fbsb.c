@@ -53,8 +53,8 @@ void calypso_fbsb_reset(CalypsoFbsb *s)
     s->fb0_attempt = 0;
     s->fb1_attempt = 0;
     s->sb_attempt  = 0;
-    s->fb0_retries = 0;
-    s->afc_retries = 0;
+    /* [2026-08-03] fb0_retries / afc_retries supprimes : jamais incrementes,
+     * donc toujours 0. Voir la note dans calypso_fbsb_dump(). */
     s->fn_started  = 0;
 }
 
@@ -147,15 +147,29 @@ void calypso_fbsb_dump(const CalypsoFbsb *s, const char *tag)
     int a_ang = fbsb_cell(s->api, b, NDB_A_SYNC_DEMOD_ANG);
     int a_snr = fbsb_cell(s->api, b, NDB_A_SYNC_DEMOD_SNR);
 
-    /* TOA et ANGLE sont signes cote firmware. */
+    /* TOA et ANGLE sont signes cote firmware.
+     *
+     * [2026-08-03] `fb0_ret` et `afc_ret` RETIRES de cette ligne. Ils etaient
+     * declares (calypso_fbsb.h), remis a zero dans calypso_fbsb_reset(), imprimes
+     * ici — et INCREMENTES NULLE PART dans tout l'arbre. Ils valaient donc
+     * structurellement 0 a chaque impression, quoi que fasse le firmware.
+     *
+     * Pourquoi ca comptait : ce zero a ete lu comme une MESURE et cite comme tel
+     * dans au moins six endroits, dont le statut de reference lui-meme
+     * (doc/ETAT_ACTUEL.md §13.1, « Cause amont : fb0_att=22, fb0_ret=0 [...] la L1
+     * est encore en phase de SYNCHRONISATION »). La conclusion tiree de ce champ
+     * etait fausse : la console firmware montre FB0, FB1 puis SB qui aboutissent
+     * (BSIC=7, `Synchronize_TDMA`) — la L1 depasse bien la synchro.
+     *
+     * On RETIRE au lieu de cabler : il n'existe aucune notion de « retry » dans ce
+     * module, en inventer une serait fabriquer une mesure de plus. Un compteur
+     * absent est honnete ; un compteur fige a 0 ment. */
     fprintf(stderr,
             "[fbsb] %s state=%s fb0_att=%u fb1_att=%u sb_att=%u "
-            "fb0_ret=%u afc_ret=%u "
             "data[](det=%d toa=%d pm=%d ang=%d snr=0x%04x) "
             "api[](det=%d toa=%d pm=%d ang=%d snr=0x%04x)%s\n",
             tag ? tag : "", names[s->state],
             s->fb0_attempt, s->fb1_attempt, s->sb_attempt,
-            s->fb0_retries, s->afc_retries,
             d_det, (int)(int16_t)d_toa, d_pm, (int)(int16_t)d_ang, d_snr & 0xFFFF,
             a_det, (int)(int16_t)a_toa, a_pm, (int)(int16_t)a_ang, a_snr & 0xFFFF,
             (d_det > 0 && a_det <= 0) ? "  <<<< DIVERGENCE data/api" : "");
