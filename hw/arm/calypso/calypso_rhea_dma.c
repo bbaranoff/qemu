@@ -69,6 +69,8 @@
 #include "qemu/osdep.h"
 #include "hw/arm/calypso/calypso_debug.h"
 #include "hw/arm/calypso/calypso_rhea_dma.h"
+#include "hw/arm/calypso/calypso_rif.h"
+#include "hw/arm/calypso/calypso_c54x.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -291,6 +293,157 @@ void calypso_rhea_dma_write(void *opaque, hwaddr off, uint64_t val, unsigned siz
 
     fprintf(stderr, "[rhea-dma] WR  +0x%02x = 0x%04x (hors carte §11)\n",
             (unsigned)off, v);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * [2026-08-03] LE TRANSFERT — CALYPSO_RHEA_DMA_XFER=1, defaut 0.
+ *
+ * POURQUOI MAINTENANT. Le TODO §E posait la condition : « implementer SEULEMENT
+ * si A debloque, il n'y aurait rien a transferer avant ». C'est fait — `0xa5cd`
+ * (armement RX) s'execute enfin et programme DMA2_AAD/ALGTH/CTRL avec ENABLE=1
+ * (cf. doc/ETAT_ACTUEL.md §14.12). Le firmware le confirme lui-meme en posant
+ * `DSP_ERR_DMA_PROG | DSP_ERR_DMA_TASK` (d_error_status = 24) a chaque trame :
+ * il a arme un transfert que personne n'executait.
+ *
+ * CE QUE FAIT CE CODE. A la reception d'un burst, quand le firmware a choisi le
+ * mode DMA (RDMA_MASK=0, decide par LUI dans SPCR, on ne force rien) :
+ *   1. vider le recepteur RIF vers la memoire API a l'adresse DMA2_AAD ;
+ *   2. borner le transfert a DMA2_ALGTH (longueur de page, en OCTETS §11.3.3) ;
+ *   3. poser IRQ_STATE, effacer DMA_START, et lever INT10n si IRQ_MODE=1.
+ *
+ * CE QUE CE CODE NE FAIT PAS, VOLONTAIREMENT :
+ *   · il n'arme rien de lui-meme — si ENABLE=0, il ne transfere pas. Le but est
+ *     de servir une demande du firmware, pas de la fabriquer ;
+ *   · il ne touche pas SPCR ni les masques : le choix IT/DMA reste au firmware ;
+ *   · il ne bascule pas de page (CURRENT_PAGE) : le double buffering du §11.3.5
+ *     n'est pas modelise. Si le firmware s'en sert, ca se verra comme un
+ *     ecrasement — a implementer alors, pas par anticipation.
+ *
+ * ⚠️ CHANGEMENT DE NATURE, d'ou le gate a 0 par defaut : ce module cesse d'etre
+ * un instrument de lecture pour devenir une piece de materiel. Tant que le gate
+ * est a 0, le comportement d'avant le 03/08 est strictement conserve.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+static bool rhea_dma_xfer_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = calypso_gate("CALYPSO_RHEA_DMA_XFER", 0);
+        fprintf(stderr, "[rhea-dma] TRANSFERT %s (CALYPSO_RHEA_DMA_XFER=%d) — %s\n",
+                on ? "ACTIF" : "inactif", on,
+                on ? "le controleur vide le RIF vers la memoire API"
+                   : "instrument de lecture seul, aucun transfert (defaut)");
+    }
+    return on != 0;
+}
+
+void calypso_rhea_dma_rx_request(C54xState *s)
+{
+    if (!rhea_dma_on() || !rhea_dma_xfer_on())
+        return;
+    rhea_dma_init();
+
+    const int n = 1;                 /* DMA2 = canal RIF RX (§6 Table 2) */
+    uint16_t ctrl = rd.ch[n].ctrl;
+
+    /* On ne sert que ce que le firmware a REELLEMENT arme. */
+    if (!(ctrl & CTRL_ENABLE)) {
+        static unsigned long long n_off;
+        if (n_off++ == 0 || (n_off % 5000) == 0)
+            fprintf(stderr, "[rhea-dma] requete RX x%llu ignoree : DMA2 ENABLE=0 "
+                    "(le firmware n'a pas arme ce canal — on ne l'arme pas a sa "
+                    "place)\n", n_off);
+        return;
+    }
+    if (!(ctrl & CTRL_DIRECTION)) {
+        static unsigned n_dir;
+        if (n_dir++ < 5)
+            fprintf(stderr, "[rhea-dma] requete RX ignoree : DMA2 DIRECTION=0 "
+                    "(API->Rhea), ce n'est pas une reception\n");
+        return;
+    }
+
+    /* ALGTH est une longueur en OCTETS (§11.3.3) ; la memoire API est en mots. */
+    int max_words = rd.ch[n].algth ? (int)(rd.ch[n].algth / 2) : 0;
+    if (max_words <= 0) {
+        static unsigned n_len;
+        if (n_len++ < 5)
+            fprintf(stderr, "[rhea-dma] requete RX ignoree : DMA2_ALGTH=%u — aucune "
+                    "longueur de page programmee\n", rd.ch[n].algth);
+        return;
+    }
+
+    uint16_t *api = s ? s->api_ram : NULL;
+    if (!api) {
+        static unsigned n_api;
+        if (n_api++ < 5)
+            fprintf(stderr, "[rhea-dma] requete RX ignoree : memoire API absente\n");
+        return;
+    }
+
+    /* AAD = offset en OCTETS depuis la base API -> index de mot dans api_ram.
+     * (mot DSP = 0x0800 + aad/2, et l'index api_ram est ce mot moins C54X_API_BASE,
+     * donc exactement aad/2.) */
+    unsigned dst_idx = (rd.ch[n].aad & 0x0FFF) / 2;
+    if (dst_idx + (unsigned)max_words > C54X_API_SIZE) {
+        max_words = (int)(C54X_API_SIZE - dst_idx);
+        static unsigned n_clip;
+        if (max_words <= 0) {
+            if (n_clip++ < 5)
+                fprintf(stderr, "[rhea-dma] requete RX ignoree : AAD=0x%03x hors "
+                        "memoire API\n", rd.ch[n].aad);
+            return;
+        }
+        if (n_clip++ < 5)
+            fprintf(stderr, "[rhea-dma] transfert TRONQUE a %d mots : AAD=0x%03x + "
+                    "ALGTH depasse la fenetre API\n", max_words, rd.ch[n].aad);
+    }
+
+    static uint16_t buf[4096];
+    if (max_words > (int)(sizeof(buf) / sizeof(buf[0])))
+        max_words = (int)(sizeof(buf) / sizeof(buf[0]));
+
+    int got = calypso_rif_drain(buf, max_words);
+    if (got <= 0) {
+        static unsigned long long n_empty;
+        if (n_empty++ == 0 || (n_empty % 5000) == 0)
+            fprintf(stderr, "[rhea-dma] requete RX x%llu : recepteur RIF vide, "
+                    "rien a transferer\n", n_empty);
+        return;
+    }
+
+    for (int i = 0; i < got; i++)
+        api[dst_idx + i] = buf[i];
+
+    rd.ch[n].cur_off = (uint16_t)(got * 2);
+
+    /* §11.3.5 : le transfert est fini -> IRQ_STATE, et DMA_START retombe. */
+    rd.ch[n].ctrl = (uint16_t)((rd.ch[n].ctrl | CTRL_IRQ_STATE) & ~CTRL_DMA_START);
+    if (rd.ch[n].ctrl & CTRL_ONE_SHOT)
+        rd.ch[n].ctrl &= (uint16_t)~CTRL_ENABLE;
+
+    {
+        static unsigned long long n_ok;
+        n_ok++;
+        if (n_ok <= 20 || (n_ok % 500) == 0)
+            fprintf(stderr, "[rhea-dma] *** TRANSFERT RX #%llu : %d mots RIF -> "
+                    "api_ram[0x%04x..0x%04x] (mot DSP 0x%04x, ARM 0x%08x) "
+                    "ALGTH=%u IRQ_MODE=%d ONE_SHOT=%d\n",
+                    n_ok, got, dst_idx, dst_idx + got - 1,
+                    (unsigned)(C54X_API_BASE + dst_idx),
+                    0xFFD00000u + (rd.ch[n].aad & 0x0FFF),
+                    rd.ch[n].algth, !!(rd.ch[n].ctrl & CTRL_IRQ_MODE),
+                    !!(rd.ch[n].ctrl & CTRL_ONE_SHOT));
+    }
+
+    /* §11.3.5 IRQ_MODE : c'est le firmware qui a decide s'il veut l'interruption. */
+    if ((rd.ch[n].ctrl & CTRL_IRQ_MODE) && s) {
+        static unsigned long long n_it;
+        n_it++;
+        if (n_it <= 10 || (n_it % 500) == 0)
+            fprintf(stderr, "[rhea-dma] end-DMA -> INT10n (vec%d/bit%d) #%llu\n",
+                    C54X_IT_DMA_VEC, C54X_IT_DMA_BIT, n_it);
+        c54x_interrupt_ex(s, C54X_IT_DMA_VEC, C54X_IT_DMA_BIT);
+    }
 }
 
 /* Pont XIO : le MEME banc de registres, vu du bus Rhea du DSP.

@@ -77,6 +77,7 @@
 #include "hw/arm/calypso/calypso_debug.h"
 #include "hw/arm/calypso/calypso_c54x.h"
 #include "hw/arm/calypso/calypso_rif.h"
+#include "hw/arm/calypso/calypso_rhea_dma.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -293,6 +294,30 @@ bool calypso_rif_portw(C54xState *s, uint16_t pa, uint16_t val)
     }
 }
 
+int calypso_rif_drain(uint16_t *dst, int max)
+{
+    if (!calypso_rif_on() || !dst || max <= 0)
+        return 0;
+    rif_init();
+
+    int got = 0;
+    while (got < max) {
+        if (rif.fifo_n == 0) {
+            rif_refill();          /* meme realimentation que la lecture de DRR */
+            if (rif.fifo_n == 0)
+                break;             /* recepteur vide : on rend ce qu'on a */
+        }
+        dst[got++] = rif.fifo[0];
+        memmove(&rif.fifo[0], &rif.fifo[1],
+                (size_t)(rif.fifo_n - 1) * sizeof(uint16_t));
+        rif.fifo_n--;
+    }
+    /* Le recepteur s'est vide : RSRFULL n'a plus lieu d'etre (§12.6). */
+    if (got && rif.fifo_n == 0 && rif.stage_pos >= rif.stage_n)
+        rif.rsrfull = false;
+    return got;
+}
+
 void calypso_rif_rx_burst(C54xState *s, const uint16_t *w, int n)
 {
     if (!calypso_rif_on() || !w || n <= 0)
@@ -327,8 +352,14 @@ void calypso_rif_rx_burst(C54xState *s, const uint16_t *w, int n)
         rif.n_int++;
         c54x_interrupt_ex(s, C54X_IT_RIF_RX_VEC, C54X_IT_RIF_RX_BIT);
     }
-    if (rdma)
+    if (rdma) {
         rif.n_dma++;
+        /* [2026-08-03] La requete de fin de DMA du §3.7.1 a enfin un destinataire.
+         * Jusqu'ici on comptait la requete sans la servir : le controleur RHEA
+         * journalisait sans transferer. Sans effet si CALYPSO_RHEA_DMA_XFER=0
+         * (defaut) — le comportement d'avant est strictement conserve. */
+        calypso_rhea_dma_rx_request(s);
+    }
 
     if (rif.n_burst <= 10 || (rif.n_burst % 500) == 0)
         fprintf(stderr, "[rif] burst #%u n=%d -> FIFO %d/%d ; RINT_MASK=%d "

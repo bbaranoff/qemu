@@ -165,6 +165,26 @@ c'est un vrai changement de comportement, a valider sous charge.
 
 **Candidat d'explication** pour les ecrasements de page R deja documentes.
 
+## E. Implementer le transfert DMA — ✅ **CONDITION REMPLIE le 03/08, c'est LE mur**
+
+> 🏁 **Le « si A debloque » est acquis.** `0xa5cd` (armement RX) s'execute pour la
+> premiere fois : le tremplin `data[0x0158]` est installe et `DMA2_AAD`/`ALGTH`/
+> `CTRL` sont programmes avec `ENABLE=1`. Il y a donc enfin quelque chose a
+> transferer. Deux defauts du MODELE le bloquaient (`doc/ETAT_ACTUEL.md` §14.12) :
+> `FORCE_TASK` ecrivait `data[]` au lieu d'`api_ram[]` (corrige), et la famille
+> `0xF1xx` ALU n'etait pas decodee (sas `FIX_F1XX_ALU_LK`).
+>
+> **Preuve que c'est bien le mur suivant** : le firmware imprime `DSP Error Status:
+> 24` a chaque trame = `DSP_ERR_DMA_PROG | DSP_ERR_DMA_TASK`. Ce n'est pas une
+> erreur mais un **temoin** (`doc/DSP_ARM_LINKAGE.md`) : le DSP a arme son DMA, et
+> `calypso_rhea_dma.c` n'execute aucun transfert. `A_CD-WR` reste donc a 0.
+>
+> ⚠️ Avant de coder : `FIX_F1XX_ALU_LK` est encore dans le SAS. Le valider sous
+> charge (camp -> LU -> SMS) AVANT d'empiler un changement de nature par-dessus,
+> sinon on ne saura plus lequel des deux a casse quoi.
+
+### E (texte d'origine)
+
 ## E. Implementer le transfert DMA — SEULEMENT si A debloque
 
 `calypso_rhea_dma.c` enregistre et journalise mais **n'execute aucun transfert**.

@@ -7976,6 +7976,117 @@ static int c54x_exec_one(C54xState *s)
             return consumed + s->lk_used;
         }
         if (hi8 == 0xF0 || hi8 == 0xF1) {
+            /* ═══════════════════════════════════════════════════════════════
+             * [2026-08-03] FIX_F1XX_ALU_LK — SAS (CALYPSO_FIXES=FIX_F1XX_ALU_LK).
+             *
+             * LE DEFAUT. Les handlers ALU a immediat long existent, mais ils sont
+             * IMBRIQUES dans `if (hi8 == 0xF2)` (l.~8241) et `if (hi8 == 0xF3)`
+             * (l.~8576). Un opcode `0xF1xx` ne peut donc jamais les atteindre, et
+             * ce bloc-ci ne contient AUCUN test de masque FCF0/FCE0/FCFF — que des
+             * correspondances exactes (F072/F073/F074...). La famille
+             * ADD/SUB/LD/AND/OR/XOR #lk avec DST=B (bit 8) n'est donc pas decodee.
+             *
+             * ⚠️ LE COMMENTAIRE JUSTE EN DESSOUS AFFIRME L'INVERSE — il dit que les
+             * 0xF1xx « tombent dans » les masques FCE0/FCFF/FCF0 « L3915/L3852/
+             * L3886 ». C'est FAUX : ces handlers sont sous les gardes 0xF2/0xF3.
+             * Le commentaire decrit une intention, pas le code. Il est conserve
+             * tel quel plus bas comme piece a conviction (meme motif que les deux
+             * commentaires XPCWATCH pris en defaut le 03/08).
+             *
+             * MESURE QUI L'ETABLIT (sonde CHAIN-B05F, dispatcher de tache) :
+             *     0xb060  LD          A = 0x000018   (correct)
+             *     0xb062  f130 7fff   A = 0x005294   <- A ecrase
+             *     0xb066  f843     -> 0xb077          bailout, 33/33 passages
+             * `0xF130` devrait etre `AND #0x7fff, A, B` (subop=3, src_b=0 -> A,
+             * dst_b=1 -> B) : il doit ecrire B et laisser A INTACT.
+             *
+             * ⚠️ CE QUI RESTE INEXPLIQUE, a ne pas masquer : la provenance exacte
+             * de `0x5294` (constante, independante de l'entree). Un opcode non
+             * decode devrait laisser A tranquille, pas y ecrire une constante. Ce
+             * correctif rend le decodage CORRECT ; il ne prouve pas qu'il etait la
+             * seule cause. Si `A` continue d'etre ecrase avec le fix actif, le
+             * fallback lui-meme est en cause et il faudra l'instrumenter.
+             *
+             * PORTEE. Ce correctif touche TOUTES les instructions 0xF1xx du
+             * firmware, pas seulement le dispatcher de tache — d'ou le sas plutot
+             * qu'un correctif direct. Protocole `environnement/fixes.env` : valider
+             * SOUS CHARGE (camp + LU + SMS), puis effacer LA CONDITION, pas le
+             * correctif. Trois niveaux de validation exiges par le fichier :
+             * formel (binutils/SPRU172C), grandeur physique, chemin fonctionnel.
+             *
+             * L'implementation est un copier-conforme de la branche `hi8 == 0xF3`
+             * (mask FCF0), volontairement : meme arithmetique, meme traitement du
+             * shift et du signe, meme selection src/dst. Toute divergence entre les
+             * deux serait un bug de plus, pas une amelioration. */
+            /* [2026-08-03] CONDITION EFFACEE — le correctif est CONFIRME et devient
+             * le comportement normal. Protocole `environnement/fixes.env` : « des
+             * qu'un correctif est confirme, EFFACER LA CONDITION dans le code, pas
+             * le correctif. Un sas se vide, une bequille reste. »
+             *
+             * PREUVE RETENUE (A/B en `native_twl_host_demod`, 03/08) :
+             *   effet positif : `0xa5cd` (armement RX) s'execute pour la premiere
+             *     fois — la chaine de dispatch franchit 0xb066, atteint 0xb070
+             *     (resolution d'index) puis le CALA ;
+             *   effet negatif : AUCUN observable perdu. Camp, SI et CHANNEL REQUEST
+             *     tous presents et au moins aussi nombreux qu'avant (SI 8 vs 7,
+             *     camp 46 vs 30/42, CHAN_REQ 15 vs 10/14).
+             *
+             * ⚠️ LIMITE ASSUMEE, a connaitre : le niveau 3 complet de fixes.env
+             * (camp -> LU -> SMS) est STRUCTURELLEMENT inexercable sur ce correctif.
+             * Le seul banc qui va jusqu'au SMS est `shunt_legit`, et il pose
+             * `CALYPSO_DSP_RUN_C54X=0` (calypso_shunt_legit.env:29) — l'interpreteur
+             * c54x n'y tourne pas, donc ce correctif n'y est jamais execute. Ce
+             * n'est pas un manque de rigueur : aucun banc ne reunit aujourd'hui
+             * « c54x actif » et « LU complet ». Le LU n'aboutit pas non plus en
+             * native_twl_host_demod (mesure : 0 LU ACCEPT, 0 TMSI, pas d'IMM
+             * ASSIGN) — ce qui marchait, et qui marche toujours, c'est camp + SI.
+             * Reevaluer quand le chemin DSP ira plus loin (apres le DMA). */
+            if ((op & 0xFCF0) == 0xF000 ||  /* ADD #lk, SHIFT, src, [dst] */
+                (op & 0xFCF0) == 0xF010 ||  /* SUB */
+                (op & 0xFCF0) == 0xF020 ||  /* LD  */
+                (op & 0xFCF0) == 0xF030 ||  /* AND */
+                (op & 0xFCF0) == 0xF040 ||  /* OR  */
+                (op & 0xFCF0) == 0xF050) {  /* XOR */
+                op2 = prog_fetch(s, s->pc + 1 + (s->lk_used ? 1 : 0));
+                consumed = 2;
+                int subop     = (op >> 4) & 0xF;
+                int shift_raw = op & 0xF;
+                int shift     = (shift_raw & 0x8) ? (shift_raw - 16) : shift_raw;
+                int src_b     = (op >> 9) & 1;
+                int dst_b     = (op >> 8) & 1;
+                int64_t src   = src_b ? s->b : s->a;
+                /* ADD/SUB/LD : lk signe ; AND/OR/XOR : lk non signe. */
+                int64_t lk_base = (subop <= 2) ? (int64_t)(int16_t)op2
+                                               : (int64_t)(uint16_t)op2;
+                int64_t lk_val  = (shift >= 0) ? (lk_base << shift)
+                                               : (lk_base >> (-shift));
+                int64_t result = src;
+                switch (subop) {
+                case 0x0: result = src + lk_val; break;   /* ADD */
+                case 0x1: result = src - lk_val; break;   /* SUB */
+                case 0x2: result = lk_val;       break;   /* LD (src ignore) */
+                case 0x3: result = src & lk_val; break;   /* AND */
+                case 0x4: result = src | lk_val; break;   /* OR  */
+                case 0x5: result = src ^ lk_val; break;   /* XOR */
+                }
+                if (dst_b) s->b = sext40(result); else s->a = sext40(result);
+                {   /* Trace bornee : un correctif d'ISA doit pouvoir se constater,
+                     * pas se supposer. 40 lignes, sous le gate du sas. */
+                    static unsigned _n = 0;
+                    if (_n < 40) {
+                        _n++;
+                        fprintf(stderr,
+                                "[c54x] FIX_F1XX_ALU_LK #%u pc=0x%04x op=0x%04x lk=0x%04x "
+                                "subop=%d shift=%d src=%s dst=%s -> %s=0x%06llx insn=%u\n",
+                                _n, s->pc, op, op2, subop, shift,
+                                src_b ? "B" : "A", dst_b ? "B" : "A",
+                                dst_b ? "B" : "A",
+                                (unsigned long long)((dst_b ? s->b : s->a) & 0xFFFFFFULL),
+                                s->insn_count);
+                    }
+                }
+                return consumed + s->lk_used;
+            }
             /* FIRS catch RETIRÉ (2026-05-25 v3, Claude web review).
              *
              * Le bloc `if (hi8 == 0xF1) { FIRS treatment }` qui était ici

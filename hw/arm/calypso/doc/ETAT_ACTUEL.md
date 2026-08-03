@@ -210,6 +210,105 @@ dans `data[0x43d8]`, et pourquoi ne le fait-il jamais ?** C'est un probleme
 d'INSTALLATION de handler, pas d'ordonnancement, pas de lecture de mailbox, pas de
 demodulation. Toutes les autres branches sont mesurees saines.
 
+> ⚠️ **[2026-08-03 soir] QUESTION DEPASSEE, cf. §14.12.** `data[0x43d8]`/`0xb01e`
+> n'est PAS le chemin d'ordonnancement du travail NB : le bloc `0xaff9` qui le
+> contient est un **miroir page W -> page R suivi d'un hook de patch vide**, sans
+> aucune comparaison ni branchement sur la valeur de la tache (dump ROM : six
+> paires `10e1 <k>` / `80e2 <k>`, puis huit NOP autour du `CALA`). Le vrai
+> dispatcher est `0xb05f`. Ne pas repartir sur `0x43d8`.
+
+### 14.12 🏁 LE VERROU EST TOMBE — deux defauts du MODELE, pas du firmware
+
+**Le mur « le DSP n'arme jamais sa reception » est leve.** Il ne tenait pas au
+firmware ni au silicium, mais a **deux defauts de l'emulateur**, trouves par la
+mesure et corriges le 03/08.
+
+#### Defaut 1 — `FORCE_TASK` ecrivait dans le mauvais tableau (CORRIGE)
+
+La bequille `CALYPSO_FORCE_TASK` posait les trois cellules de tache dans
+`s->data[]`. Or pour toute adresse de la fenetre API, le DSP lit `s->api_ram[]` :
+
+```c
+data_read_locked() :
+  if (addr >= C54X_API_BASE && addr < ...+C54X_API_SIZE)
+      v = s->api_ram[addr - C54X_API_BASE];
+```
+
+La tache atterrissait donc dans un tableau que personne ne lit. Le miroir etait
+**deja fait quinze lignes plus bas** pour `d_dsp_page` — la contrainte etait
+connue, pas appliquee. Mesure avant/apres (sonde `LD-TRACE`) :
+
+```
+avant : addr=0x0814  data[addr]=0x0018  val_lue=0x0000
+apres : addr=0x0814  data[addr]=0x0018  val_lue=0x0018
+```
+
+#### Defaut 2 — la famille `0xF1xx` ALU n'etait pas decodee (SAS)
+
+Les handlers ALU a immediat long (masque FCF0) existent et sont corrects, mais ils
+sont **imbriques** dans `if (hi8 == 0xF2)` et `if (hi8 == 0xF3)`. Le bloc
+`if (hi8 == 0xF0 || hi8 == 0xF1)` ne contient aucun test de masque. Un opcode
+`0xF1xx` — c'est-a-dire les variantes avec DST=B — n'etait donc jamais decode.
+
+⚠️ **Un commentaire du code affirmait l'inverse** (« les 0xF1xx tombent dans les
+masques FCE0/FCFF/FCF0 »). Il decrivait une intention. Conserve en place comme
+piece a conviction. Troisieme commentaire pris en defaut le meme jour, apres les
+deux de `XPCWATCH`.
+
+Correctif : `CALYPSO_FIXES=FIX_F1XX_ALU_LK` (sas, cf. `environnement/fixes.env`),
+copie conforme de la branche `hi8 == 0xF3`.
+
+#### Le deblocage, mesure
+
+```
+                        avant            apres
+0xb062 (AND #lk,A,B)    A ecrase 0x5294  A = 0x0018 PRESERVE (le AND ecrit B)
+0xb066                  bailout 33/33    franchi
+0xb070                  jamais atteint   12 passages — resolution d'index
+0xa5cd  ARMEMENT RX     jamais           **EXECUTE**
+```
+
+`0xa5cd` installe le tremplin `data[0x0158]` ET programme `DMA2_AAD`/`ALGTH`/`CTRL`
+avec `ENABLE=1`. C'est le verrou cherche depuis des semaines.
+
+#### 14.12.1 LE MUR S'EST DEPLACE VERS LE DMA
+
+Le firmware imprime desormais `DSP Error Status: 24` a chaque trame.
+
+**Ce n'est PAS une erreur.** `doc/DSP_ARM_LINKAGE.md` §`d_error_status` :
+`d_error_status == data[0x3f92] & 0x0FFF` — le DSP **recopie son mot d'etat
+interne**, il ne calcule aucun code d'erreur ; l'ARM l'imprime et l'efface
+(`sync.c:249`), le DSP le repose : *« un DSP Error Status n'est pas en soi un
+blocage, c'est un temoin »*. Ce ne sont donc pas 16 000 erreurs mais **un etat**,
+reaffiche a chaque trame.
+
+`24 = 0x0008 | 0x0010` = **`DSP_ERR_DMA_PROG` | `DSP_ERR_DMA_TASK`**
+(`dsp_api.h:1541`). Les deux temoins DMA.
+
+**Lecture** : le DSP arme enfin son DMA de reception, et le modele ne le sert pas —
+`calypso_rhea_dma.c` « enregistre et journalise, **n'execute aucun transfert** »
+(§13.7). D'ou `A_CD-WR` toujours a 0 : la reception est armee, mais aucun burst
+n'arrive.
+
+⚠️ **Piege d'interpretation a ne pas repeter** : les runs precedents affichaient
+`DSP Error Status` = **0**, et j'ai d'abord lu la comparaison comme une REGRESSION
+du correctif. Faux : ce zero signifiait « le DSP n'arme jamais rien », donc le
+temoin ne POUVAIT pas s'allumer. **Un compteur a zero peut mesurer l'absence de la
+cause, pas la sante du systeme.** Quatrieme variante du meme piege dans la journee,
+apres `fb0_ret`, `ARM RD a_cd` et `CALYPSO_A_TRACE_PC`.
+
+#### 14.12.2 CE QUI RESTE OUVERT
+
+1. **`0x5294` inexplique.** Un opcode non decode devrait laisser `A` tranquille,
+   pas y ecrire une constante independante de l'entree. Le correctif rend le
+   decodage correct ; il ne prouve pas que c'etait le seul mecanisme. A
+   instrumenter au niveau du fallback si ca ressort.
+2. **`FIX_F1XX_ALU_LK` est dans le SAS**, pas valide. Il capture aussi `hi8 ==
+   0xF0` (mesure : `f020`/`f010` tracees). Validation exigee de niveau 3 :
+   camp -> LU -> SMS. Un fix d'ISA touche tout le firmware.
+3. **Le transfert DMA** — c'est le mur suivant, et le `TODO.md` §E l'avait ecrit
+   d'avance : « implementer SEULEMENT si A debloque ». La condition est remplie.
+
 **Corollaire** : la §13.1 (« `d_task_d` ecrite 913 fois toujours a 0 », moniteur
 mailbox) ne surveillait qu'une adresse — elle n'a vu que les remises a zero de
 `l1s_nb_resp` (`prim_rx_nb.c:160`) et a manque les 760 commandes non nulles.
