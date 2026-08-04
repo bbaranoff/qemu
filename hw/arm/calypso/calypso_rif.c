@@ -128,6 +128,11 @@ static struct {
     bool     drr_valid;
 
     unsigned n_burst, n_drr_rd, n_spcr_rd, n_spcr_wr, n_int, n_dma, n_overrun;
+
+    /* [2026-08-04] BEQUILLE RIF_BACKPRESSURE : bursts refuses faute de place,
+     * et bursts imposes par la soupape anti-blocage. `bp_run` = refus
+     * consecutifs en cours. */
+    unsigned n_bp_skip, n_bp_force, bp_run;
 } rif;
 
 bool calypso_rif_on(void)
@@ -140,6 +145,70 @@ bool calypso_rif_on(void)
                     "redeviennent des no-op (comportement d'avant le 03/08)\n");
     }
     return on != 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * @BEQUILLE — RIF_BACKPRESSURE  (CALYPSO_RIF_BACKPRESSURE, defaut 0)
+ *
+ *   (1) C'EST UNE BEQUILLE. Le silicium n'a pas de contre-pression : quand un
+ *       burst arrive et que le precedent n'est pas lu, le recepteur ECRASE et
+ *       pose RSRFULL (§12.6). Refuser la livraison est une DEVIATION du
+ *       materiel, pas une correction de modele.
+ *
+ *   (2) CE QU'ELLE MASQUE : l'interpreteur c54x est ~96x trop lent
+ *       (cf. natif-mur-vitesse-interpreteur-c54x). Mesure du 04/08 sur un run
+ *       native_twl : 73 500 bursts pousses pour 54 492 overruns — 74 % des
+ *       bursts ecrasent un predecesseur non consomme, et le DSP ne draine que
+ *       ~4 mots (RIF_FIFO_DEPTH) sur les 296 avant l'ecrasement suivant. Le
+ *       DMA transporte donc des zeros, `a_cd` est publie vide, et un SI ne
+ *       sort que quand le hasard aligne remplissage/drainage/RRST. Tant que
+ *       cette gate est a 1, on ne mesure PLUS le vrai debit du DSP : on
+ *       observe un banc ralenti a sa main.
+ *
+ *   (3) QUAND LA RETIRER : des que le DSP consomme un burst entier dans le
+ *       temps d'une trame — c'est-a-dire quand l'interpreteur est assez
+ *       rapide (JIT, ou budget par trame revu). Juge : `overrun` doit tomber
+ *       proche de 0 avec la gate a 0. Si `n_bp_force` est non nul, le DSP ne
+ *       consomme toujours pas et la soupape a du forcer : la bequille ne
+ *       suffit pas, ce n'est pas un progres.
+ *
+ * PORTEE RESTREINTE (corrige le 04/08 apres mesure) : la contre-pression ne
+ * s'applique QUE si un chemin de drainage est arme (RDMA ou RINT demasque).
+ * Recepteur non arme = rien ne videra jamais l'etage : refuser reviendrait a
+ * jeter des bursts frais pour proteger un burst mort. Dans ce cas on ecrase,
+ * comme le materiel.
+ *
+ * SOUPAPE ANTI-BLOCAGE : sans elle, un DSP qui cesse de lire figerait la
+ * reception pour toujours. Apres CALYPSO_RIF_BP_MAX_SKIP refus consecutifs
+ * (defaut 200), on impose le burst suivant et on le journalise.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+static bool rif_backpressure_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = calypso_gate("CALYPSO_RIF_BACKPRESSURE", 0);
+        fprintf(stderr, "[rif] BEQUILLE contre-pression %s "
+                "(CALYPSO_RIF_BACKPRESSURE=%d) — %s\n",
+                on ? "ACTIVE" : "inactive", on,
+                on ? "un burst n'ecrase plus un predecesseur non lu ; "
+                     "DEVIATION du §12.6, le debit mesure n'est plus celui du DSP"
+                   : "comportement materiel conserve : ecrasement + RSRFULL (defaut)");
+    }
+    return on != 0;
+}
+
+/* Valeur NUMERIQUE : `calypso_gate` ne rend que 0/1, il ne convient pas ici.
+ * Idiome getenv+atoi, comme les autres seuils du modele. */
+static unsigned rif_bp_max_skip(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("CALYPSO_RIF_BP_MAX_SKIP");
+        v = e ? atoi(e) : 200;
+        if (v <= 0)
+            v = 200;   /* une soupape a 0 serait un blocage garanti */
+    }
+    return (unsigned)v;
 }
 
 /* §12.6 note bit2 « Unused », §12.3 s'en sert. On expose RRDY = « une donnee est
@@ -335,7 +404,41 @@ void calypso_rif_rx_burst(C54xState *s, const uint16_t *w, int n)
             fprintf(stderr, "[rif] OVERRUN #%u : %d mots du burst precedent non lus "
                     "(RSRFULL pose, cf. §12.6 : le bit garde la trace du probleme)\n",
                     rif.n_overrun, rif.stage_n - rif.stage_pos);
+
+        /* @BEQUILLE RIF_BACKPRESSURE — voir rif_backpressure_on() plus haut.
+         * On REFUSE le nouveau burst au lieu d'ecraser, pour que le DSP ait le
+         * temps de consommer les 296 mots au lieu des ~4 qu'il draine sinon.
+         * RSRFULL reste pose : le firmware garde la trace du probleme. */
+        /* [2026-08-04, correction du jour meme] N'appliquer la contre-pression
+         * QUE si un chemin de drainage est arme. Mesure : `RDMA_MASK=1` sur 36
+         * des 52 lignes `[rif] burst #` echantillonnees — le recepteur n'est pas
+         * arme la moitie du temps. Refuser un burst dans ce cas est NUISIBLE :
+         * l'etage perime ne sera jamais draine, on jette donc des bursts frais
+         * jusqu'a ce que la soupape force (mesure : 38 BP-FORCE, et un
+         * `292/296 mots encore a lire` inchange apres 200 refus). Quand rien
+         * n'est arme, le comportement materiel — ecraser — est le bon. */
+        bool drain_arme = !(rif.spcr & SPCR_RDMA_MASK) ||
+                          !(rif.spcr & SPCR_RINT_MASK);
+        if (rif_backpressure_on() && drain_arme) {
+            if (++rif.bp_run <= rif_bp_max_skip()) {
+                rif.n_bp_skip++;
+                if (rif.n_bp_skip <= 10 || (rif.n_bp_skip % 2000) == 0)
+                    fprintf(stderr, "[rif] BP-SKIP #%u : burst refuse, %d/%d mots "
+                            "du precedent encore a lire (refus consecutifs %u/%u)\n",
+                            rif.n_bp_skip, rif.stage_n - rif.stage_pos,
+                            rif.stage_n, rif.bp_run, rif_bp_max_skip());
+                return;          /* pas de livraison, donc pas de notification */
+            }
+            /* Soupape : le DSP ne consomme plus, on impose le burst pour ne pas
+             * figer la reception. Un compteur non nul ici DEMENT le progres. */
+            rif.n_bp_force++;
+            fprintf(stderr, "[rif] BP-FORCE #%u : %u refus consecutifs atteints "
+                    "(CALYPSO_RIF_BP_MAX_SKIP), burst impose — le DSP ne draine "
+                    "plus, la contre-pression ne suffit pas\n",
+                    rif.n_bp_force, rif.bp_run);
+        }
     }
+    rif.bp_run = 0;
 
     memcpy(rif.stage, w, (size_t)n * sizeof(uint16_t));
     rif.stage_n = n;
@@ -371,4 +474,8 @@ void calypso_rif_rx_burst(C54xState *s, const uint16_t *w, int n)
                              : "AUCUNE notification — les deux masques sont poses, "
                                "le firmware n'a pas arme le recepteur"),
                 rif.n_int, rif.n_dma, rif.n_overrun);
+
+    if (rif_backpressure_on() && (rif.n_burst <= 10 || (rif.n_burst % 500) == 0))
+        fprintf(stderr, "[rif] BP-BILAN burst=%u overrun=%u refuses=%u imposes=%u\n",
+                rif.n_burst, rif.n_overrun, rif.n_bp_skip, rif.n_bp_force);
 }

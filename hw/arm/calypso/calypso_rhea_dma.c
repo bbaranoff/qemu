@@ -429,6 +429,11 @@ void calypso_rhea_dma_rx_request(C54xState *s)
      * attendait deux tampons distincts (AAD et AAD+ALGTH), ca se verrait comme
      * un ecrasement de la premiere moitie. */
     int total = 0, pages = 0;
+    /* [2026-08-04] Comptage du contenu accumule SUR TOUTES LES PAGES. L'ancienne
+     * sonde bouclait sur `buf[0..total[` alors que `buf` ne contient QUE la
+     * derniere page (max_words mots) : au-dela elle relisait des restes. */
+    int nz_total = 0;
+    uint16_t head8[8] = {0};
     for (;;) {
         int got = calypso_rif_drain(buf, max_words);
         if (got <= 0)
@@ -436,6 +441,11 @@ void calypso_rhea_dma_rx_request(C54xState *s)
 
         for (int i = 0; i < got; i++)
             api[dst_idx + i] = buf[i];
+
+        for (int i = 0; i < got; i++)
+            if (buf[i]) nz_total++;
+        if (pages == 0)
+            for (int i = 0; i < 8 && i < got; i++) head8[i] = buf[i];
 
         total += got;
         pages++;
@@ -488,17 +498,19 @@ void calypso_rhea_dma_rx_request(C54xState *s)
          * amont, dans ce que l'hote injecte au RIF ; des valeurs IQ plausibles
          * disent (1) et il faudra trouver quel tampon le PM interrogue.
          * Plafonne aux 10 premiers transferts — c'est un diagnostic, pas une trace. */
-        if (n_ok <= 10) {
-            int nz = 0;
-            for (int i = 0; i < got; i++)
-                if (buf[i]) nz++;
+        /* [2026-08-04] ⚠️ CORRECTIF DE SONDE. L'ancienne version etait plafonnee
+         * a `n_ok <= 10`, donc elle ne regardait QUE les 10 premiers transferts —
+         * c'est-a-dire le DEMARRAGE, ou l'entree est reellement vide (mesure
+         * FEED-FP : bursts #1..#5 a nz=0/2368, puis #6 a nz=2211/2368). D'ou la
+         * conclusion FAUSSE, repetee plusieurs fois, que « le DMA transporte des
+         * zeros ». Meme cadence que la ligne TRANSFERT au-dessus, pour qu'un
+         * echantillon corresponde toujours a un transfert journalise. */
+        if (n_ok <= 20 || (n_ok % 500) == 0) {
             fprintf(stderr, "[rhea-dma]     contenu : %d/%d mots non nuls ; "
                     "8 premiers = %04x %04x %04x %04x %04x %04x %04x %04x\n",
-                    nz, got,
-                    got > 0 ? buf[0] : 0, got > 1 ? buf[1] : 0,
-                    got > 2 ? buf[2] : 0, got > 3 ? buf[3] : 0,
-                    got > 4 ? buf[4] : 0, got > 5 ? buf[5] : 0,
-                    got > 6 ? buf[6] : 0, got > 7 ? buf[7] : 0);
+                    nz_total, total,
+                    head8[0], head8[1], head8[2], head8[3],
+                    head8[4], head8[5], head8[6], head8[7]);
         }
     }
 

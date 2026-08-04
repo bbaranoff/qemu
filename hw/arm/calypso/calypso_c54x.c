@@ -1660,6 +1660,74 @@ static uint16_t data_read(C54xState *s, uint16_t addr)
      * sont de toute façon visibles côté écriture. */
     calypso_mbx(MBX_DSP_RD, addr, s->data[addr], 0, s->pc, 0, s->insn_count);
 
+    /* ─────────────────────────────────────────────────────────────────────────
+     * [2026-08-04] FEED-DST — QUEL TAMPON LE DEMOD LIT-IL VRAIMENT ?
+     * Gate CALYPSO_FEED_DST (defaut 0). LECTURE SEULE, plafonnee.
+     *
+     * CE QU'ON TRANCHE. Mesure du 04/08 : le DMA livre du VRAI IQ
+     * (`contenu : 295/296 mots non nuls` en regime, empreintes variees) et le DSP
+     * publie quand meme 89 % de zeros dans `a_cd`. Avant d'accuser le decodeur
+     * d'opcodes, il faut savoir si le demod lit seulement la ou le DMA ecrit.
+     *
+     *   zone A = 0x0cce..0x0df5 : DESTINATION du DMA (AAD=0x99c -> api_ram[0x4ce],
+     *            mot DSP 0x0800+0x4ce). C'est la que le vrai IQ arrive.
+     *   zone B = 0x4c00..0x4d27 : tampon corrélateur (CALYPSO_BSP_DARAM_ADDR),
+     *            celui que corr_iq.py analyse.
+     *
+     * LECTURE DU RESULTAT : A>0 et B=0 -> le demod lit bien le DMA, le probleme
+     * est en aval (decodeur/ALU). A=0 et B>0 -> il lit un tampon que le DMA
+     * n'alimente pas : ca suffit a expliquer les zeros SANS bug d'ALU. Les deux
+     * a 0 -> ni l'un ni l'autre, et c'est la question qui change.
+     *
+     * ⚠️ Compte des LECTURES, pas des trames : un ratio A/B ne dit pas « le demod
+     * prefere A », il dit combien de mots ont ete lus ou. Et les PC listes sont
+     * les 8 PREMIERS distincts rencontres, pas les plus frequents. */
+    {
+        static int fd_on = -1;
+        if (fd_on < 0) {
+            fd_on = calypso_gate("CALYPSO_FEED_DST", 0);
+            /* Trace d'armement : sans elle, une sonde muette serait
+             * indiscernable d'une sonde eteinte. Si FEED-DST s'annonce ARMEE et
+             * qu'aucune ligne A/B ne suit, la reponse est « le demod ne lit NI
+             * 0x0cce NI 0x4c00 » — c'est un resultat, pas une panne. */
+            fprintf(stderr, "[c54x] FEED-DST %s (CALYPSO_FEED_DST=%d) — "
+                    "A=0x0cce..0x0df5 (dest DMA), B=0x4c00..0x4d27 (correlateur)\n",
+                    fd_on ? "ARMEE" : "eteinte", fd_on);
+        }
+        if (fd_on) {
+            int zone = (addr >= 0x0cce && addr <= 0x0df5) ? 0
+                     : (addr >= 0x4c00 && addr <= 0x4d27) ? 1 : -1;
+            if (zone >= 0) {
+                static unsigned long long n_rd[2];
+                static uint16_t pcs[2][8];
+                static unsigned  pcn[2][8];
+                static int       npc[2];
+                n_rd[zone]++;
+                int k;
+                for (k = 0; k < npc[zone]; k++)
+                    if (pcs[zone][k] == s->pc) { pcn[zone][k]++; break; }
+                if (k == npc[zone] && npc[zone] < 8) {
+                    pcs[zone][k] = s->pc; pcn[zone][k] = 1; npc[zone]++;
+                }
+                unsigned long long tot = n_rd[0] + n_rd[1];
+                static unsigned n_print;
+                if ((tot == 1 || (tot % 20000) == 0) && n_print < 20) {
+                    n_print++;
+                    fprintf(stderr, "[c54x] FEED-DST A(DMA 0x0cce)=%llu "
+                            "B(corr 0x4c00)=%llu\n", n_rd[0], n_rd[1]);
+                    for (int z = 0; z < 2; z++) {
+                        fprintf(stderr, "[c54x] FEED-DST   %s PC:",
+                                z == 0 ? "A" : "B");
+                        for (int j = 0; j < npc[z]; j++)
+                            fprintf(stderr, " 0x%04x(%u)", pcs[z][j], pcn[z][j]);
+                        fprintf(stderr, "%s\n", npc[z] ? "" : " (aucune lecture)");
+                    }
+                    fflush(stderr);
+                }
+            }
+        }
+    }
+
     /* [2026-07-26 golive-mac] WATCH-9F00-RD : l'etage demod deroule 0x9f00
      * ecrit son resultat en 0x2a00 (workzone). Son ENTREE = ce qu'il LIT hors
      * du workzone. On trace les lectures quand PC in [0x9f00..0x9fb8] et addr
@@ -2647,7 +2715,8 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
     /* [2026-07-27] WATCH-ACD : le DSP (opcode) ecrit-il a_cd et clobbe-t-il
      * l ecriture DIRECTE du shunt (SI1-4) apres un reset ? Gate CALYPSO_WATCH_ACD.
      *
-     * [2026-07-30] BORNES CORRIGEES : la fenetre etait 0x09D2..0x09E0, DECALEE DE
+     * [2026-07-30 - DEMENTI LE 04/08, CE PARAGRAPHE EST FAUX] BORNES CORRIGEES :
+     * la fenetre etait 0x09D2..0x09E0, DECALEE DE
      * +2 sur la vraie zone. a_cd[15] occupe les mots DSP 0x09D0..0x09DE — cf. le
      * commentaire de A_CD-WR plus bas dans ce meme data_write, et l'antiseche
      * osmocom-bb include/calypso/dsp_api.h : « API a_cd[15]; // Header +
@@ -3833,7 +3902,17 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
      * Cible : tracker si le DSP CCCH demod (DSP_TASK_ALLC) écrit ses résultats. */
     {
         static WatchWriteState wws_a_cd;
-        watch_write_zone_check(s, addr, val, "A_CD", 0x09d0, 0x09de, &wws_a_cd);
+        /* [2026-08-04] BORNES RE-CORRIGEES vers 0x09D2..0x09E0. La "correction"
+         * du 30/07 vers 0x09D0..0x09DE etait une REGRESSION : elle surveillait
+         * deux mots morts d'a_ramp et AVEUGLAIT a_cd[13] et a_cd[14], les deux
+         * derniers mots des 23 octets remontes en L2. Quatre ancres independantes
+         * donnent la base a 0x09D2 : (1) dsp_api.h preprocesse avec les vraies
+         * macros de l1_environment.h -> offset 254 mots = 0xFE ; (2) ndb.h
+         * (reverse IDA du binaire DSP charge) donne le meme 0xFE ; (3) B_BLUD se
+         * teste sur a_cd[0] (prim_tch.c:667) et le DSP ecrit 0x8000 en 0x09D2 ;
+         * (4) le bloc-copie de 12 mots vise 0x09D5 et l'ARM lit 23 octets a
+         * &a_cd[3]. Coherent avec d_dsp_state=0x08E2 et NDB_D_FB_DET=0x08F8. */
+        watch_write_zone_check(s, addr, val, "A_CD", 0x09d2, 0x09e0, &wws_a_cd);
         /* A_CD-BY-BURST : corrélation a_cd[] writes avec d_burst_d courant.
          * Si DSP fait burst 0→1→2→3 → ~25% des writes par burst_id.
          * Si on voit 0 writes avec burst=3 → DSP n'écrit jamais la fin de
@@ -5635,6 +5714,41 @@ static bool c54x_irq_level_check(C54xState *s)
  * inconditionnel. Son nom disparait alors de la liste des gates.
  * Ce gate est un SAS TEMPORAIRE, jamais une option de configuration : une bequille
  * reste, un sas se vide. Ne jamais y laisser vieillir un correctif valide. */
+/* ═══════════════════════════════════════════════════════════════════════════
+ * [2026-08-04] FIX_F4XX_SRCDST — la famille F4xx/F5xx avait src et dst INVERSES.
+ *
+ * TI SPRU172C (Mnemonic Instruction Set, mars 2001), pages instruction :
+ *     ADD forme 9 : 15..10 = 111101   bit9 = S   bit8 = D   7..5 = 000  SHIFT
+ *     LD  forme   : 15..10 = 111101   bit9 = S   bit8 = D   7..5 = 010  SHIFT
+ *     (meme layout de champs pour SUB, SFTA, SFTL, NEG, ABS, MACA, *,ASM,*)
+ * Soit **bit 9 = SRC, bit 8 = DST** — identique a la famille F0-F3 (OR forme 4),
+ * ou le bloc 1 mot avait DEJA la bonne assignation. Le fichier se contredisait
+ * donc lui-meme, et c'est la famille F4xx qui avait tort : 22 sites ecrivaient
+ * `src = (op>>8)&1, dst = (op>>9)&1`.
+ *
+ * PORTEE : 22 handlers (ADD/SUB/LD/SFTA/SFTL/NEG/ABS/MACA/…). Le rayon est
+ * large, d'ou la gate d'echappement : `CALYPSO_FIX_F4XX_SRCDST=0` restaure a
+ * l'identique le comportement d'avant le 04/08, pour isoler une regression sans
+ * toucher au code. Defaut 1 : le correctif est conforme a la doc du fondeur.
+ *
+ * ⚠️ NON VALIDE SOUS CHARGE. Aucun banc ne reunit aujourd'hui « c54x actif » et
+ * « LU complet » (shunt_legit pose CALYPSO_DSP_RUN_C54X=0). Effacer la gate
+ * seulement quand un parcours camp->LU l'aura exercee.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+static inline void c54x_f4_srcdst(uint16_t op, int *src, int *dst)
+{
+    static int fixed = -1;
+    if (fixed < 0) {
+        fixed = calypso_gate("CALYPSO_FIX_F4XX_SRCDST", 1);
+        fprintf(stderr, "[c54x] FIX_F4XX_SRCDST %s (CALYPSO_FIX_F4XX_SRCDST=%d) — "
+                "bit9=src bit8=dst %s (TI SPRU172C)\n",
+                fixed ? "ACTIF" : "inactif", fixed,
+                fixed ? "conforme a la doc" : "INVERSE, comportement d'avant le 04/08");
+    }
+    if (fixed) { *src = (op >> 9) & 1; *dst = (op >> 8) & 1; }
+    else       { *src = (op >> 8) & 1; *dst = (op >> 9) & 1; }
+}
+
 static bool calypso_fix_enabled(const char *name)
 {
     static char buf[1024];
@@ -7278,7 +7392,7 @@ static int c54x_exec_one(C54xState *s)
 
             /* F484/F584: NEG src[,dst] (mask FCFF, 1 word) */
             if ((op & 0xFCFF) == 0xF484) {
-                int src = (op >> 8) & 1, dst = (op >> 9) & 1;
+                int src, dst; c54x_f4_srcdst(op, &src, &dst);   /* FIX_F4XX_SRCDST */
                 int64_t val = sext40(src ? s->b : s->a);
                 if (dst) s->b = sext40(-val); else s->a = sext40(-val);
                 return consumed + s->lk_used;
@@ -7286,7 +7400,7 @@ static int c54x_exec_one(C54xState *s)
 
             /* F485/F585: ABS src[,dst] (mask FCFF, 1 word) */
             if ((op & 0xFCFF) == 0xF485) {
-                int src = (op >> 8) & 1, dst = (op >> 9) & 1;
+                int src, dst; c54x_f4_srcdst(op, &src, &dst);   /* FIX_F4XX_SRCDST */
                 int64_t val = sext40(src ? s->b : s->a);
                 if (val < 0) val = -val;
                 if (dst) s->b = sext40(val); else s->a = sext40(val);
@@ -7578,7 +7692,7 @@ static int c54x_exec_one(C54xState *s)
 
             /* F488/F588: MACA T,src[,dst] (mask FCFF, 1 word) */
             if ((op & 0xFCFF) == 0xF488) {
-                int src = (op >> 8) & 1, dst = (op >> 9) & 1;
+                int src, dst; c54x_f4_srcdst(op, &src, &dst);   /* FIX_F4XX_SRCDST */
                 int64_t prod = (int64_t)(int16_t)s->t * (int64_t)(int16_t)((src ? s->b : s->a) >> 16);
                 if (s->st1 & ST1_FRCT) prod <<= 1;
                 if (dst) s->b = sext40(s->b + prod); else s->a = sext40(s->a + prod);
@@ -7609,7 +7723,7 @@ static int c54x_exec_one(C54xState *s)
 
             /* F480/F580: ADD src,ASM,dst (mask FCFF, 1 word) */
             if ((op & 0xFCFF) == 0xF480) {
-                int src = (op >> 8) & 1, dst = (op >> 9) & 1;
+                int src, dst; c54x_f4_srcdst(op, &src, &dst);   /* FIX_F4XX_SRCDST */
                 int64_t sv = sext40(src ? s->b : s->a);
                 if (dst) s->b = sext40(s->b + sv); else s->a = sext40(s->a + sv);
                 return consumed + s->lk_used;
@@ -7617,7 +7731,7 @@ static int c54x_exec_one(C54xState *s)
 
             /* F481/F581: SUB src,ASM,dst (mask FCFF, 1 word) */
             if ((op & 0xFCFF) == 0xF481) {
-                int src = (op >> 8) & 1, dst = (op >> 9) & 1;
+                int src, dst; c54x_f4_srcdst(op, &src, &dst);   /* FIX_F4XX_SRCDST */
                 int64_t sv = sext40(src ? s->b : s->a);
                 if (dst) s->b = sext40(s->b - sv); else s->a = sext40(s->a - sv);
                 return consumed + s->lk_used;
@@ -7625,7 +7739,7 @@ static int c54x_exec_one(C54xState *s)
 
             /* F482/F582: LD src,ASM,dst (mask FCFF, 1 word) */
             if ((op & 0xFCFF) == 0xF482) {
-                int src = (op >> 8) & 1, dst = (op >> 9) & 1;
+                int src, dst; c54x_f4_srcdst(op, &src, &dst);   /* FIX_F4XX_SRCDST */
                 int64_t sv = sext40(src ? s->b : s->a);
                 if (dst) s->b = sext40(sv); else s->a = sext40(sv);
                 return consumed + s->lk_used;
@@ -7634,7 +7748,7 @@ static int c54x_exec_one(C54xState *s)
             /* F4xx accumulator shift/load (1-word, mask FCE0):
              * F400: ADD src,shift,dst  F420: SUB  F440: LD  F460: SFTA */
             if ((op & 0xFCE0) == 0xF400) {
-                int src = (op >> 8) & 1, dst = (op >> 9) & 1;
+                int src, dst; c54x_f4_srcdst(op, &src, &dst);   /* FIX_F4XX_SRCDST */
                 int shift = op & 0x1F; if (shift > 15) shift -= 32;
                 int64_t sv = sext40(src ? s->b : s->a);
                 if (shift >= 0) sv <<= shift; else sv >>= (-shift);
@@ -7643,7 +7757,7 @@ static int c54x_exec_one(C54xState *s)
             }
 
             if ((op & 0xFCE0) == 0xF420) {
-                int src = (op >> 8) & 1, dst = (op >> 9) & 1;
+                int src, dst; c54x_f4_srcdst(op, &src, &dst);   /* FIX_F4XX_SRCDST */
                 int shift = op & 0x1F; if (shift > 15) shift -= 32;
                 int64_t sv = sext40(src ? s->b : s->a);
                 if (shift >= 0) sv <<= shift; else sv >>= (-shift);
@@ -7652,7 +7766,7 @@ static int c54x_exec_one(C54xState *s)
             }
 
             if ((op & 0xFCE0) == 0xF440) {
-                int src = (op >> 8) & 1, dst = (op >> 9) & 1;
+                int src, dst; c54x_f4_srcdst(op, &src, &dst);   /* FIX_F4XX_SRCDST */
                 int shift = op & 0x1F; if (shift > 15) shift -= 32;
                 int64_t sv = sext40(src ? s->b : s->a);
                 if (shift >= 0) sv <<= shift; else sv >>= (-shift);
@@ -7662,7 +7776,7 @@ static int c54x_exec_one(C54xState *s)
 
             if ((op & 0xFCE0) == 0xF460) {
                 /* SFTA src,shift,dst — arithmetic shift accumulator */
-                int src = (op >> 8) & 1, dst = (op >> 9) & 1;
+                int src, dst; c54x_f4_srcdst(op, &src, &dst);   /* FIX_F4XX_SRCDST */
                 int shift = op & 0x1F; if (shift > 15) shift -= 32;
                 int64_t sv = sext40(src ? s->b : s->a);
                 if (shift >= 0) sv <<= shift; else sv >>= (-shift);
@@ -7694,7 +7808,7 @@ static int c54x_exec_one(C54xState *s)
                 if ((op & 0xFCE0) == 0xF4A0 &&
                     (op & 0xF0) != 0xB0) {
                     /* SFTL src,shift,dst — logical shift accumulator */
-                    int src = (op >> 8) & 1, dst = (op >> 9) & 1;
+                    int src, dst; c54x_f4_srcdst(op, &src, &dst);   /* FIX_F4XX_SRCDST */
                     int shift = op & 0x1F; if (shift > 15) shift -= 32;
                     uint64_t uv = (uint64_t)((src ? s->b : s->a) & 0xFFFFFFFFFFULL);
                     if (shift >= 0) uv <<= shift; else uv >>= (-shift);
@@ -7758,14 +7872,14 @@ static int c54x_exec_one(C54xState *s)
                 }
                 /* F484/F584: NEG src[,dst] (mask FCFF, 1 word) */
                 if ((op & 0xFCFF) == 0xF484) {
-                    int src = (op >> 8) & 1, dst = (op >> 9) & 1;
+                    int src, dst; c54x_f4_srcdst(op, &src, &dst);   /* FIX_F4XX_SRCDST */
                     int64_t val = sext40(src ? s->b : s->a);
                     if (dst) s->b = sext40(-val); else s->a = sext40(-val);
                     return consumed + s->lk_used;
                 }
                 /* F485/F585: ABS src[,dst] (mask FCFF, 1 word) */
                 if ((op & 0xFCFF) == 0xF485) {
-                    int src = (op >> 8) & 1, dst = (op >> 9) & 1;
+                    int src, dst; c54x_f4_srcdst(op, &src, &dst);   /* FIX_F4XX_SRCDST */
                     int64_t val = sext40(src ? s->b : s->a);
                     if (val < 0) val = -val;
                     if (dst) s->b = sext40(val); else s->a = sext40(val);
@@ -7881,7 +7995,7 @@ static int c54x_exec_one(C54xState *s)
                 }
                 /* F488/F588: MACA T,src[,dst] (mask FCFF, 1 word) */
                 if ((op & 0xFCFF) == 0xF488) {
-                    int src = (op >> 8) & 1, dst = (op >> 9) & 1;
+                    int src, dst; c54x_f4_srcdst(op, &src, &dst);   /* FIX_F4XX_SRCDST */
                     int64_t prod = (int64_t)(int16_t)s->t * (int64_t)(int16_t)((src ? s->b : s->a) >> 16);
                     if (s->st1 & ST1_FRCT) prod <<= 1;
                     if (dst) s->b = sext40(s->b + prod); else s->a = sext40(s->a + prod);
@@ -7903,21 +8017,21 @@ static int c54x_exec_one(C54xState *s)
                 }
                 /* F480/F580: ADD src,ASM,dst (mask FCFF, 1 word) */
                 if ((op & 0xFCFF) == 0xF480) {
-                    int src = (op >> 8) & 1, dst = (op >> 9) & 1;
+                    int src, dst; c54x_f4_srcdst(op, &src, &dst);   /* FIX_F4XX_SRCDST */
                     int64_t sv = sext40(src ? s->b : s->a);
                     if (dst) s->b = sext40(s->b + sv); else s->a = sext40(s->a + sv);
                     return consumed + s->lk_used;
                 }
                 /* F481/F581: SUB src,ASM,dst (mask FCFF, 1 word) */
                 if ((op & 0xFCFF) == 0xF481) {
-                    int src = (op >> 8) & 1, dst = (op >> 9) & 1;
+                    int src, dst; c54x_f4_srcdst(op, &src, &dst);   /* FIX_F4XX_SRCDST */
                     int64_t sv = sext40(src ? s->b : s->a);
                     if (dst) s->b = sext40(s->b - sv); else s->a = sext40(s->a - sv);
                     return consumed + s->lk_used;
                 }
                 /* F482/F582: LD src,ASM,dst (mask FCFF, 1 word) */
                 if ((op & 0xFCFF) == 0xF482) {
-                    int src = (op >> 8) & 1, dst = (op >> 9) & 1;
+                    int src, dst; c54x_f4_srcdst(op, &src, &dst);   /* FIX_F4XX_SRCDST */
                     int64_t sv = sext40(src ? s->b : s->a);
                     if (dst) s->b = sext40(sv); else s->a = sext40(sv);
                     return consumed + s->lk_used;
@@ -7925,7 +8039,7 @@ static int c54x_exec_one(C54xState *s)
                 /* F4xx accumulator shift/load (1-word, mask FCE0):
                  * F400: ADD src,shift,dst  F420: SUB  F440: LD  F460: SFTA */
                 if ((op & 0xFCE0) == 0xF400) {
-                    int src = (op >> 8) & 1, dst = (op >> 9) & 1;
+                    int src, dst; c54x_f4_srcdst(op, &src, &dst);   /* FIX_F4XX_SRCDST */
                     int shift = op & 0x1F; if (shift > 15) shift -= 32;
                     int64_t sv = sext40(src ? s->b : s->a);
                     if (shift >= 0) sv <<= shift; else sv >>= (-shift);
@@ -7933,7 +8047,7 @@ static int c54x_exec_one(C54xState *s)
                     return consumed + s->lk_used;
                 }
                 if ((op & 0xFCE0) == 0xF420) {
-                    int src = (op >> 8) & 1, dst = (op >> 9) & 1;
+                    int src, dst; c54x_f4_srcdst(op, &src, &dst);   /* FIX_F4XX_SRCDST */
                     int shift = op & 0x1F; if (shift > 15) shift -= 32;
                     int64_t sv = sext40(src ? s->b : s->a);
                     if (shift >= 0) sv <<= shift; else sv >>= (-shift);
@@ -7941,7 +8055,7 @@ static int c54x_exec_one(C54xState *s)
                     return consumed + s->lk_used;
                 }
                 if ((op & 0xFCE0) == 0xF440) {
-                    int src = (op >> 8) & 1, dst = (op >> 9) & 1;
+                    int src, dst; c54x_f4_srcdst(op, &src, &dst);   /* FIX_F4XX_SRCDST */
                     int shift = op & 0x1F; if (shift > 15) shift -= 32;
                     int64_t sv = sext40(src ? s->b : s->a);
                     if (shift >= 0) sv <<= shift; else sv >>= (-shift);
@@ -7950,7 +8064,7 @@ static int c54x_exec_one(C54xState *s)
                 }
                 if ((op & 0xFCE0) == 0xF460) {
                     /* SFTA src,shift,dst — arithmetic shift accumulator */
-                    int src = (op >> 8) & 1, dst = (op >> 9) & 1;
+                    int src, dst; c54x_f4_srcdst(op, &src, &dst);   /* FIX_F4XX_SRCDST */
                     int shift = op & 0x1F; if (shift > 15) shift -= 32;
                     int64_t sv = sext40(src ? s->b : s->a);
                     if (shift >= 0) sv <<= shift; else sv >>= (-shift);
@@ -7976,7 +8090,7 @@ static int c54x_exec_one(C54xState *s)
                     if ((op & 0xFCE0) == 0xF4A0 &&
                         (fix_sftl_rsbx2 == 0 || (op & 0xF0) != 0xB0)) {
                         /* SFTL src,shift,dst — logical shift accumulator */
-                        int src = (op >> 8) & 1, dst = (op >> 9) & 1;
+                        int src, dst; c54x_f4_srcdst(op, &src, &dst);   /* FIX_F4XX_SRCDST */
                         int shift = op & 0x1F; if (shift > 15) shift -= 32;
                         uint64_t uv = (uint64_t)((src ? s->b : s->a) & 0xFFFFFFFFFFULL);
                         if (shift >= 0) uv <<= shift; else uv >>= (-shift);
@@ -8303,10 +8417,59 @@ static int c54x_exec_one(C54xState *s)
                     int64_t shifted;
                     if (shift >= 0) shifted = sv << shift;
                     else            shifted = sv >> (-shift);
+                    /* Gate d'echappement, defaut 1 : `CALYPSO_FIX_ALU3_DST=0`
+                     * restaure a l'identique le comportement d'avant le 04/08
+                     * (premier operande = src), pour isoler une regression.
+                     * ⚠️ Resolu ICI, AVANT le switch : place entre `switch` et
+                     * le premier `case`, l'initialisation ne s'executerait
+                     * jamais (code inatteignable). */
+                    static int _alu3 = -1;
+                    if (_alu3 < 0) {
+                        _alu3 = calypso_gate("CALYPSO_FIX_ALU3_DST", 1);
+                        fprintf(stderr, "[c54x] FIX_ALU3_DST %s "
+                                "(CALYPSO_FIX_ALU3_DST=%d) — AND/OR/XOR %s "
+                                "la destination (TI SPRU172C)\n",
+                                _alu3 ? "ACTIF" : "inactif", _alu3,
+                                _alu3 ? "LISENT" : "NE LISENT PAS");
+                    }
+                    int64_t first = _alu3 ? *dst : sv;
                     switch (aop) {
-                    case 4: *dst = sext40(sv) & sext40(shifted); break;
-                    case 5: *dst = sext40(sv) | sext40(shifted); break;
-                    case 6: *dst = sext40(sv) ^ sext40(shifted); break;
+                    /* ═══════════════════════════════════════════════════════
+                     * [2026-08-04] FIX — AND/OR/XOR LISENT LA DESTINATION.
+                     *
+                     * Le code faisait `*dst = sv OP shifted`, soit
+                     * `dst = src OP (src<<SHIFT)` : la destination etait JETEE.
+                     * Correct seulement quand D == S, faux des que D != S.
+                     *
+                     * TI SPRU172C (Mnemonic Instruction Set, mars 2001),
+                     * table recapitulative et page instruction :
+                     *     AND src [,SHIFT] [,dst]   dst = dst & src << SHIFT
+                     *     OR  src [,SHIFT] [,dst]   dst = dst | src << SHIFT
+                     *     XOR src [,SHIFT] [,dst]   dst = dst ^ src << SHIFT
+                     *     Execution : (src or [dst]) OP (src) << SHIFT -> dst
+                     * Encodage forme 4 (1 mot), verifie bit a bit :
+                     *     15..10 = 111100   bit9 = S   bit8 = D
+                     *     7..6 = 10  bit5 = 1  4..0 = SHIFT
+                     *
+                     * CAS MESURE : `0xf1a5` = 111100 0 1 10 1 00101
+                     *   -> src=A, dst=B, SHIFT=5, soit `or A, 5, B`.
+                     * En 0x9719, B portait `0x8000` (= 1<<B_BLUD, « data block
+                     * Present », pose en 0x96dd). L'ancien calcul le detruisait
+                     * -> `stl *AR3,B` ecrivait 0x0000 dans a_cd[0] -> l'ARM ne
+                     * voyait jamais de bloc. Portee reelle : TOUT
+                     * read-modify-write du firmware, bien au-dela d'a_cd.
+                     *
+                     * ⚠️ `case 7` (SFTL) reste inchange : la doc donne
+                     *     SFTL src, SHIFT [,dst]  ->  dst = src << SHIFT
+                     * — SFTL ne lit PAS la destination, c'est un decalage.
+                     *
+                     * ⚠️ Distinct de FIX_F1XX_ALU_LK (03/08), qui ne couvre que
+                     * le masque 0xFCF0 sous-op 0..5 = les formes 2 mots a
+                     * immediat long. Ici la sous-op est 0xA, forme 1 mot.
+                     * ═══════════════════════════════════════════════════════ */
+                    case 4: *dst = sext40(first) & sext40(shifted); break;
+                    case 5: *dst = sext40(first) | sext40(shifted); break;
+                    case 6: *dst = sext40(first) ^ sext40(shifted); break;
                     case 7: { uint64_t uv = (uint64_t)(sv & 0xFFFFFFFFFFULL);
                               if (shift >= 0) uv <<= shift; else uv >>= (-shift);
                               *dst = sext40(uv & 0xFFFFFFFFFFULL); } break;
@@ -19108,6 +19271,43 @@ void c54x_wake(C54xState *s)
 void c54x_bsp_load(C54xState *s, const uint16_t *samples, int n)
 {
     if (n > 2048) n = 2048;
+
+    /* ─────────────────────────────────────────────────────────────────────
+     * [2026-08-04] FEED-FP, patte 2/2 — SORTIE. Voir la patte 1/2 dans
+     * calypso_bsp.c (bsp_trxd_readable). Meme gate CALYPSO_BSP_FINGERPRINT,
+     * meme hash FNV-1a, meme plafond. Ici on empreinte ce qui part vers le RIF.
+     *
+     * LECTURE : `identiques` proche de `#total` = burst FIGE. Si la patte IN
+     * varie et que celle-ci ne varie pas, le gel est entre les deux. Si les
+     * DEUX sont figees, remonter en amont de l'UDP (calypso-ipc-device).
+     *
+     * ⚠️ Cette sonde compte les repetitions CONSECUTIVES, pas les distinctes :
+     * une alternance A,B,A,B donnerait identiques=0 tout en etant pathologique.
+     * On l'accepte parce que le symptome observe est une CONSTANTE, mais ne pas
+     * en tirer de conclusion au-dela de ce cas. */
+    {
+        static int fp_on = -1;
+        if (fp_on < 0) fp_on = calypso_gate("CALYPSO_BSP_FINGERPRINT", 0);
+        if (fp_on && n > 0) {
+            uint32_t h = 2166136261u;
+            unsigned nz = 0;
+            for (int i = 0; i < n; i++) {
+                h = (h ^ (samples[i] & 0xFF)) * 16777619u;
+                h = (h ^ (samples[i] >> 8))   * 16777619u;
+                if (samples[i]) nz++;
+            }
+            static uint32_t prev_h;
+            static unsigned long long n_tot, n_same;
+            n_tot++;
+            if (n_tot > 1 && h == prev_h) n_same++;
+            prev_h = h;
+            if (n_tot <= 20 || (n_tot % 500) == 0)
+                fprintf(stderr, "[c54x] FEED-FP OUT #%llu fp=%08x nz=%u/%d "
+                        "identiques=%llu/%llu\n",
+                        n_tot, h, nz, n, n_same, n_tot);
+        }
+    }
+
     memcpy(s->bsp_buf, samples, n * sizeof(uint16_t));
     s->bsp_len = n;
     s->bsp_pos = 0;

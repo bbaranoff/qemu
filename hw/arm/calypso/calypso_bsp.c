@@ -415,6 +415,43 @@ static void bsp_trxd_readable(void *opaque)
                          (struct sockaddr *)&addr, &alen);
     if (n < 8) return;
 
+    /* ─────────────────────────────────────────────────────────────────────
+     * [2026-08-04] FEED-FP, patte 1/2 — ENTREE. Sonde LECTURE SEULE, plafonnee,
+     * gate CALYPSO_BSP_FINGERPRINT (defaut 0).
+     *
+     * CE QU'ON TRANCHE. `corr_iq.py` mesure 400/400 bursts FCCH IDENTIQUES
+     * (rms=32533, coh=0.998 constants) a l'entree du DSP, alors que la source
+     * `calypso-ipc-device` sert 10 111 FCCH sur 103 244 bursts = 9,8 %, soit
+     * exactement la cadence GSM. Le gel est donc DANS QEMU. Cette patte prend
+     * l'empreinte de ce qui ARRIVE en UDP ; la patte 2/2 (c54x_bsp_load) prend
+     * celle de ce qui SORT vers le RIF. Empreintes variees ici + constantes
+     * la-bas = gel encadre entre les deux.
+     *
+     * ⚠️ On journalise un HASH du burst COMPLET, pas 8 mots : deux bursts
+     * peuvent partager un prefixe. C'est precisement l'erreur de lecture qui
+     * m'a fait conclure trop vite deux fois aujourd'hui. */
+    {
+        static int fp_on = -1;
+        if (fp_on < 0) fp_on = calypso_gate("CALYPSO_BSP_FINGERPRINT", 0);
+        if (fp_on && n > 8) {
+            uint32_t h = 2166136261u;      /* FNV-1a 32 bits */
+            unsigned nz = 0;
+            for (ssize_t i = 8; i < n; i++) {
+                h = (h ^ buf[i]) * 16777619u;
+                if (buf[i]) nz++;
+            }
+            static uint32_t prev_h;
+            static unsigned long long n_tot, n_same;
+            n_tot++;
+            if (n_tot > 1 && h == prev_h) n_same++;
+            prev_h = h;
+            if (n_tot <= 20 || (n_tot % 500) == 0)
+                fprintf(stderr, "[bsp] FEED-FP IN  #%llu fp=%08x nz=%u/%lld "
+                        "identiques=%llu/%llu\n",
+                        n_tot, h, nz, (long long)(n - 8), n_same, n_tot);
+        }
+    }
+
     /* Tee I/Q vers le bridge de démod (gr-gsm py) sous shunt : le BSP gate
      * la livraison DARAM de toute façon (calypso_bsp.c ~990), donc on forwarde
      * le burst brut (8 hdr + I/Q cs16) vers CALYPSO_IQ_TEE_PORT (défaut 6703).
