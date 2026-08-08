@@ -941,8 +941,37 @@ static int calypso_tch_cfg_read(uint8_t *tn, uint8_t *tsc, uint16_t *arfcn)
     return 1;
 }
 
+/* Canal dedie SDCCH courant, publie par si_bridge apres decodage de l'IMM
+ * ASSIGN : seq@0(u32) kind@4 (0=SDCCH/4, 1=SDCCH/8) ss@5 tn@6. seq=0 = aucun.
+ * C'est si_bridge qui le publie parce que c'est lui qui VOIT l'IMM ASSIGN (il
+ * le forwarde deja en AGCH) ; le dupliquer ici imposerait de re-decoder le CCCH
+ * dans un process qui ne le recoit pas. */
+static int calypso_dcch_cfg_read(uint8_t *kind, uint8_t *ss, uint8_t *tn)
+{
+    static int fd = -1;
+    if (fd < 0) fd = open("/dev/shm/calypso_dcch_cfg", O_RDONLY);
+    if (fd < 0) return 0;
+    uint8_t b[16];
+    if (pread(fd, b, sizeof(b), 0) != (ssize_t)sizeof(b)) return 0;
+    uint32_t seq; memcpy(&seq, b, 4);
+    if (seq == 0) return 0;
+    if (kind) *kind = b[4];
+    if (ss)   *ss   = b[5];
+    if (tn)   *tn   = b[6];
+    /* Trace au CHANGEMENT : sans elle, une injection sur la mauvaise sous-voie
+     * serait indiscernable d'une absence d'injection. */
+    static uint32_t last_seq = 0;
+    if (seq != last_seq) {
+        last_seq = seq;
+        LOGP(DDEV, LOGL_NOTICE, "DCCH-CFG #%u : SDCCH/%d SS=%u TN=%u\n",
+             seq, b[4] ? 8 : 4, b[5], b[6]);
+    }
+    return 1;
+}
+
 /* Lecteur generique d'un sideband 23 o (meme layout que calypso_sdcch_ul). */
-static int calypso_ul_sb_read(const char *path, int *fdp, uint8_t *l2, uint32_t *seq_out)
+static int calypso_ul_sb_read2(const char *path, int *fdp, uint8_t *l2,
+                               uint32_t *seq_out, uint32_t *l1s_fn_out)
 {
     if (*fdp < 0) *fdp = open(path, O_RDONLY);
     if (*fdp < 0) return 0;
@@ -950,9 +979,21 @@ static int calypso_ul_sb_read(const char *path, int *fdp, uint8_t *l2, uint32_t 
     if (pread(*fdp, buf, sizeof(buf), 0) != (ssize_t)sizeof(buf)) return 0;
     uint32_t seq; memcpy(&seq, buf, 4);
     if (seq == 0) return 0;
-    if (seq_out) *seq_out = seq;
-    if (l2)      memcpy(l2, buf + 16, 23);
+    if (seq_out)    *seq_out = seq;
+    /* l1s_fn = l'horloge L1 du FIRMWARE, calee sur l'air (il s'est synchronise
+     * sur la SB que le shunt lui injecte, laquelle porte la FN reelle decodee
+     * par gr-gsm). Lue ICI, au moment ou l'on constate la nouvelle sequence :
+     * c'est donc une mesure SIMULTANEE des deux horloges, contrairement a une
+     * comparaison de queues de journaux (ou l'instant relatif est inconnu, et
+     * ou un modulo 104 n'a aucun sens a +/-200 trames pres). */
+    if (l1s_fn_out) memcpy(l1s_fn_out, buf + 4, 4);
+    if (l2)         memcpy(l2, buf + 16, 23);
     return 1;
+}
+
+static int calypso_ul_sb_read(const char *path, int *fdp, uint8_t *l2, uint32_t *seq_out)
+{
+    return calypso_ul_sb_read2(path, fdp, l2, seq_out, NULL);
 }
 
 /* Voix montante : 64 o, seq@0 l1s_fn@4 fn@8 fr[33]@16. */
@@ -1005,31 +1046,95 @@ static int tch_ul_build_burst(int8_t *ab, uint32_t fn, uint8_t tsc, uint8_t tn,
     static uint32_t seq_facch = 0, seq_sacch = 0, seq_speech = 0;
     static uint8_t  pend_facch[23]; static int pend_facch_valid = 0;
 
+    /* [2026-08-08] Position SACCH montante, SWEEPABLE.
+     * La BTS declare Radio Link Failure a chaque appel alors qu'on injecte bien
+     * 4 bursts SACCH par bloc : la FACCH passe (l'ASSIGNMENT COMPLETE atteint la
+     * BSC) mais la SACCH non. Or FACCH n'exige qu'un alignement mod 13, le SDCCH
+     * mod 51, et la SACCH mod 104 : un decalage de lcm(13,51)=663 trames entre
+     * internal_fn et l'horloge BTS laisse passer les deux premiers tout en
+     * posant la SACCH 13 trames a cote (663 mod 26 = 13), c'est-a-dire sur la
+     * trame IDLE du timeslot. CALYPSO_UL_TCH_SACCH_OFS=13 teste cette hypothese
+     * sans rebuild. */
+    static int sa_ofs = -99999;
+    if (sa_ofs == -99999) { const char *e = getenv("CALYPSO_UL_TCH_SACCH_OFS");
+                            sa_ofs = e ? atoi(e) : 0; }
     uint32_t t26 = fn % 26;
-    uint32_t sacch_pos = (tn % 2) ? 25 : 12;
+    uint32_t sacch_pos = (uint32_t)((((tn % 2) ? 25 : 12) + sa_ofs) % 26 + 26) % 26;
 
-    /* --- SACCH du dedie : 4 bursts, un par 26-multitrame (fn%104 = pos+26k) --- */
+    /* --- SACCH du dedie : 4 bursts, un par 26-multitrame -----------------------
+     *
+     * LE BID NE VIENT PAS DE NOTRE HORLOGE. Il venait de (fn/26)%4, ce qui
+     * suppose que internal_fn partage la phase mod 104 de l'horloge de la BTS.
+     * Elle ne la partage pas : mesure du 08/08, gr-gsm (verrouille sur FCCH/SCH,
+     * donc horloge AIR) rendait ses blocs SACCH a fn%104=38 pendant que nous
+     * injections a 64/90/12 — un ecart de 78 mod 104, soit 3 positions de bid.
+     * Nos quatre bursts tombaient donc a cheval sur deux blocs de la BTS : CRC
+     * systematiquement faux, aucune SACCH decodee, et la BTS declarait Radio
+     * Link Failure au bout de ~32 periodes (les 13,3 s constates a chaque appel).
+     * Et l'ecart d'horloge n'a rien d'une constante : le corriger par un offset
+     * fige serait un reglage a refaire a chaque run.
+     *
+     * REPERE SANS HORLOGE : le firmware n'ecrit a_cu qu'au burst 0 du bloc
+     * (l1s_tch_a_cmd : `if (burst_id == 0)`), et le shunt consomme ce bloc une
+     * seule fois. Chaque NOUVELLE sequence dans le sideband EST donc un debut de
+     * bloc, date par le firmware lui-meme. On compte les bursts a partir de la,
+     * au lieu de deduire la phase d'une horloge qui n'est pas la bonne. */
     if (t26 == sacch_pos) {
-        uint32_t bid = (fn / 26) % 4;
-        if (bid == 0) {
-            uint8_t l2[23]; uint32_t sq = 0;
-            if (calypso_ul_sb_read("/dev/shm/calypso_tch_sacch_ul", &fd_sacch, l2, &sq)
-                && sq != seq_sacch) {
-                seq_sacch = sq;
-                gsm0503_xcch_encode(sacch_bursts, l2);
+        /* Position de CE slot dans le bloc de la BTS : les quatre bursts d'un
+         * bloc SACCH/TF occupent fn%104 = pos, pos+26, pos+52, pos+78. */
+        uint32_t pos_bid = ((fn % 104) + 104 - sacch_pos) % 104 / 26;
+
+        static ubit_t sa_pending_bursts[4 * TCH_BPLEN];
+        static int    sa_pending = 0;            /* un bloc encode attend son bid 0 */
+        static int    sa_active  = 0;            /* un bloc est en cours d'emission */
+
+        /* Le firmware n'ecrit a_cu qu'au burst 0 de SON bloc ; on encode des que
+         * la sequence change. Mais on N'EMET PAS tout de suite : mesure du 08/08,
+         * il ouvre ses blocs quand la trame d'emission est a %104=38, soit le
+         * bid 1 de la BTS. Emettre aussitot etalait nos quatre bursts sur
+         * 38/64/90/12, donc a cheval sur DEUX blocs de la BTS -> CRC faux a tous
+         * les coups -> aucune SACCH decodee -> Radio Link Failure a ~13 s.
+         * On retient donc le bloc et on l'emet a partir de la prochaine vraie
+         * frontiere (pos_bid == 0). Cout : au pire une periode SACCH (480 ms) de
+         * latence, sans consequence sur de la signalisation lente. */
+        uint8_t l2[23]; uint32_t sq = 0, l1s = 0;
+        if (calypso_ul_sb_read2("/dev/shm/calypso_tch_sacch_ul", &fd_sacch, l2, &sq, &l1s)
+            && sq != seq_sacch) {
+            seq_sacch = sq;
+            gsm0503_xcch_encode(sa_pending_bursts, l2);
+            sa_pending = 1;
+            static unsigned nsa = 0;
+            if (nsa++ < 20 || (nsa % 25) == 0)
+                LOGP(DDEV, LOGL_NOTICE,
+                     "TCH-UL SACCH bloc #%u encode : ouvert par le firmware a "
+                     "fn=%u (%%104=%u, bid BTS=%u) | air l1s_fn=%u (ecart=%d) "
+                     "-> mis en attente du prochain bid 0\n",
+                     nsa, fn, fn % 104, pos_bid, l1s, (int32_t)(l1s - fn));
+        }
+
+        /* Demarrage d'un bloc : uniquement sur le bid 0 de la BTS. */
+        if (pos_bid == 0) {
+            if (sa_pending) {
+                memcpy(sacch_bursts, sa_pending_bursts, sizeof(sacch_bursts));
+                sa_pending = 0;
+                sa_active  = 1;
                 sacch_have = 1;
             } else if (!sacch_have) {
-                /* Rien a dire encore : bloc de bourrage LAPDm. La SACCH montante
-                 * doit couler EN CONTINU — la BTS compte les blocs manquants et
-                 * declare une defaillance de lien radio si le flux s'arrete. */
+                /* Rien a dire : bourrage LAPDm. La SACCH montante doit couler EN
+                 * CONTINU — la BTS compte les blocs manquants et declare une
+                 * defaillance de lien radio si le flux s'arrete. */
                 uint8_t idle[23]; idle[0] = 0x01; idle[1] = 0x03; idle[2] = 0x01;
                 memset(idle + 3, 0x2b, sizeof(idle) - 3);
                 gsm0503_xcch_encode(sacch_bursts, idle);
                 sacch_have = 1;
+                sa_active  = 1;
+            } else {
+                sa_active = 1;                   /* rejoue le dernier bloc connu */
             }
         }
-        if (!sacch_have) return 0;
-        ul_compose_nb(ab, sacch_bursts + bid * TCH_BPLEN, tsc);
+        if (!sacch_have || !sa_active)
+            return 0;
+        ul_compose_nb(ab, sacch_bursts + pos_bid * TCH_BPLEN, tsc);
         if (is_facch_out) *is_facch_out = 2;         /* 2 = SACCH */
         return 1;
     }
@@ -1463,8 +1568,30 @@ int32_t uhdwrap_read(void *dev, uint32_t num_chans)
     static int ul_sdcch = -1, sd_ofs = -99999;
     if (ul_sdcch < 0)    { const char *e = getenv("CALYPSO_UL_SDCCH");     ul_sdcch = (!e || *e != '0') ? 1 : 0; }
     if (sd_ofs == -99999){ const char *e = getenv("CALYPSO_UL_SDCCH_OFS"); sd_ofs = e ? atoi(e) : 0; }
+
+    /* [2026-08-08] SOUS-VOIE ET TIMESLOT REELS, plus SDCCH/4 SS0 EN DUR.
+     *
+     * La BSC de ce banc declare TS0 en CCCH+SDCCH4 et TS1 en SDCCH8, et assigne
+     * sur les douze sous-voies. Mesure d'un run : 21 assignations sur TS0 et 37
+     * sur TS1. Cette injection ne connaissait qu'une seule fenetre (s51 37..40 =
+     * SDCCH/4 SS0) et un seul slot (TS0) : la SABM des 37 autres n'atteignait
+     * jamais la BTS -> T200 -> MDL-Error -> « ca ne passe pas tout le temps ».
+     *
+     * Fenetres UL (GSM 05.02 ; le montant est decale de 15 trames sur le DL) :
+     *   SDCCH/4 combine  SS0..3 -> 37, 41, 47, 0
+     *   SDCCH/8          SSi    -> (i*4 + 15) % 51
+     * Slot : montant = DL + 3 slots -> (3+TN)*625 echantillons, et un chunk ne
+     * couvre qu'une DEMI-trame, d'ou la phase (meme mecanique que le TCH). */
+    uint8_t dc_kind = 0, dc_ss = 0, dc_tn = 0;
+    int dc_have = calypso_dcch_cfg_read(&dc_kind, &dc_ss, &dc_tn);
+    static const int UL4[4] = { 37, 41, 47, 0 };
+    int ul_base = dc_have ? (dc_kind ? (((dc_ss & 7) * 4 + 15) % 51) : UL4[dc_ss & 3])
+                          : 37;                     /* defaut = ancien comportement */
+    int dc_slot = dc_have ? (3 + (int)dc_tn) * (CALYPSO_FRAME_SAMPLES / 8) : 1875;
+    int dc_phase = (dc_slot / CALYPSO_SHM_BUFSIZE) * CALYPSO_SHM_BUFSIZE;
+    int dc_local = dc_slot - dc_phase;
     if (ul_sdcch &&
-        (d->rx_ts % ((uint64_t)CALYPSO_FRAME_SAMPLES)) == 0) {
+        (d->rx_ts % ((uint64_t)CALYPSO_FRAME_SAMPLES)) == (uint64_t)dc_phase) {
         /* POLL le sideband a CHAQUE frame (pas seulement aux slots inject). La SABM
          * (ctrl 0x3f) est publiee a l1s%51={36-39} mais l'offset l1s<->osmo_fn faisait
          * que les reads gates sur les slots SDCCH tombaient sur de l'idle -> SABM
@@ -1505,8 +1632,9 @@ int32_t uhdwrap_read(void *dev, uint32_t num_chans)
           } }
         int eff_ofs = (sd_ofs != 0) ? sd_ofs : 15;
         uint32_t s51 = (uint32_t)((((long)osmo_fn + eff_ofs) % 51 + 51) % 51);
-        if (ul_src != ul_chunk && s51 >= 37 && s51 <= 40) {   /* SDCCH/4 SS0 UL block */
-            int bid = (int)s51 - 37;
+        int sd_bid = (int)(((long)s51 - ul_base + 51) % 51);   /* 0..3 dans le bloc */
+        if (ul_src != ul_chunk && sd_bid < 4) {
+            int bid = sd_bid;
             /* COHÉRENCE DE BLOC (#2 v2) : osmo-bts desentrelace les 4 bursts osmo%51
              * {37,38,39,40} EN UN bloc L2 -> les 4 DOIVENT porter le MEME L2. On TIENT
              * donc la derniere trame signalisante captee (held_l2) de facon persistante
@@ -1591,9 +1719,13 @@ int32_t uhdwrap_read(void *dev, uint32_t num_chans)
                  * peut être négatif) décale le burst normal pour caler le TSC. */
                 static int sd_smp = -999999;
                 if (sd_smp == -999999) { const char *e = getenv("CALYPSO_UL_SDCCH_SMP_OFS"); sd_smp = e ? atoi(e) : 0; }
-                int off = (ul_slotoff < 0 ? 0 : ul_slotoff) + sd_smp;
+                /* Offset dans LE chunk courant : dc_local, deja ramene dans la
+                 * demi-trame par la phase. Sans config dedie lue, dc_local vaut
+                 * 1875 = l'ancien ul_slotoff, donc comportement inchange. */
+                int off = dc_local + sd_smp;
                 if (off < 0) off = 0;
-                if (2 * off + (int)sizeof(g_ul_iq) > (int)sizeof(ul_chunk)) off = 0;
+                if (off + CALYPSO_BSP_BURSTLEN * CALYPSO_TRX_OSR > CALYPSO_SHM_BUFSIZE)
+                    off = dc_local;                  /* borne : ne pas deborder le chunk */
                 memcpy(ul_chunk + 2 * off, g_ul_iq, sizeof(g_ul_iq));
                 ul_src = ul_chunk;
                 static unsigned sd_inj = 0;
@@ -1672,10 +1804,10 @@ int32_t uhdwrap_read(void *dev, uint32_t num_chans)
                     static unsigned tinj = 0;
                     if (tinj++ < 40 || kind || (tinj % 500) == 0)
                         LOGP(DDEV, LOGL_NOTICE,
-                             "TCH-UL inject #%u %s fn=%u (%%26=%u %%13=%u) TN=%u TSC=%u "
+                             "TCH-UL inject #%u %s fn=%u (%%104=%u %%26=%u %%13=%u) TN=%u TSC=%u "
                              "abs=%d phase=%d local=%d\n",
                              tinj, kind == 1 ? "FACCH" : kind == 2 ? "SACCH" : "voix",
-                             internal_fn, internal_fn % 26, internal_fn % 13,
+                             internal_fn, internal_fn % 104, internal_fn % 26, internal_fn % 13,
                              tn, tsc, abs_off, phase, local);
                 }
             }

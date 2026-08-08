@@ -150,6 +150,32 @@ static void __attribute__((constructor)) shunt_env_value_list(void)
 static uint32_t g_rach_l1s_fn[256];
 volatile uint8_t g_last_recorded_ra = 0;   /* per-ra FN-FIX : ra de la derniere RACH (lu par l1ctl_sock.c) */
 static uint8_t  g_rach_l1s_valid[256];
+/* [2026-08-08] Fenetre de presentation du SDCCH, posee par la SOURCE AUTORITAIRE.
+ *
+ * g_shunt.sdcch_ss etait pose dans feed_agch, donc par N'IMPORTE QUEL IMM ASSIGN
+ * traversant le CCCH — y compris ceux destines aux autres abonnes (mesure du
+ * 08/08 : 68 IMM ASSIGN de RA=0x07 et 12 de RA=0x0a pour un RACH a nous de
+ * RA=0x08). La fenetre ou le shunt presente a_cd suivait donc le trafic des
+ * voisins, et le descendant du canal dedie tombait a cote.
+ *
+ * Appele depuis l1ctl_sock quand le FIRMWARE annonce son propre chan_nr
+ * (DATA_CONF / DATA_IND). kind : 0 = SDCCH/4 combine, 1 = SDCCH/8.
+ * Base DL fn%51 : /4 -> {22,26,32,36}[ss] ; /8 -> ss*4. */
+void calypso_dsp_shunt_set_dcch(int kind, int ss)
+{
+    static const uint8_t b4[4] = { 22, 26, 32, 36 };
+    uint8_t base = kind ? (uint8_t)((ss & 7) * 4) : b4[ss & 3];
+    if (g_shunt.sdcch_ss_set && g_shunt.sdcch_ss == base
+        && g_shunt.sdcch_ch8 == (kind != 0))
+        return;                                  /* inchange */
+    g_shunt.sdcch_ss     = base;
+    g_shunt.sdcch_ss_set = true;
+    g_shunt.sdcch_ch8    = (kind != 0);
+    SHUNT_LOG("DCCH-WINDOW : SDCCH/%d SS=%d -> presentation a_cd sur fn%%51 %u-%u "
+              "(source unique = chan_nr du firmware ; feed_agch n'y touche plus)\n",
+              kind ? 8 : 4, ss, base, base + 3);
+}
+
 void calypso_dsp_shunt_record_rach(uint8_t ra)
 {
     if (!g_shunt.active) return;
@@ -898,13 +924,38 @@ static void shunt_dispatch_tch_dl(uint8_t page_idx)
 
     shunt_tch_serv_demod(d);            /* toujours : les mesures valent pour tout burst */
 
+    /* ---- voix : CONSOMMATION UNIQUE (2026-08-08, correctif) ----------------
+     *
+     * Avant, ce bloc reecrivait a_dd_0 a CHAQUE dispatch TCHT tant que
+     * tch_dl_valid, or ce drapeau ne redescendait jamais. Une trame decodee
+     * etait donc re-presentee jusqu'a l'arrivee de la suivante, avec B_BLUD
+     * arme : le firmware la comptait comme un bloc NEUF a chaque fois. Mesure
+     * du run 17:33 : 5000 presentations pour 371 trames REELLEMENT decodees par
+     * gr-gsm, soit ~3 TRAFFIC_IND sur 4 qui etaient des doublons. Le mobile
+     * recevait un flux d'apparence continue, en fait bourre de repetitions —
+     * exactement le « replay infini » deja rencontre sur sb_valid, et corrige
+     * la-bas par SHUNT_SB_MAX_AGE.
+     *
+     * On consomme donc la trame : presentee une fois, puis plus de B_BLUD tant
+     * que gr-gsm n'en fournit pas une nouvelle. Les trous deviennent VISIBLES —
+     * et c'est voulu : gapk a un ECU (« ecu/fr » dans sa chaine) dont le role
+     * est precisement de masquer les blocs manquants. Mieux vaut un trou traite
+     * par l'etage prevu pour ca qu'un doublon presente comme une trame fraiche.
+     * CALYPSO_TCH_DL_REPEAT=1 retablit l'ancien comportement pour comparer. */
     if (g_shunt.tch_dl_valid) {
+        static int repeat = -1;
+        if (repeat < 0) { const char *e = getenv("CALYPSO_TCH_DL_REPEAT");
+                          repeat = (e && *e == '1') ? 1 : 0; }
         shunt_ndb_hdr(d, ndb_w(g_ndb.a_dd_0), true);
         shunt_ndb_put_fr(d, ndb_w(g_ndb.a_dd_0), g_shunt.tch_dl_fr);
-        static unsigned n = 0;
+        if (!repeat)
+            g_shunt.tch_dl_valid = false;      /* consommee */
+        static unsigned n = 0, dup = 0;
+        if (repeat) dup++;
         if (n++ < 20 || (n % 250) == 0)
-            SHUNT_LOG("TCH-DL #%u a_dd_0 <- FR seq=%u sig=0x%x\n",
-                      n, g_shunt.tch_dl_seq, g_shunt.tch_dl_fr[0] >> 4);
+            SHUNT_LOG("TCH-DL #%u a_dd_0 <- FR seq=%u sig=0x%x%s\n",
+                      n, g_shunt.tch_dl_seq, g_shunt.tch_dl_fr[0] >> 4,
+                      repeat ? " (REPEAT : doublons possibles)" : "");
     }
     if (shunt_tch_fresh(g_shunt.facch_dl_valid, g_shunt.facch_dl_tick)) {
         shunt_ndb_hdr(d, ndb_w(g_ndb.a_fd), true);
@@ -1899,8 +1950,17 @@ static void calypso_dsp_shunt_feed_agch(const uint8_t *l2, int len)
             _ss = (cd0 >> 3) & 0x07; _ct = "SDCCH/8";
             _base = _ss * 4;                    /* 0,4,8,12,16,20,24,28 (mod 51) */
         }
-        if (_base >= 0) { g_shunt.sdcch_ss = (uint8_t)_base; g_shunt.sdcch_ss_set = true;
-                          g_shunt.sdcch_ch8 = ((cd0 & 0xC0) == 0x40); }  /* base + type /4|/8 */
+        /* [2026-08-08] CE CHEMIN N'ECRIT PLUS LA FENETRE. Il la posait depuis
+         * N'IMPORTE QUEL IMM ASSIGN du CCCH — donc aussi ceux des autres
+         * abonnes (mesure : 68 de RA=0x07 et 12 de RA=0x0a pour un RACH a nous
+         * de RA=0x08). Ajouter la source autoritaire sans retirer celle-ci ne
+         * suffisait pas : les deux ecrivains se marchaient dessus, et le test
+         * anti-repetition du setter le faisait sortir en silence quand feed_agch
+         * avait deja pose la valeur (constate au run 18:31 : DCCH #2 SS=1 detecte,
+         * aucune DCCH-WINDOW correspondante). La fenetre vient desormais
+         * UNIQUEMENT de calypso_dsp_shunt_set_dcch(), appelee sur le chan_nr que
+         * le firmware annonce lui-meme. On garde la sonde ci-dessous, qui reste
+         * utile pour voir ce que le reseau distribue. */
         static unsigned _iac = 0;
         if (_iac++ < 80) {
             fprintf(stderr, "[dsp-shunt] IMM-ASS chan_desc=[%02x %02x %02x] %s SS=%d base=%d TN=%u req-ref=[%02x %02x %02x]\n",

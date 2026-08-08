@@ -101,6 +101,7 @@ static L1CTLSock g_l1ctl;
 volatile uint32_t g_last_rach_conf_fn = 0;
 volatile uint32_t g_rach_conf_fn[256] = {0};  /* per-ra FN-FIX : RACH_CONF fn keye par g_last_recorded_ra */
 extern volatile uint8_t g_last_recorded_ra;   /* defini dans calypso_dsp_shunt.c (record_rach) */
+extern void calypso_dsp_shunt_set_dcch(int kind, int ss);  /* fenetre SDCCH du shunt */
 
 /* ---- Sercomm helpers ---- */
 
@@ -254,6 +255,56 @@ static void sercomm_frame_complete(L1CTLSock *s)
             g_rach_conf_fn[g_last_recorded_ra] = g_last_rach_conf_fn;   /* per-ra : keye par le ra de la derniere RACH */
             L1CTL_LOG("FN-FIX: RACH_CONF fn=%u capture (memo mobile, ra=0x%02x)", g_last_rach_conf_fn, g_last_recorded_ra);
         }
+        /* ═══════════════════════════════════════════════════════════════════
+         * CANAL DEDIE COURANT -> /dev/shm/calypso_dcch_cfg  (2026-08-08)
+         *
+         * OU LE LIRE. Premiere tentative : depuis les IMM ASSIGN du CCCH, cote
+         * si_bridge. FAUX — le CCCH porte ceux de TOUS les abonnes (68 de
+         * RA=0x07, 12 de RA=0x0a pour un RACH a nous de RA=0x08) : la sous-voie
+         * active sautait 60 fois par run. Deuxieme tentative : DM_EST_REQ dans
+         * l1ctl_client_readable. FAUX AUSSI, et pour une raison structurelle
+         * documentee en tete de ce fichier : ce socket est INACTIF, osmocon
+         * detient /tmp/osmocom_l2 et relaie par le pty. Mesure : `RX←mobile` = 0
+         * occurrence sur tout le journal, alors qu'osmocon voit bien 6 DM_EST.
+         *
+         * ICI, en revanche, on est dans le sens firmware->mobile, qui est le
+         * SEUL flux L1CTL que QEMU parse reellement. DATA_CONF (0x0f) et
+         * DATA_IND (0x03) portent l1ctl_info_dl.chan_nr en payload[4], rempli
+         * par le firmware depuis SON ordonnanceur mframe : c'est donc bien le
+         * canal que NOTRE mobile utilise, pas celui d'un voisin.
+         *
+         * chan_nr (GSM 08.58 9.3.1) : 001SSTTT = SDCCH/4, 01SSSTTT = SDCCH/8.
+         * BCCH (0x80) / CCCH (0x90) / TCH (00001TTT) sont ignores ici.
+         * ═══════════════════════════════════════════════════════════════════ */
+        if ((payload[0] == 0x0f || payload[0] == 0x03) && plen >= 5) {
+            uint8_t chan_nr = payload[4];
+            int kind = -1, ss = 0;
+            if ((chan_nr & 0xE0) == 0x20)      { kind = 0; ss = (chan_nr >> 3) & 0x03; }
+            else if ((chan_nr & 0xC0) == 0x40) { kind = 1; ss = (chan_nr >> 3) & 0x07; }
+            static uint8_t last_chan_nr = 0xFF;
+            if (kind >= 0 && chan_nr != last_chan_nr) {
+                static uint32_t dcch_seq;
+                last_chan_nr = chan_nr;
+                dcch_seq++;
+                uint8_t b[16];
+                memset(b, 0, sizeof(b));
+                memcpy(b, &dcch_seq, 4);
+                b[4] = (uint8_t)kind; b[5] = (uint8_t)ss;
+                b[6] = chan_nr & 0x07; b[7] = chan_nr;
+                int dfd = open("/dev/shm/calypso_dcch_cfg",
+                               O_WRONLY | O_CREAT | O_TRUNC, 0666);
+                if (dfd >= 0) {
+                    if (write(dfd, b, sizeof(b)) < 0) { /* ignore */ }
+                    close(dfd);
+                }
+                L1CTL_LOG("DCCH #%u : chan_nr=0x%02x -> SDCCH/%d SS=%d TN=%u "
+                          "(vu sur %s)", dcch_seq, chan_nr, kind ? 8 : 4, ss,
+                          chan_nr & 0x07, l1ctl_tname(payload[0]));
+                /* La MEME verite pilote la fenetre de presentation a_cd du shunt,
+                 * qui suivait jusqu'ici les IMM ASSIGN des autres abonnes. */
+                calypso_dsp_shunt_set_dcch(kind, ss);
+            }
+        }
         L1CTL_LOG("TX→mobile: dlci=%d len=%d type=0x%02x %s", dlci, plen, payload[0],
                   l1ctl_tname(payload[0]));
         l1ctl_send_to_mobile(s, payload, plen);
@@ -384,6 +435,7 @@ static void l1ctl_client_readable(void *opaque)
                 if (write(kfd, z, sizeof(z)) < 0) { /* ignore */ }
                 close(kfd);
             }
+
         }
 
         /* Wrap in sercomm and inject into UART RX */
