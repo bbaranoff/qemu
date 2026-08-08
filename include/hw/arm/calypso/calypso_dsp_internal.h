@@ -78,10 +78,38 @@
 #define TCHT_DSP_TASK       13     /* TCH traffic : RX(d_task_d) ET TX(d_task_u) — le vrai trafic */
 #define TCHA_DSP_TASK       14     /* TCH SACCH */
 #define TCHD_DSP_TASK       28     /* TCH dummy (RX-only, PAS de data UL) — ne PAS relayer en UL */
-/* Offsets NDB (BASE_API_NDB), confirmes DWARF layer1.highram.elf (T_NDB sizeof=0x18d4). */
+/* Offsets NDB (BASE_API_NDB), confirmes DWARF layer1.highram.elf (T_NDB sizeof=0x18d4).
+ *
+ * [2026-08-08] CHAINE COMPLETE. Les trois valeurs deja presentes (a_cd=0x1FC DWARF,
+ * a_dd_0=0x238, a_cu=0x264 qui etait code EN DUR dans shunt_latch_task) sont trois
+ * ancres INDEPENDANTES d'une seule et meme suite contigue de dsp_api.h :
+ *     a_cd[15] a_fd[15] a_dd_0[22] a_cu[15] a_fu[15] a_du_0[22]
+ *     0x1FC    +0x1E    +0x1E      +0x2C    +0x1E    +0x1E
+ *   = 0x1FC -> 0x21A -> 0x238 -> 0x264 -> 0x282 -> 0x2A0
+ * Les trois ancres tombent EXACTEMENT sur 0x1FC / 0x238 / 0x264 : la suite est donc
+ * verifiee en trois points, pas extrapolee depuis un seul. a_dd_1/a_du_1 vivent plus
+ * haut dans la struct (dsp_api.h:277-278, AVANT a_cd) -> 0x108 / 0x134. */
+#define NDB_A_FD            0x21A  /* FACCH DL  [15] : L3 pendant l'appel (CONNECT...) */
 #define NDB_A_DD_0          0x238  /* DL traffic FR sub0 : [0]@+0 hdr, [2]@+4 biterr, [3]@+6 (33o) */
+#define NDB_A_CU            0x264  /* SDCCH/SACCH UL [15] (etait en dur dans latch_task) */
+#define NDB_A_FU            0x282  /* FACCH UL  [15] : ASSIGNMENT COMPLETE part par la */
+#define NDB_A_DU_0          0x2A0  /* UL traffic FR sub1 (cf PIEGE #1 : sub0 = a_du_1) */
+#define NDB_A_DD_1          0x108  /* DL traffic FR sub1 */
 #define NDB_A_DU_1          0x134  /* PIEGE #1 : UL sub0 = a_du_1 (PAS a_du_0=0x2A0) cf prim_tch.c:485. JALON 3. */
 #define NDB_D_TCH_MODE      0x006
+
+/* Adresse MOT dans c54x->data[] d'un offset NDB. Le firmware lit data[] via
+ * calypso_dsp_read (calypso_trx.c:396 : data[offset/2 + 0x0800]) ; le chemin
+ * a_cd du camp ecrit deja data[0x9D2] en dur. Cette macro rend la meme valeur
+ * SANS constante magique : NDB_W(NDB_A_CD) == 0x9D2 (verifie ci-dessous). */
+#define NDB_W(off)          (0x0800u + ((0x01A8u + (unsigned)(off)) >> 1))
+/* Garde-fou de compilation : si un des offsets derive, ca ne compile plus au lieu
+ * d'ecrire silencieusement a cote (c'est exactement le mode de panne du 2026-06-02,
+ * a_cd a 0x1DC -> num_biterr=0xff + CRC fail, invisible sauf au decode). */
+#define NDB_W_CHECK  \
+    ((NDB_W(NDB_A_CD) == 0x9D2u) && (NDB_W(NDB_A_FD)   == 0x9E1u) && \
+     (NDB_W(NDB_A_DD_0) == 0x9F0u) && (NDB_W(NDB_A_CU) == 0xA06u) && \
+     (NDB_W(NDB_A_FU) == 0xA15u) && (NDB_W(NDB_A_DU_1) == 0x96Eu))
 /* a_dd_0[0] header bits (l1_environment.h:267-270) */
 #define B_FIRE0             5
 #define B_FIRE1             6
@@ -114,6 +142,26 @@ struct dsp_shunt_state {
     uint8_t    tch_dl_fr[33];
     bool       tch_dl_valid;
     uint32_t   tch_dl_seq;
+    /* ---- TCH/F : DL de signalisation (2026-08-08) ------------------------------
+     * FACCH DL et SACCH-du-TCH DL, decodes par le grgsm TCHF et achemines en
+     * GSMTAP 4730 (sous-types 0x08 / 0x88) -> feed_facch / feed_tch_sacch.
+     * Ils sont TENUS (pas consume-once) : le firmware relit a_fd/a_cd a sa
+     * cadence de bloc (fn%13%4==3 pour la FACCH, burst 3 pour la SACCH) et on ne
+     * connait pas cette phase ici. Le tick d'arrivee sert de TTL pour ne pas
+     * re-presenter indefiniment une trame morte (cf le replay infini de sb_valid,
+     * corrige par SHUNT_SB_MAX_AGE : meme piege, meme garde-fou). */
+    uint8_t    facch_dl[23];          /* FACCH DL -> a_fd[3..14] */
+    bool       facch_dl_valid;
+    uint32_t   facch_dl_tick;
+    uint8_t    tsacch_dl[23];         /* SACCH du TCH -> a_cd[3..14] (l1s_tch_a_resp) */
+    bool       tsacch_dl_valid;
+    uint32_t   tsacch_dl_tick;
+    /* Canal dedie TCH courant, publie par si_bridge (/dev/shm/calypso_tch_cfg)
+     * apres decodage de l'ASSIGNMENT COMMAND. tn sert au routage UL. */
+    uint8_t    tch_tn;
+    uint8_t    tch_tsc;
+    uint16_t   tch_arfcn;
+    bool       tch_cfg_valid;
     /* SI réel injecté (gr-gsm ou démod C native) via calypso_dsp_shunt_feed_si.
      * Si si_valid, shunt_dispatch_allc écrit si_buf dans a_cd au lieu du canned. */
     uint8_t    si_buf[23];
@@ -228,6 +276,7 @@ uint16_t shunt_read_w(uint32_t addr);
 void shunt_write_w(uint32_t addr, uint16_t v);
 uint16_t shunt_burst_echo(void);   /* [2026-07-22] echo burst commande (per-cmd mirror) */
 uint32_t shunt_l1s_fn(void);
+const char *shunt_fw_elf_path(void);  /* ELF -kernel : symboles ET offsets DWARF */
 uint32_t shunt_last_rach_fn(void);
 uint32_t wp_base(uint8_t page_idx);
 uint32_t rp_base(uint8_t page_idx);
