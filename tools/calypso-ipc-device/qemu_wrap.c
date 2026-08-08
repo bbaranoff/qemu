@@ -1084,6 +1084,12 @@ static int tch_ul_build_burst(int8_t *ab, uint32_t fn, uint8_t tsc, uint8_t tn,
          * bloc SACCH/TF occupent fn%104 = pos, pos+26, pos+52, pos+78. */
         uint32_t pos_bid = ((fn % 104) + 104 - sacch_pos) % 104 / 26;
 
+        static int sa_start = -1;
+        if (sa_start < 0) { const char *e = getenv("CALYPSO_UL_TCH_SACCH_BID");
+                            sa_start = e ? (atoi(e) & 3) : 0;
+                            LOGP(DDEV, LOGL_NOTICE,
+                                 "TCH-UL SACCH : emission demarree au bid BTS %d "
+                                 "(CALYPSO_UL_TCH_SACCH_BID, balayer 0..3)\n", sa_start); }
         static ubit_t sa_pending_bursts[4 * TCH_BPLEN];
         static int    sa_pending = 0;            /* un bloc encode attend son bid 0 */
         static int    sa_active  = 0;            /* un bloc est en cours d'emission */
@@ -1106,14 +1112,27 @@ static int tch_ul_build_burst(int8_t *ab, uint32_t fn, uint8_t tsc, uint8_t tn,
             static unsigned nsa = 0;
             if (nsa++ < 20 || (nsa % 25) == 0)
                 LOGP(DDEV, LOGL_NOTICE,
-                     "TCH-UL SACCH bloc #%u encode : ouvert par le firmware a "
-                     "fn=%u (%%104=%u, bid BTS=%u) | air l1s_fn=%u (ecart=%d) "
-                     "-> mis en attente du prochain bid 0\n",
-                     nsa, fn, fn % 104, pos_bid, l1s, (int32_t)(l1s - fn));
+                     "TCH-UL SACCH bloc #%u encode : ecrit par le firmware a "
+                     "l1s_fn=%u (%%104=%u <- ANCRE STABLE) ; apercu par nous a "
+                     "fn=%u (%%104=%u, retard=%d trames car on ne lit le sideband "
+                     "qu'aux slots SACCH) -> emission au bid %d\n",
+                     nsa, l1s, l1s % 104, fn, fn % 104, (int32_t)(fn - l1s),
+                     sa_start);
         }
 
-        /* Demarrage d'un bloc : uniquement sur le bid 0 de la BTS. */
-        if (pos_bid == 0) {
+        /* Demarrage d'un bloc : sur le bid de depart choisi.
+         *
+         * POURQUOI C'EST BALAYABLE ET PAS DEDUIT. Notre fn est prouve congruent
+         * a celui de la BTS mod 51 (le SDCCH montant aboutit) et mod 13 (la
+         * FACCH montante aboutit, l'ASSIGNMENT COMPLETE atteint la BSC), donc
+         * mod 663. Mais 663 est IMPAIR : il ne contraint pas la congruence
+         * mod 104, qui est justement celle dont depend le bid SACCH. Aucune des
+         * mesures dont je dispose ne fixe cette phase — la deduire serait
+         * inventer. Quatre valeurs possibles, une seule marche : on balaye.
+         * CALYPSO_UL_TCH_SACCH_BID=0..3 (defaut 0). Le juge est direct :
+         *   grep -c "CONNECTION FAIL" /var/log/osmocom/osmo-bsc.log
+         * cesse d'augmenter et l'appel passe les 15 s. */
+        if ((int)pos_bid == sa_start) {
             if (sa_pending) {
                 memcpy(sacch_bursts, sa_pending_bursts, sizeof(sacch_bursts));
                 sa_pending = 0;
@@ -1134,7 +1153,10 @@ static int tch_ul_build_burst(int8_t *ab, uint32_t fn, uint8_t tsc, uint8_t tn,
         }
         if (!sacch_have || !sa_active)
             return 0;
-        ul_compose_nb(ab, sacch_bursts + pos_bid * TCH_BPLEN, tsc);
+        /* Le contenu part toujours de son burst 0 ; c'est la POSITION de depart
+         * qui bouge. On indexe donc le contenu relativement au bid de depart. */
+        uint32_t cbid = (pos_bid + 4 - (uint32_t)sa_start) & 3;
+        ul_compose_nb(ab, sacch_bursts + cbid * TCH_BPLEN, tsc);
         if (is_facch_out) *is_facch_out = 2;         /* 2 = SACCH */
         return 1;
     }
