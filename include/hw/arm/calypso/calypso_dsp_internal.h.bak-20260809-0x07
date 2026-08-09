@@ -209,12 +209,6 @@ struct dsp_shunt_state {
     uint32_t   sdcch_tick;           /* legacy single-slot */
     uint8_t    sdcch_ss;             /* base DL fn%51 de la voie dediee (SDCCH/4 ou /8) */
     bool       sdcch_ss_set;         /* true = sdcch_ss issu d'un IMM-ASS valide (sinon defaut 22) */
-    /* [2026-08-09] Instant ou le firmware a annonce un canal DEDIE (DM_EST_REQ,
-     * via calypso_dsp_shunt_set_dcch). Sert UNIQUEMENT a couper l ecriture du
-     * bloc SI du camp dans a_cd pendant la fenetre ou le mobile est deja en
-     * dedie mais ou gr-gsm n a pas encore decode la 1re SACCH. */
-    uint32_t   dcch_guard_tick;
-    bool       dcch_guard_armed;
     bool       sdcch_ch8;            /* true = derniere assignation = SDCCH/8 (sinon /4) */
     /* PM REEL (no-hardcode) : magnitude moyenne du dernier burst DL (feed_iq).
      * Remplace le canned 0x7000 / le 0=-110 : le firmware en derive le vrai rxlev. */

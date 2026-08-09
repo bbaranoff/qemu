@@ -102,6 +102,7 @@ volatile uint32_t g_last_rach_conf_fn = 0;
 volatile uint32_t g_rach_conf_fn[256] = {0};  /* per-ra FN-FIX : RACH_CONF fn keye par g_last_recorded_ra */
 extern volatile uint8_t g_last_recorded_ra;   /* defini dans calypso_dsp_shunt.c (record_rach) */
 extern void calypso_dsp_shunt_set_dcch(int kind, int ss);  /* fenetre SDCCH du shunt */
+extern void calypso_dsp_shunt_set_dcch_active(int on);     /* garde SI pendant le dedie */
 extern int calypso_dsp_shunt_tch_dl_written(const uint8_t *fr33); /* sonde TCH-DL */
 
 /* ---- SONDE CALYPSO_TCH_DL_PROBE : les octets FR qui partent VRAIMENT ---------
@@ -341,6 +342,22 @@ static void sercomm_frame_complete(L1CTLSock *s)
             if ((chan_nr & 0xE0) == 0x20)      { kind = 0; ss = (chan_nr >> 3) & 0x03; }
             else if ((chan_nr & 0xC0) == 0x40) { kind = 1; ss = (chan_nr >> 3) & 0x07; }
             static uint8_t last_chan_nr = 0xFF;
+            /* [2026-08-09] FRONT DE LIBERATION DU DEDIE, dans le sens que QEMU
+             * parse REELLEMENT. Premiere tentative : accrocher DM_REL_REQ (0x12)
+             * dans le bloc mobile->firmware plus bas. C'est du CODE MORT ici :
+             * le socket l1ctl de QEMU est orphelin (le mobile parle a osmocon),
+             * mesure « RX←mobile » = 0 occurrence sur tout le journal. Ce meme
+             * bloc porte aussi la remise a zero du Kc a chaque DM_EST/DM_REL —
+             * elle ne s'execute donc jamais non plus, a verifier avant d'activer
+             * l'A5/1.
+             * Ici on est dans DATA_CONF/DATA_IND, qui EST parse : quand chan_nr
+             * repasse sur du non-dedie (BCCH 0x80 / CCCH 0x90), le canal est
+             * termine et la garde SI doit se lever. Sans ce front, seule la
+             * peremption de 60 s la libere, et le camp reste prive de SI. */
+            if (kind < 0 && last_chan_nr != 0xFF) {
+                last_chan_nr = 0xFF;
+                calypso_dsp_shunt_set_dcch_active(0);
+            }
             if (kind >= 0 && chan_nr != last_chan_nr) {
                 static uint32_t dcch_seq;
                 last_chan_nr = chan_nr;
@@ -362,6 +379,7 @@ static void sercomm_frame_complete(L1CTLSock *s)
                 /* La MEME verite pilote la fenetre de presentation a_cd du shunt,
                  * qui suivait jusqu'ici les IMM ASSIGN des autres abonnes. */
                 calypso_dsp_shunt_set_dcch(kind, ss);
+                calypso_dsp_shunt_set_dcch_active(1);
             }
         }
         L1CTL_LOG("TX→mobile: dlci=%d len=%d type=0x%02x %s", dlci, plen, payload[0],
@@ -494,6 +512,11 @@ static void l1ctl_client_readable(void *opaque)
          * nouveau canal demarre EN CLAIR jusqu'a son propre CIPHER MODE COMMAND
          * (sinon un Kc perime chiffrerait la SABM du canal suivant). */
         if (payload[0] == 0x05 || payload[0] == 0x12) {   /* DM_EST_REQ / DM_REL_REQ */
+            /* ⚠️ CE BLOC EST MORT dans la configuration actuelle : « RX←mobile »
+             * ne compte 0 occurrence, le socket l1ctl de QEMU etant orphelin (le
+             * mobile parle a osmocon). La remise a zero du Kc ci-dessous ne
+             * s'execute donc JAMAIS — a verifier avant d'activer l'A5/1. La garde
+             * SI du dedie est branchee plus haut, sur DATA_CONF/DATA_IND. */
             int kfd = open("/dev/shm/calypso_kc",
                            O_WRONLY | O_CREAT | O_TRUNC, 0666);
             if (kfd >= 0) {

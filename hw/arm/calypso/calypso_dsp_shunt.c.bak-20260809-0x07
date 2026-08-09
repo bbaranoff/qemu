@@ -165,18 +165,9 @@ void calypso_dsp_shunt_set_dcch(int kind, int ss)
 {
     static const uint8_t b4[4] = { 22, 26, 32, 36 };
     uint8_t base = kind ? (uint8_t)((ss & 7) * 4) : b4[ss & 3];
-    /* [2026-08-09] LA GARDE S ARME AVANT LE RETOUR ANTICIPE.
-     * Elle etait posee plus bas, apres le « if inchange » : a la DEUXIEME
-     * ouverture d un dedie sur la MEME sous-voie, la fonction sortait avant de
-     * l atteindre et la fenetre restait ouverte. Mesure : mobile passe en dedie
-     * 2 fois, une seule ligne DCCH-WINDOW, 10 « 0x07 » toujours la.
-     * Cet appel signale une OUVERTURE de canal, pas un changement de sous-voie —
-     * la garde doit donc suivre l appel, pas la comparaison. */
-    g_shunt.dcch_guard_tick  = g_shunt.tick_cnt;
-    g_shunt.dcch_guard_armed = true;
     if (g_shunt.sdcch_ss_set && g_shunt.sdcch_ss == base
         && g_shunt.sdcch_ch8 == (kind != 0))
-        return;                                  /* sous-voie inchangee */
+        return;                                  /* inchange */
     g_shunt.sdcch_ss     = base;
     g_shunt.sdcch_ss_set = true;
     g_shunt.sdcch_ch8    = (kind != 0);
@@ -792,64 +783,6 @@ static void shunt_dispatch_nb(uint8_t page_idx, uint16_t task_d)
      * NB UL = consume burst bits from DARAM for TX (forwarded to bridge). */
     SHUNT_LOG("DISPATCH NB page=%u task_d=%u (TODO)\n",
         page_idx, task_d);
-}
-
-/* [2026-08-09] GARDE SI PENDANT L OUVERTURE D UN CANAL DEDIE.
- *
- * DEFAUT CORRIGE : le bloc SI du camp s ecrit dans a_cd a CHAQUE tick, garde par
- * !sdcch_valid. Or sdcch_valid ne passe a vrai qu a la PREMIERE trame SDCCH
- * decodee par gr-gsm — environ 480 ms apres l ouverture du canal. Pendant cette
- * fenetre le mobile est DEJA en dedie : il lit les blocs SI, cadres BCCH, comme
- * des SACCH. gsm48_rr_rx_acch() (osmocom-bb) ne distingue B4 de Bter QUE PAR LA
- * LONGUEUR — 19 octets contre 21 — donc un bloc de 21 est pris pour un en-tete
- * court et son msg_type est lu sur des bits arbitraires. D ou le
- * « Short header message type 0x07 unsupported ».
- *
- * MESURE QUI L ETABLIT : 42 occurrences cote Calypso, 0 cote MS2 sur fake_trx
- * (qui ne passe pas par le shunt) ; et zero pendant un TCH etabli — 70 blocs
- * SACCH lus sans une erreur — parce que la, c est tch_cfg_valid qui garde.
- * Le motif « hors appel oui, pendant l appel non » designe exactement le SDCCH.
- *
- * DUREE : du DM_EST_REQ au DM_REL_REQ. Le TTL n est plus la duree nominale mais
- * un FILET DE SECURITE (~60 s) : si le DM_REL_REQ est manque, la garde se leve
- * seule plutot que d affamer le camp en SI pour toujours — le defaut
- * no-cell-info a deja ete paye une fois. CALYPSO_DCCH_SI_GUARD=0 la desactive
- * entierement, une autre valeur change le filet (en ticks de 4,6 ms). */
-/* [2026-08-09] LES DEUX FRONTS DU CANAL DEDIE.
- * Appele depuis l1ctl_sock.c sur DM_EST_REQ (0x05) et DM_REL_REQ (0x12), dans le
- * sens mobile->firmware — le meme point qui remet deja le chiffrement a zero, donc
- * un chemin exerce a chaque appel.
- * POURQUOI DEUX FRONTS ET PAS UNE FENETRE. Premiere version : garde de 120 ticks
- * a l ouverture. Mesure : les « 0x07 » tombent a +3, +5, +7 ... +16 s apres
- * l entree en dedie, pas dans la premiere demi-seconde. Le camp ne clobbe pas
- * seulement au demarrage : il clobbe dans TOUS les trous entre deux presentations
- * SDCCH, parce que sdcch_valid retombe entre les blocs. Il faut donc tenir la
- * garde du debut a la fin du canal, pas la temporiser. */
-void calypso_dsp_shunt_set_dcch_active(int on);
-void calypso_dsp_shunt_set_dcch_active(int on)
-{
-    if (on) {
-        g_shunt.dcch_guard_tick  = g_shunt.tick_cnt;
-        g_shunt.dcch_guard_armed = true;
-    } else {
-        g_shunt.dcch_guard_armed = false;
-    }
-    SHUNT_LOG("DCCH-GARDE : %s (SI du camp %s dans a_cd)\n",
-              on ? "ARMEE (DM_EST_REQ)" : "levee (DM_REL_REQ)",
-              on ? "supprime" : "retabli");
-}
-
-static bool shunt_dcch_si_guard(void)
-{
-    static int ttl = -1;
-    if (ttl < 0) { const char *e = getenv("CALYPSO_DCCH_SI_GUARD");
-                   ttl = (e && *e) ? atoi(e) : 13000; }   /* ~60 s : FILET, pas la duree nominale */
-    if (ttl == 0 || !g_shunt.dcch_guard_armed) return false;
-    if ((uint32_t)(g_shunt.tick_cnt - g_shunt.dcch_guard_tick) > (uint32_t)ttl) {
-        g_shunt.dcch_guard_armed = false;      /* expire : le camp reprend la main */
-        return false;
-    }
-    return true;
 }
 
 /* ---- TCH/F DL (JALON 1) : sideband /dev/shm/calypso_tch_dl -> a_dd_0 ----
@@ -1849,8 +1782,7 @@ void calypso_dsp_shunt_on_frame_tick(void)
              * la ou il attend un rapport de mesure. Meme raison, meme forme que le
              * garde-fou sdcch_valid juste a cote. En dedie le mobile ne lit pas le
              * BCCH : aucun SI n'est perdu. */
-            if (g_shunt.si_valid && !g_shunt.sdcch_valid && !shunt_dcch_si_guard()
-                && !g_shunt.tch_cfg_valid
+            if (g_shunt.si_valid && !g_shunt.sdcch_valid && !g_shunt.tch_cfg_valid
                 && !(g_shunt.agch_valid && (g_shunt.agch_buf[2] == 0x3f
                      || g_shunt.agch_buf[2] == 0x3a || g_shunt.agch_buf[2] == 0x3b))
                 && g_shunt.c54x && g_shunt.c54x->data) {
