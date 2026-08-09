@@ -647,68 +647,8 @@ static void shunt_latch_task(uint16_t new_d_dsp_page)
         }
         if (kk < 0) kk = 0;
         for (int i = 0; i < 23; i++) l2[i] = win[kk + i];
-          /* [2026-08-09] CONSOMMATION UNIQUE DU MONTANT SDCCH.
-           *
-           * LE DEFAUT. Ce bloc publiait a CHAQUE passage, sans jamais consommer :
-           * il balaie une fenetre de a_cu et ne teste pas B_BLUD, contrairement a
-           * shunt_ndb_take_ul() qui efface le bit apres lecture. Tant que le
-           * firmware laissait sa trame dans a_cu, on la rejouait a chaque trame.
-           * Mesure du 09/08, la MEME SABM sur des trames consecutives :
-           *   SDCCH-UL *NONIDLE* l1s%51=0  L2: 01 3f 49 05 08 70 00 f1
-           *   SDCCH-UL *NONIDLE* l1s%51=1  L2: 01 3f 49 05 08 70 00 f1
-           *   SDCCH-UL *NONIDLE* l1s%51=2  L2: 01 3f 49 05 08 70 00 f1
-           * (0x3f = SABM, 05 08 = LOCATION UPDATING REQUEST).
-           *
-           * CE QUE CA CASSE. Le lien s etablit sur la premiere : le BSC passe bien
-           * en ESTABLISHED. Les suivantes arrivent alors sur un lien deja etabli,
-           * ou une SABM porteuse d information est ILLEGALE. La BTS repond
-           * « ERROR INDICATION cause=SABM frame with information not allowed in
-           * this state », quatre fois, puis libere : WAIT_BEFORE_RF_RELEASE ->
-           * RR_REL_IND -> Location update failed. Le LU echouait APRES avoir
-           * reussi. Meme defaut que le RACH rejoue, corrige la-bas par « 1 write
-           * = 1 burst, pas de sticky », jamais applique au SDCCH montant.
-           *
-           * LE CHOIX. B_BLUD n est pas utilisable ici : ce chemin existe justement
-           * parce que l offset de la trame varie et qu il faut balayer une fenetre.
-           * On deduplique donc sur le CONTENU -- mais une retransmission T200 est
-           * legitime et porte le meme contenu. On n etouffe que les repetitions
-           * RAPPROCHEES : identiques ET moins de TTL ticks apres la precedente.
-           * Defaut 60 ticks (~275 ms), sous le T200 du SDCCH.
-           *
-           * CALYPSO_SDCCH_UL_ONCE=0 retablit la republication systematique ;
-           * CALYPSO_SDCCH_UL_TTL regle la fenetre. */
-          {
-              static int once = -1, ttl = 60;
-              if (once < 0) {
-                  const char *e = getenv("CALYPSO_SDCCH_UL_ONCE");
-                  once = (e && *e == '0') ? 0 : 1;
-                  const char *t = getenv("CALYPSO_SDCCH_UL_TTL");
-                  if (t && *t) ttl = atoi(t);
-                  SHUNT_LOG("SDCCH-UL consommation unique : %s (fenetre %d ticks)\n",
-                            once ? "ACTIVE" : "desactivee", ttl);
-              }
-              static uint8_t  dernier[23];
-              static uint32_t dernier_tick;
-              static int      a_deja_publie;
-              static unsigned long long publiees, etouffees;
-              int identique = a_deja_publie && !memcmp(dernier, l2, 23);
-              int rapproche = (uint32_t)(g_shunt.tick_cnt - dernier_tick) < (uint32_t)ttl;
-              if (once && identique && rapproche) {
-                  etouffees++;
-                  if (etouffees <= 3 || (etouffees % 500) == 0)
-                      SHUNT_LOG("SDCCH-UL etouffee #%llu : repetition rapprochee "
-                                "(ctrl=0x%02x, %u ticks) -- publiees=%llu\n",
-                                etouffees, l2[1],
-                                (unsigned)(g_shunt.tick_cnt - dernier_tick), publiees);
-              } else {
-                  memcpy(dernier, l2, 23);
-                  dernier_tick  = g_shunt.tick_cnt;
-                  a_deja_publie = 1;
-                  publiees++;
-                  calypso_sdcch_ul_publish(l2, g_shunt.d_task_u,
-                                           calypso_trx_get_fn(), shunt_l1s_fn());
-              }
-          }
+        calypso_sdcch_ul_publish(l2, g_shunt.d_task_u,
+                                 calypso_trx_get_fn(), shunt_l1s_fn());
         /* Log : quelques idle pour sanity (capé), mais TOUJOURS les frames NON-IDLE
          * (ctrl=l2[1] != 0x03) -> capte le SABM (ctrl 0x3F) et les I-frames. */
         static int ul_log = 0;
@@ -1307,49 +1247,6 @@ static void shunt_dcch_sacch_present(uint16_t *d)
     }
     if (!on) return;
 
-    /* [2026-08-09] NE PAS ECRASER LE CANAL PRINCIPAL — correctif du correctif.
-     *
-     * CE QUE LA PREMIERE VERSION FAISAIT DE FAUX. Elle presentait a CHAQUE tick ou
-     * la garde est armee, sans aucune condition de position de trame. Mesure :
-     * ~22000 ecritures dans a_cd contre 62 presentations de l anneau SDCCH -- deux
-     * ordres de grandeur. Or a_cd porte AUSSI le canal principal du SDCCH, donc le
-     * UA que le reseau envoie en reponse au SABM. On l ecrasait avant que le
-     * firmware ait pu le lire.
-     * Symptome exact : le mobile applique bien mon SACCH (« DL SACCH indicates ta 4
-     * / tx_power 7 », « New SYSTEM INFORMATION 5 ») mais ne recoit JAMAIS le UA ; il
-     * retransmet sa SABM sur T200, le BSC -- deja passe en ESTABLISHED -- proteste
-     * « SABM frame with information not allowed in this state » puis libere.
-     * La SACCH marchait parce qu elle gagnait a tous les coups.
-     *
-     * DEUX GARDE-FOUS, dans cet ordre :
-     *   1. NE PAS ECRIRE SUR UN BLOC NON LU. Meme principe que la garde de a_dd_0
-     *      posee ce matin (forcages 13949 -> 0) : si B_BLUD est encore arme, le
-     *      firmware n a pas consomme, on se tait.
-     *   2. NE PAS EMPIETER SUR LA FENETRE DU CANAL PRINCIPAL. Le SDCCH occupe
-     *      fn%51 dans [base, base+3] (base = g_shunt.sdcch_ss, pose par set_dcch).
-     *      La SACCH a ses propres blocs ailleurs ; y presenter le SI5/SI6 ne coute
-     *      rien et laisse le UA passer. */
-    {
-        uint16_t hdr = d[ndb_w(g_ndb.a_cd)];
-        if (hdr & (1u << B_BLUD)) {
-            static unsigned long long non_lu;
-            if (++non_lu % 5000 == 1)
-                SHUNT_LOG("DCCH-SACCH : bloc precedent non lu (#%llu) -- on se tait "
-                          "pour ne pas ecraser le canal principal\n", non_lu);
-            return;
-        }
-        uint32_t s51 = (uint32_t)calypso_trx_get_fn() % 51u;
-        uint32_t base = g_shunt.sdcch_ss;
-        if (s51 >= base && s51 <= base + 3u) {
-            static unsigned long long fenetre;
-            if (++fenetre % 5000 == 1)
-                SHUNT_LOG("DCCH-SACCH : fn%%51=%u dans la fenetre du canal principal "
-                          "[%u-%u] (#%llu) -- on laisse la place au SDCCH\n",
-                          s51, base, base + 3u, fenetre);
-            return;
-        }
-    }
-
     if (!g_shunt.sacch_have) {
         /* Rien de valide a presenter : on ne met PAS de bourrage (le mobile le
          * refuserait), on laisse le camp reprendre la main -- ses 0x07 sont un
@@ -1365,24 +1262,8 @@ static void shunt_dcch_sacch_present(uint16_t *d)
 
     static unsigned long long n;
     if (++n <= 3 || (n % 2000) == 0)
-        /* [2026-08-09] On imprime les 8 premiers octets, pas seulement mt.
-         * Le mobile discrimine le format SACCH par la seule LONGUEUR :
-         *   l3len == 21 (N201_Bter_SACCH) -> en-tete court -> il lit le 1er octet
-         *                                     comme un type de message (d ou les
-         *                                     « SYSTEM INFORMATION 10 » parasites)
-         *   l3len == 19 (N201_B4)         -> SI5 / SI6, ce qu on veut
-         * Mesure : 30 SI10 pour 3 SI5 -> nos trames arrivent a 21, deux octets de
-         * trop. Voir les octets permet de dire OU sont ces deux octets : en-tete
-         * L1 SACCH (2 o) mal place, ou en-tete LAPDm absent la ou on le croit.
-         * Attendu pour du B4 : [0..1] en-tete L1, [2] addr (0x03), [3] ctrl (0x03),
-         * puis le L3 qui commence par 0x06 (PD RR) et 0x1d/0x1e (SI5/SI6). */
-        SHUNT_LOG("DCCH-SACCH #%llu : a_cd <- %02x %02x %02x %02x %02x %02x %02x %02x"
-                  " (mt@6=0x%02x, %s)\n",
-                  n, g_shunt.sacch_buf[0], g_shunt.sacch_buf[1],
-                  g_shunt.sacch_buf[2], g_shunt.sacch_buf[3],
-                  g_shunt.sacch_buf[4], g_shunt.sacch_buf[5],
-                  g_shunt.sacch_buf[6], g_shunt.sacch_buf[7],
-                  g_shunt.sacch_buf[6],
+        SHUNT_LOG("DCCH-SACCH #%llu : SI6 presente dans a_cd (mt=0x%02x, %s)\n",
+                  n, g_shunt.sacch_buf[6],
                   g_shunt.sacch_real ? "REEL gr-gsm" : "derive du SI3");
 }
 
@@ -2879,30 +2760,8 @@ static void calypso_dsp_shunt_feed_sacch(const uint8_t *l2, int len)
     uint8_t *s = g_shunt.sacch_buf;
     memcpy(s, l2, n);
     for (int i = n; i < 23; i++) s[i] = 0x2b;
-    /* [2026-08-09] ON N ECRASE PLUS LES DEUX PREMIERS OCTETS.
-     *
-     * L ANCIEN CODE les forcait a zero, en les croyant systematiquement l en-tete
-     * L1 SACCH (puissance ordonnee / avance de temps). Mais le balayage juste
-     * au-dessus, « for (i = 2; i < 8) » a la recherche de 06 1d / 06 1e, dit le
-     * contraire : la position de l en-tete RR VARIE, donc le bloc rendu par gr-gsm
-     * ne porte pas toujours ses deux octets L1. Quand il ne les porte pas, l2[0] et
-     * l2[1] sont l ADRESSE et le CONTROLE LAPDm -- et on les remplacait par 0x00.
-     *
-     * CONSEQUENCE MESUREE (09/08). Le LAPDm du mobile ne reconnait alors plus
-     * l en-tete, retombe sur le format Bter et rend 21 octets de L3 au lieu de 19.
-     * Or gsm48_rr_rx_acch() discrimine par la seule LONGUEUR :
-     *   l3len == 21 (N201_Bter_SACCH) -> en-tete court, il lit le 1er octet comme
-     *                                    un type de message -> « New SYSTEM
-     *                                    INFORMATION 10 » et « SI10: BA_IND 0 !=
-     *                                    BA_IND 1 of SI5! »
-     *   l3len == 19 (N201_B4)         -> SI5 / SI6, ce qu on veut
-     * Comptage sur un run : 30 SI10 pour 3 SI5 et 1 SI6.
-     *
-     * LA VOIE TCH NE FAISAIT DEJA PAS CETTE ERREUR : feed_tch_sacch laisse les deux
-     * octets intacts et le commentaire y explique pourquoi -- le mobile APPLIQUE
-     * ces valeurs (« DL SACCH indicates ta / tx_power »), et un TA force a 0 sur un
-     * lien qui en demande 4 desaligne l emission montante. La meme raison vaut ici.
-     * On aligne donc les deux voies sur celle qui fonctionne : on ne touche a rien. */
+    s[0] = 0x00;                              /* L1 SACCH header : tx_power -> neutre */
+    s[1] = 0x00;                              /* L1 SACCH header : TA       -> neutre */
     g_shunt.sacch_have = true;
     g_shunt.sacch_real = true;                /* coupe la fabrication SI3->SI6 */
     static unsigned nf = 0;

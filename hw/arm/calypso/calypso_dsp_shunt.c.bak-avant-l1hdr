@@ -1307,49 +1307,6 @@ static void shunt_dcch_sacch_present(uint16_t *d)
     }
     if (!on) return;
 
-    /* [2026-08-09] NE PAS ECRASER LE CANAL PRINCIPAL — correctif du correctif.
-     *
-     * CE QUE LA PREMIERE VERSION FAISAIT DE FAUX. Elle presentait a CHAQUE tick ou
-     * la garde est armee, sans aucune condition de position de trame. Mesure :
-     * ~22000 ecritures dans a_cd contre 62 presentations de l anneau SDCCH -- deux
-     * ordres de grandeur. Or a_cd porte AUSSI le canal principal du SDCCH, donc le
-     * UA que le reseau envoie en reponse au SABM. On l ecrasait avant que le
-     * firmware ait pu le lire.
-     * Symptome exact : le mobile applique bien mon SACCH (« DL SACCH indicates ta 4
-     * / tx_power 7 », « New SYSTEM INFORMATION 5 ») mais ne recoit JAMAIS le UA ; il
-     * retransmet sa SABM sur T200, le BSC -- deja passe en ESTABLISHED -- proteste
-     * « SABM frame with information not allowed in this state » puis libere.
-     * La SACCH marchait parce qu elle gagnait a tous les coups.
-     *
-     * DEUX GARDE-FOUS, dans cet ordre :
-     *   1. NE PAS ECRIRE SUR UN BLOC NON LU. Meme principe que la garde de a_dd_0
-     *      posee ce matin (forcages 13949 -> 0) : si B_BLUD est encore arme, le
-     *      firmware n a pas consomme, on se tait.
-     *   2. NE PAS EMPIETER SUR LA FENETRE DU CANAL PRINCIPAL. Le SDCCH occupe
-     *      fn%51 dans [base, base+3] (base = g_shunt.sdcch_ss, pose par set_dcch).
-     *      La SACCH a ses propres blocs ailleurs ; y presenter le SI5/SI6 ne coute
-     *      rien et laisse le UA passer. */
-    {
-        uint16_t hdr = d[ndb_w(g_ndb.a_cd)];
-        if (hdr & (1u << B_BLUD)) {
-            static unsigned long long non_lu;
-            if (++non_lu % 5000 == 1)
-                SHUNT_LOG("DCCH-SACCH : bloc precedent non lu (#%llu) -- on se tait "
-                          "pour ne pas ecraser le canal principal\n", non_lu);
-            return;
-        }
-        uint32_t s51 = (uint32_t)calypso_trx_get_fn() % 51u;
-        uint32_t base = g_shunt.sdcch_ss;
-        if (s51 >= base && s51 <= base + 3u) {
-            static unsigned long long fenetre;
-            if (++fenetre % 5000 == 1)
-                SHUNT_LOG("DCCH-SACCH : fn%%51=%u dans la fenetre du canal principal "
-                          "[%u-%u] (#%llu) -- on laisse la place au SDCCH\n",
-                          s51, base, base + 3u, fenetre);
-            return;
-        }
-    }
-
     if (!g_shunt.sacch_have) {
         /* Rien de valide a presenter : on ne met PAS de bourrage (le mobile le
          * refuserait), on laisse le camp reprendre la main -- ses 0x07 sont un
@@ -2879,30 +2836,8 @@ static void calypso_dsp_shunt_feed_sacch(const uint8_t *l2, int len)
     uint8_t *s = g_shunt.sacch_buf;
     memcpy(s, l2, n);
     for (int i = n; i < 23; i++) s[i] = 0x2b;
-    /* [2026-08-09] ON N ECRASE PLUS LES DEUX PREMIERS OCTETS.
-     *
-     * L ANCIEN CODE les forcait a zero, en les croyant systematiquement l en-tete
-     * L1 SACCH (puissance ordonnee / avance de temps). Mais le balayage juste
-     * au-dessus, « for (i = 2; i < 8) » a la recherche de 06 1d / 06 1e, dit le
-     * contraire : la position de l en-tete RR VARIE, donc le bloc rendu par gr-gsm
-     * ne porte pas toujours ses deux octets L1. Quand il ne les porte pas, l2[0] et
-     * l2[1] sont l ADRESSE et le CONTROLE LAPDm -- et on les remplacait par 0x00.
-     *
-     * CONSEQUENCE MESUREE (09/08). Le LAPDm du mobile ne reconnait alors plus
-     * l en-tete, retombe sur le format Bter et rend 21 octets de L3 au lieu de 19.
-     * Or gsm48_rr_rx_acch() discrimine par la seule LONGUEUR :
-     *   l3len == 21 (N201_Bter_SACCH) -> en-tete court, il lit le 1er octet comme
-     *                                    un type de message -> « New SYSTEM
-     *                                    INFORMATION 10 » et « SI10: BA_IND 0 !=
-     *                                    BA_IND 1 of SI5! »
-     *   l3len == 19 (N201_B4)         -> SI5 / SI6, ce qu on veut
-     * Comptage sur un run : 30 SI10 pour 3 SI5 et 1 SI6.
-     *
-     * LA VOIE TCH NE FAISAIT DEJA PAS CETTE ERREUR : feed_tch_sacch laisse les deux
-     * octets intacts et le commentaire y explique pourquoi -- le mobile APPLIQUE
-     * ces valeurs (« DL SACCH indicates ta / tx_power »), et un TA force a 0 sur un
-     * lien qui en demande 4 desaligne l emission montante. La meme raison vaut ici.
-     * On aligne donc les deux voies sur celle qui fonctionne : on ne touche a rien. */
+    s[0] = 0x00;                              /* L1 SACCH header : tx_power -> neutre */
+    s[1] = 0x00;                              /* L1 SACCH header : TA       -> neutre */
     g_shunt.sacch_have = true;
     g_shunt.sacch_real = true;                /* coupe la fabrication SI3->SI6 */
     static unsigned nf = 0;

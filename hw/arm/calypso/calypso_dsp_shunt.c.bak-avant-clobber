@@ -1307,49 +1307,6 @@ static void shunt_dcch_sacch_present(uint16_t *d)
     }
     if (!on) return;
 
-    /* [2026-08-09] NE PAS ECRASER LE CANAL PRINCIPAL — correctif du correctif.
-     *
-     * CE QUE LA PREMIERE VERSION FAISAIT DE FAUX. Elle presentait a CHAQUE tick ou
-     * la garde est armee, sans aucune condition de position de trame. Mesure :
-     * ~22000 ecritures dans a_cd contre 62 presentations de l anneau SDCCH -- deux
-     * ordres de grandeur. Or a_cd porte AUSSI le canal principal du SDCCH, donc le
-     * UA que le reseau envoie en reponse au SABM. On l ecrasait avant que le
-     * firmware ait pu le lire.
-     * Symptome exact : le mobile applique bien mon SACCH (« DL SACCH indicates ta 4
-     * / tx_power 7 », « New SYSTEM INFORMATION 5 ») mais ne recoit JAMAIS le UA ; il
-     * retransmet sa SABM sur T200, le BSC -- deja passe en ESTABLISHED -- proteste
-     * « SABM frame with information not allowed in this state » puis libere.
-     * La SACCH marchait parce qu elle gagnait a tous les coups.
-     *
-     * DEUX GARDE-FOUS, dans cet ordre :
-     *   1. NE PAS ECRIRE SUR UN BLOC NON LU. Meme principe que la garde de a_dd_0
-     *      posee ce matin (forcages 13949 -> 0) : si B_BLUD est encore arme, le
-     *      firmware n a pas consomme, on se tait.
-     *   2. NE PAS EMPIETER SUR LA FENETRE DU CANAL PRINCIPAL. Le SDCCH occupe
-     *      fn%51 dans [base, base+3] (base = g_shunt.sdcch_ss, pose par set_dcch).
-     *      La SACCH a ses propres blocs ailleurs ; y presenter le SI5/SI6 ne coute
-     *      rien et laisse le UA passer. */
-    {
-        uint16_t hdr = d[ndb_w(g_ndb.a_cd)];
-        if (hdr & (1u << B_BLUD)) {
-            static unsigned long long non_lu;
-            if (++non_lu % 5000 == 1)
-                SHUNT_LOG("DCCH-SACCH : bloc precedent non lu (#%llu) -- on se tait "
-                          "pour ne pas ecraser le canal principal\n", non_lu);
-            return;
-        }
-        uint32_t s51 = (uint32_t)calypso_trx_get_fn() % 51u;
-        uint32_t base = g_shunt.sdcch_ss;
-        if (s51 >= base && s51 <= base + 3u) {
-            static unsigned long long fenetre;
-            if (++fenetre % 5000 == 1)
-                SHUNT_LOG("DCCH-SACCH : fn%%51=%u dans la fenetre du canal principal "
-                          "[%u-%u] (#%llu) -- on laisse la place au SDCCH\n",
-                          s51, base, base + 3u, fenetre);
-            return;
-        }
-    }
-
     if (!g_shunt.sacch_have) {
         /* Rien de valide a presenter : on ne met PAS de bourrage (le mobile le
          * refuserait), on laisse le camp reprendre la main -- ses 0x07 sont un
