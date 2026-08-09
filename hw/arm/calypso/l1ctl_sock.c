@@ -102,6 +102,65 @@ volatile uint32_t g_last_rach_conf_fn = 0;
 volatile uint32_t g_rach_conf_fn[256] = {0};  /* per-ra FN-FIX : RACH_CONF fn keye par g_last_recorded_ra */
 extern volatile uint8_t g_last_recorded_ra;   /* defini dans calypso_dsp_shunt.c (record_rach) */
 extern void calypso_dsp_shunt_set_dcch(int kind, int ss);  /* fenetre SDCCH du shunt */
+extern int calypso_dsp_shunt_tch_dl_written(const uint8_t *fr33); /* sonde TCH-DL */
+
+/* ---- SONDE CALYPSO_TCH_DL_PROBE : les octets FR qui partent VRAIMENT ---------
+ *
+ * Confronte les 33 octets de voix d'un TRAFFIC_IND a l'anneau des trames que le
+ * shunt a reellement ecrites dans a_dd_0 (cf. le commentaire de la sonde dans
+ * calypso_dsp_shunt.c). Repond a UNE question : le firmware relaie-t-il ce qu'on
+ * lui donne, ou autre chose ?
+ *
+ * Cadrage : TRAFFIC_IND = l1ctl_hdr(4) + l1ctl_info_dl(12) + data(33) = 49, ce
+ * que confirme le `len=49` deja journalise. On ne touche a rien si la taille
+ * n'est pas celle-la — une sonde qui devine son cadrage ne prouve rien.
+ *
+ * Compteurs CUMULATIFS (jamais un taux : cf. les deux chiffres faux annonces le
+ * 09/08 en divisant des `grep -c` sur un journal bufferise). */
+static void l1ctl_tch_dl_probe(const uint8_t *payload, int plen)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("CALYPSO_TCH_DL_PROBE");
+        on = (e && *e == '1') ? 1 : 0;
+        /* Une sonde muette est indecidable : elle s'annonce, dans les deux sens. */
+        L1CTL_LOG("SONDE TCH-DL-PROBE %s (CALYPSO_TCH_DL_PROBE)",
+                  on ? "ACTIVE" : "inactive");
+    }
+    if (!on || payload[0] != 0x1e /* L1CTL_TRAFFIC_IND */)
+        return;
+
+    static unsigned long long n = 0, ok = 0, bad = 0, mauvais_cadrage = 0;
+    n++;
+    if (plen != 49) {
+        mauvais_cadrage++;
+        if (mauvais_cadrage <= 3)
+            L1CTL_LOG("TCH-DL-PROBE : TRAFFIC_IND de %d o, attendu 49 "
+                      "(4 hdr + 12 info_dl + 33 FR) -- cadrage a reverifier "
+                      "avant toute conclusion", plen);
+    } else {
+        const uint8_t *fr = payload + 16;
+        int seq = calypso_dsp_shunt_tch_dl_written(fr);
+        if (seq >= 0) {
+            ok++;
+        } else {
+            bad++;
+            if (bad <= 5) {
+                char h[64];
+                int p = 0;
+                for (int i = 0; i < 12; i++)
+                    p += snprintf(h + p, sizeof(h) - p, "%02x ", fr[i]);
+                L1CTL_LOG("TCH-DL-PROBE ECART #%llu : sortant sig=0x%x [%s...] ne "
+                          "correspond a AUCUNE des 8 dernieres trames ecrites "
+                          "dans a_dd_0", bad, fr[0] >> 4, h);
+            }
+        }
+    }
+    if ((n % 250) == 0)
+        L1CTL_LOG("TCH-DL-PROBE : %llu TRAFFIC_IND -- identiques a a_dd_0 : %llu, "
+                  "differentes : %llu, cadrage inattendu : %llu",
+                  n, ok, bad, mauvais_cadrage);
+}
 
 /* ---- Sercomm helpers ---- */
 
@@ -307,6 +366,7 @@ static void sercomm_frame_complete(L1CTLSock *s)
         }
         L1CTL_LOG("TX→mobile: dlci=%d len=%d type=0x%02x %s", dlci, plen, payload[0],
                   l1ctl_tname(payload[0]));
+        l1ctl_tch_dl_probe(payload, plen);
         l1ctl_send_to_mobile(s, payload, plen);
     }
     /* Ignore other DLCIs (debug console, loader, etc.) */
@@ -402,7 +462,13 @@ static void l1ctl_client_readable(void *opaque)
             uint8_t algo = payload[8];
             uint8_t klen = payload[9];
             if (klen > 16) klen = 16;
-            if (10 + (int)klen <= msglen) {
+            /* [2026-08-08] GARDE SUR algo, parite avec l'ecrivain VIVANT
+             * (osmocon.c:1300). Ce chemin-ci est mort (osmocon detient
+             * /tmp/osmocom_l2 ; « RX<-mobile » = 0 occurrence mesuree), mais il
+             * ecrivait un seq NON NUL meme pour algo=0/klen=0 : un lecteur y
+             * verrait un Kc « present » et chiffrerait avec une cle nulle. Fusil
+             * charge pose sur la table — on met la securite. */
+            if (algo >= 1 && algo <= 3 && 10 + (int)klen <= msglen) {
                 static uint32_t kc_seq = 0;
                 uint8_t kbuf[32];
                 memset(kbuf, 0, sizeof(kbuf));

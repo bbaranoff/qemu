@@ -789,24 +789,117 @@ static void shunt_dispatch_nb(uint8_t page_idx, uint16_t task_d)
  * Producteur = qemu_wrap/gr-gsm (decode 8 bursts -> gsm0503_tch_fr_decode -> 33o FR) ou
  * l'injecteur de test (tone 600). Layout 48o : seq@0(u32 LE) fn@4(u32 LE) fr[33]@8.
  * Consume-once par seq (modele calypso_rach_read). */
+/* Sideband voix DL — ANNEAU de 16 trames (2026-08-08).
+ *
+ * POURQUOI UN ANNEAU. C'etait un SLOT UNIQUE : si_bridge y ecrit a 50 trames/s
+ * (le debit plein d'un TCH/F) et QEMU le relit au rythme de son tick. Toute
+ * irregularite du tick ecrase une trame avant lecture, DEFINITIVEMENT et SANS
+ * TRACE. Mesure du run 21:34 : 659 trames decodees par gr-gsm, 500 presentees
+ * dans a_dd_0, 491 TRAFFIC_IND -> ~25 % perdues dans le passage, soit ~37/s au
+ * lieu de 50/s. C'est exactement ce que l'oreille entend comme un son
+ * intermittent : la chaine est bonne, elle fuit au transfert.
+ *
+ * Layout : entete 8 o [w_seq(u32) | n_slots(u32)] puis 16 x 48 o, slot k =
+ * ((seq-1) % 16). Le producteur ecrit le slot PUIS publie w_seq (ordre
+ * important : un lecteur ne doit jamais voir un seq annonce dont le slot n'est
+ * pas encore ecrit). Compat : si le fichier fait 48 o (ancien format), on
+ * retombe sur le slot unique.
+ *
+ * PERTE COMPTEE, PAS DEDUITE : si le producteur a pris plus de 16 trames
+ * d'avance, on saute et on l'annonce avec un TOTAL CUMULATIF. Une perte
+ * silencieuse redeviendrait indiscernable d'un decodage incomplet en amont. */
+#define TCH_DL_RING_N 16
+#define TCH_DL_SLOT   48
+
 static void calypso_tch_dl_poll(void)
 {
     static int fd = -2;
     if (fd == -2)
-        fd = open("/dev/shm/calypso_tch_dl", O_CREAT | O_RDWR, 0644); /* cree -> open une fois */
+        fd = open("/dev/shm/calypso_tch_dl", O_CREAT | O_RDWR, 0644);
     if (fd < 0)
         return;
-    uint8_t buf[48];
-    if (pread(fd, buf, sizeof(buf), 0) != (ssize_t)sizeof(buf))
+
+    uint8_t hdr[8];
+    if (pread(fd, hdr, sizeof(hdr), 0) != (ssize_t)sizeof(hdr))
         return;
-    uint32_t seq;
-    memcpy(&seq, buf, 4);
-    if (seq == 0 || seq == g_shunt.tch_dl_seq)
-        return;                         /* pas de nouvelle trame */
-    g_shunt.tch_dl_seq = seq;
+    uint32_t w_seq, n_slots;
+    memcpy(&w_seq, hdr, 4);
+    memcpy(&n_slots, hdr + 4, 4);
+
+    if (n_slots == 0 || n_slots > 4096) {       /* ancien format 48 o : slot unique */
+        uint8_t buf[TCH_DL_SLOT];
+        if (pread(fd, buf, sizeof(buf), 0) != (ssize_t)sizeof(buf))
+            return;
+        uint32_t seq; memcpy(&seq, buf, 4);
+        if (seq == 0 || seq == g_shunt.tch_dl_seq)
+            return;
+        g_shunt.tch_dl_seq = seq;
+        memcpy(g_shunt.tch_dl_fr, buf + 8, 33);
+        g_shunt.tch_dl_valid = true;
+        return;
+    }
+
+    if (w_seq == 0 || w_seq == g_shunt.tch_dl_seq)
+        return;                                  /* rien de neuf */
+
+    /* [2026-08-08] LE PRODUCTEUR REPART A 1 A CHAQUE APPEL. si_bridge recree son
+     * tailer par session TCH, avec un `seq` local remis a zero, alors qu'ici
+     * tch_dl_seq garde la valeur de l'appel precedent. Au nouvel appel on avait
+     * donc w_seq(1) < tch_dl_seq(655), et la soustraction NON SIGNEE ci-dessous
+     * debordait : le journal a affiche « 4294966626 trames sautees » (= 2^32-670),
+     * un compteur de perte absurde qui aurait fait chercher une fuite inexistante.
+     * Un recul du seq ne peut signifier qu'une chose : nouveau producteur. */
+    if (w_seq < g_shunt.tch_dl_seq) {
+        SHUNT_LOG("TCH-DL : le producteur a redemarre (w_seq=%u < %u) -> "
+                  "resynchronisation\n", w_seq, g_shunt.tch_dl_seq);
+        g_shunt.tch_dl_seq = 0;
+        g_shunt.tch_dl_valid = false;
+    }
+    if (g_shunt.tch_dl_valid)
+        return;                                  /* la precedente n'est pas encore consommee */
+
+    uint32_t next = g_shunt.tch_dl_seq + 1;
+    if (g_shunt.tch_dl_seq == 0 || (w_seq - next) >= n_slots) {
+        /* Le producteur a debordé l'anneau : on repart sur la plus ancienne
+         * trame encore intacte, et on COMPTE ce qu'on saute. */
+        /* Borne explicite : ce compteur a deja affiche 2^32-670 par debordement.
+         * Un compteur de perte faux est pire que pas de compteur. */
+        uint32_t behind = (w_seq > next) ? (w_seq - next) : 0;
+        uint32_t skipped = (g_shunt.tch_dl_seq == 0 || behind < n_slots)
+                         ? 0 : behind - (n_slots - 1);
+        /* [2026-08-08] ON PREND LA PLUS RECENTE, PAS LA PLUS ANCIENNE.
+         * Prendre w_seq-(N-1) visait a « ne rien perdre », mais c'est le slot que
+         * le producteur va ECRASER EN PREMIER : a 50 trames/s le controle
+         * `sseq != next` echouait presque toujours, on repartait sans avancer, et
+         * comme tch_dl_seq ne bougeait pas on retombait sur le meme slot au tour
+         * suivant. INTERBLOCAGE : mesure du 22:10, le sideband avancait a 50/s
+         * (w_seq 1429->1579) pendant que TRAFFIC_IND restait a 0/s.
+         * La plus recente vient d'etre publiee : elle est stable ~20 ms, et pour
+         * de la voix c'est de toute facon la bonne a garder. */
+        next = w_seq;
+        if (skipped) {
+            static unsigned long long lost_total = 0; static unsigned nlog = 0;
+            lost_total += skipped;
+            if (nlog++ < 20 || (nlog % 50) == 0)
+                SHUNT_LOG("TCH-DL DEBORDEMENT : %u trames sautees (TOTAL CUMULE %llu) "
+                          "-- l'anneau de %u ne suit pas ; c'est un trou AUDIBLE, "
+                          "pas un defaut de decodage\n",
+                          skipped, lost_total, n_slots);
+        }
+    }
+
+    uint8_t buf[TCH_DL_SLOT];
+    off_t off = 8 + (off_t)((next - 1) % n_slots) * TCH_DL_SLOT;
+    if (pread(fd, buf, sizeof(buf), off) != (ssize_t)sizeof(buf))
+        return;
+    uint32_t sseq; memcpy(&sseq, buf, 4);
+    if (sseq != next)
+        return;                                  /* slot pas encore ecrit : on repassera */
+    g_shunt.tch_dl_seq = next;
     memcpy(g_shunt.tch_dl_fr, buf + 8, 33);
     g_shunt.tch_dl_valid = true;
 }
+
 
 /* ---- TCH : primitives d'ecriture NDB (2026-08-08) --------------------------
  *
@@ -898,6 +991,15 @@ static void shunt_tch_serv_demod(uint16_t *d)
  * re-presenter. Meme garde-fou que SHUNT_SB_MAX_AGE : une trame tenue sans borne
  * finit par etre rejouee en silence, et le journal ment (on croit voir un flux,
  * on voit un echo). 0 = pas de peremption. */
+/* Gate A/B commun aux trois flux DL du TCH (voix, FACCH, SACCH) :
+ * CALYPSO_TCH_DL_REPEAT=1 retablit la re-presentation d'avant le 08/08. */
+static bool shunt_tch_dl_repeat(void)
+{
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("CALYPSO_TCH_DL_REPEAT"); v = (e && *e == '1') ? 1 : 0; }
+    return v != 0;
+}
+
 static uint32_t shunt_tch_dl_ttl(void)
 {
     static int v = -1;
@@ -910,6 +1012,45 @@ static bool shunt_tch_fresh(bool valid, uint32_t tick)
     uint32_t ttl = shunt_tch_dl_ttl();
     if (!valid) return false;
     return (ttl == 0) || ((uint32_t)(g_shunt.tick_cnt - tick) <= ttl);
+}
+
+/* ---- SONDE CALYPSO_TCH_DL_PROBE : ce qu'on ECRIT vs ce qui PART ------------
+ *
+ * [2026-08-09] Constat qui l'impose : chaine descendante mesuree saine jusqu'au
+ * sideband (50,0 trames/s, 250/250 distinctes, 0 % de silence), la chaine de
+ * lecture GAPK du mobile s'execute bien ~50 fois/s (prouve : gapk_io_dequeue_ul
+ * n'a qu'UN appelant, juste apres gapk_io_enqueue_dl -> les 48,7 TRAFFIC_REQ/s
+ * mesures ne peuvent venir que d'autant de TRAFFIC_IND enfiles), et pourtant
+ * l'ecouteur du MS est du ZERO NUMERIQUE EXACT (crete 0 sur 48000 echantillons).
+ * Il ne reste qu'une hypothese testable : les octets FR qui arrivent au mobile
+ * ne sont pas ceux qu'on a ecrits dans a_dd_0.
+ *
+ * On memorise donc les N dernieres trames REELLEMENT ecrites, et l1ctl_sock
+ * confronte a cet anneau les 33 octets qui partent vraiment. L'anneau (et non
+ * la seule derniere trame) parce que le firmware relit a_dd_0 avec un retard de
+ * quelques ticks : comparer a la derniere ecrite fabriquerait des ecarts qui
+ * n'existent pas.
+ *
+ * Sonde de comparaison, pas de taux : elle rend des compteurs CUMULATIFS. */
+#define TCH_DL_PROBE_N 8
+static struct { uint8_t fr[33]; uint32_t seq; } g_tch_dl_probe[TCH_DL_PROBE_N];
+static unsigned g_tch_dl_probe_w;
+
+static void shunt_tch_dl_probe_note(const uint8_t *fr, uint32_t seq)
+{
+    unsigned i = g_tch_dl_probe_w++ % TCH_DL_PROBE_N;
+    memcpy(g_tch_dl_probe[i].fr, fr, 33);
+    g_tch_dl_probe[i].seq = seq;
+}
+
+/* Rend le seq de la trame ecrite qui correspond, ou -1. Appele par l1ctl_sock. */
+int calypso_dsp_shunt_tch_dl_written(const uint8_t *fr33);
+int calypso_dsp_shunt_tch_dl_written(const uint8_t *fr33)
+{
+    for (unsigned i = 0; i < TCH_DL_PROBE_N; i++)
+        if (g_tch_dl_probe[i].seq && !memcmp(g_tch_dl_probe[i].fr, fr33, 33))
+            return (int)g_tch_dl_probe[i].seq;
+    return -1;
 }
 
 /* TCHT (13) DL = voix (a_dd_0) + FACCH (a_fd) + mesures. Le firmware relit
@@ -948,6 +1089,7 @@ static void shunt_dispatch_tch_dl(uint8_t page_idx)
                           repeat = (e && *e == '1') ? 1 : 0; }
         shunt_ndb_hdr(d, ndb_w(g_ndb.a_dd_0), true);
         shunt_ndb_put_fr(d, ndb_w(g_ndb.a_dd_0), g_shunt.tch_dl_fr);
+        shunt_tch_dl_probe_note(g_shunt.tch_dl_fr, g_shunt.tch_dl_seq);
         if (!repeat)
             g_shunt.tch_dl_valid = false;      /* consommee */
         static unsigned n = 0, dup = 0;
@@ -960,6 +1102,18 @@ static void shunt_dispatch_tch_dl(uint8_t page_idx)
     if (shunt_tch_fresh(g_shunt.facch_dl_valid, g_shunt.facch_dl_tick)) {
         shunt_ndb_hdr(d, ndb_w(g_ndb.a_fd), true);
         shunt_ndb_put_l2(d, ndb_w(g_ndb.a_fd), g_shunt.facch_dl);
+        /* [2026-08-08] CONSOMMATION UNIQUE, comme la voix.
+         * Ce bloc reecrivait a_fd a CHAQUE dispatch TCHT tant que le TTL tenait
+         * (26 ticks), en rearmant B_BLUD a chaque fois : le firmware remontait
+         * donc la MEME trame LAPDm des dizaines de fois. Mesure du run 21:25 :
+         * 12 « MDL-Error (cause 6) » en UNE seconde, cause 6 =
+         * MDL_CAUSE_UNSOL_SPRV_RESP (lapd_core.h:38) = trame de supervision NON
+         * SOLLICITEE — c'est-a-dire la meme supervision relivree en boucle.
+         * Le firmware efface lui-meme l'en-tete apres lecture (prim_tch.c:293,
+         * a_fd[0] = 1<<B_FIRE1), donc ne plus reecrire ne perd rien : le bloc
+         * reste disponible jusqu'a ce qu'il le consomme. */
+        if (!shunt_tch_dl_repeat())
+            g_shunt.facch_dl_valid = false;
         static unsigned n = 0;
         if (n++ < 40 || (n % 100) == 0)
             SHUNT_LOG("TCH-FACCH-DL #%u a_fd <- %02x %02x %02x %02x (age=%u ticks)\n",
@@ -988,6 +1142,11 @@ static void shunt_dispatch_tch_sacch(uint8_t page_idx)
         return;
     shunt_ndb_hdr(d, ndb_w(g_ndb.a_cd), true);          /* B_BLUD : cf piege ci-dessus */
     shunt_ndb_put_l2(d, ndb_w(g_ndb.a_cd), g_shunt.tsacch_dl);
+    /* Consommation unique, meme raison que la FACCH ci-dessus : l1s_tch_a_resp
+     * efface a_cd[0] apres lecture (prim_tch.c:700), donc re-presenter ne fait
+     * que dupliquer des blocs de signalisation deja livres. */
+    if (!shunt_tch_dl_repeat())
+        g_shunt.tsacch_dl_valid = false;
     static unsigned n = 0;
     if (n++ < 40 || (n % 50) == 0)
         SHUNT_LOG("TCH-SACCH-DL #%u a_cd <- %02x %02x %02x %02x %02x %02x\n",
