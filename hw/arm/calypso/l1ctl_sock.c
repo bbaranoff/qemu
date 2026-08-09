@@ -361,24 +361,23 @@ static void sercomm_frame_complete(L1CTLSock *s)
              * sans arret. La garde clignotait et le camp reprenait la main entre
              * deux blocs. On rafraichit donc sur chaque bloc DEDIE et on laisse
              * la peremption faire la fermeture. */
-            /* [2026-08-09] LE DEDIE NE SE RESUME PAS AU SDCCH -- RACINE DU 0x07.
-             * `kind` ne vaut >= 0 que pour SDCCH/4 et SDCCH/8 : il sert a calculer
-             * la fenetre de presentation a_cd, qui n a de sens que la. S en servir
-             * AUSSI pour rafraichir la garde la laissait morte pendant un appel
-             * voix, ou chan_nr designe un TCH : kind restait -1 en permanence, la
-             * garde perimait au bout de 2 s et le camp reecrivait son SI dans a_cd
-             * -- c est-a-dire dans le SACCH du TCH. Le mobile lisait alors un bloc
-             * de camp la ou il attendait du SACCH dedie, et gsm48_rr.c:6253 le
-             * rejetait en « Short header message type 0x07 unsupported ».
-             * Mesure du 09/08 qui a mis la puce a l oreille : 0 armement journalise
-             * pour 121 peremptions, et les 0x07 en rafale reguliere PENDANT la
-             * communication (8 en 8 s), pas a l etablissement.
-             * La garde doit donc tenir sur TOUT canal dedie. Codage GSM 08.58 du
-             * chan_nr, bits 7..3 :
+            /* [2026-08-09] LE DEDIE NE SE RESUME PAS AU SDCCH.
+             * `kind` ne vaut >= 0 que pour SDCCH/4 et SDCCH/8 : il sert a
+             * calculer la fenetre de presentation a_cd, qui n a de sens que la.
+             * Mais la GARDE, elle, doit tenir sur tout canal dedie -- TCH/F et
+             * TCH/H compris, dont le SACCH passe aussi par a_cd.
+             * Sans ca, pendant un appel voix kind restait -1 en permanence, la
+             * garde n etait jamais rafraichie, elle perimait au bout de 2 s et le
+             * camp reecrivait son SI dans a_cd. Mesure du 09/08 : 0 armement
+             * journalise, 121 peremptions, et 8 « Short header message type 0x07
+             * unsupported » en rafale reguliere PENDANT la communication.
+             * Codage GSM 08.58 du chan_nr (bits 7..3) :
              *   00001TTT TCH/F | 0001xTTT TCH/H | 001..... SDCCH/4 | 01...... SDCCH/8 */
-            if (((chan_nr & 0xF8) == 0x08) || ((chan_nr & 0xF0) == 0x10) ||
-                ((chan_nr & 0xE0) == 0x20) || ((chan_nr & 0xC0) == 0x40))
-                calypso_dsp_shunt_set_dcch_active(1);   /* rafraichit, ne ferme jamais */
+            bool dedie = ((chan_nr & 0xF8) == 0x08)      /* TCH/F   */
+                      || ((chan_nr & 0xF0) == 0x10)      /* TCH/H   */
+                      || ((chan_nr & 0xE0) == 0x20)      /* SDCCH/4 */
+                      || ((chan_nr & 0xC0) == 0x40);     /* SDCCH/8 */
+            if (dedie) calypso_dsp_shunt_set_dcch_active(1);   /* rafraichit */
             if (kind >= 0 && chan_nr != last_chan_nr) {
                 static uint32_t dcch_seq;
                 last_chan_nr = chan_nr;

@@ -161,6 +161,9 @@ static uint8_t  g_rach_l1s_valid[256];
  * Appele depuis l1ctl_sock quand le FIRMWARE annonce son propre chan_nr
  * (DATA_CONF / DATA_IND). kind : 0 = SDCCH/4 combine, 1 = SDCCH/8.
  * Base DL fn%51 : /4 -> {22,26,32,36}[ss] ; /8 -> ss*4. */
+/* Declaration anticipee : set_dcch (plus bas) appelle set_dcch_active, defini
+ * seulement vers la ligne 833. Idiome du fichier, il n y a pas d en-tete. */
+void calypso_dsp_shunt_set_dcch_active(int on);
 void calypso_dsp_shunt_set_dcch(int kind, int ss);   /* -Werror=missing-prototypes */
 void calypso_dsp_shunt_set_dcch(int kind, int ss)
 {
@@ -174,7 +177,11 @@ void calypso_dsp_shunt_set_dcch(int kind, int ss)
      * Cet appel signale une OUVERTURE de canal, pas un changement de sous-voie —
      * la garde doit donc suivre l appel, pas la comparaison. */
     g_shunt.dcch_guard_tick  = g_shunt.tick_cnt;
-    g_shunt.dcch_guard_armed = true;
+    /* [2026-08-09] On passe par set_dcch_active au lieu de poser le drapeau a
+     * la main : cet armement-ci etait MUET, d ou un compte de 0 armements pour
+     * 121 peremptions -- un silence indecidable. Une seule porte, qui journalise
+     * la transition. */
+    calypso_dsp_shunt_set_dcch_active(1);
     if (g_shunt.sdcch_ss_set && g_shunt.sdcch_ss == base
         && g_shunt.sdcch_ch8 == (kind != 0))
         return;                                  /* sous-voie inchangee */
@@ -826,7 +833,7 @@ static void shunt_dispatch_nb(uint8_t page_idx, uint16_t task_d)
  * seulement au demarrage : il clobbe dans TOUS les trous entre deux presentations
  * SDCCH, parce que sdcch_valid retombe entre les blocs. Il faut donc tenir la
  * garde du debut a la fin du canal, pas la temporiser. */
-void calypso_dsp_shunt_set_dcch_active(int on);
+/* prototype : voir la declaration anticipee en tete de fichier */
 void calypso_dsp_shunt_set_dcch_active(int on)
 {
     if (on) {
