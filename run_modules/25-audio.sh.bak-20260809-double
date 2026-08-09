@@ -46,15 +46,6 @@ MOD_ENABLED_IF[audio]='[ "${AUDIO:-1}" = 1 ]'
 : "${AUDIO_LIB:=$EGPRS_DIR/lib/audio.sh}"
 : "${AUDIO_SINK:=gsm_audio}"
 : "${AUDIO_TMUX_SESSION:=gapk}"
-# [2026-08-09] GAPK_AUTO : le pont « RTP reseau -> gsm_audio » est DESACTIVE par
-# defaut. Il fait un SECOND chemin vers l'ecouteur du MS, en parallele du vrai :
-#   vrai    : air -> grgsm -> sideband -> QEMU -> firmware -> mobile -> gsm_out
-#   doublon : MGW -> RTP -> gapk-start.sh auto -> gsm_out
-# Les deux portent le meme audio, decale du temps de traversee de la chaine GSM :
-# on entend tout EN DOUBLE. Le pont garde un usage legitime pour du monitoring
-# reseau ou de l'enregistrement, d'ou la vanne plutot que la suppression.
-#   GAPK_AUTO=1 le remet.
-: "${GAPK_AUTO:=0}"
 
 _audio_sink_present() {
     pactl list short sinks 2>/dev/null | grep -q "$AUDIO_SINK"
@@ -100,12 +91,7 @@ mod_audio_start() {
     . "$AUDIO_LIB" || { cd "$retour"; mod_fail "bibliothèque illisible : $AUDIO_LIB"; return $MOD_RC_FAIL; }
 
     mod_say "sink visé : $AUDIO_SINK · session tmux : $AUDIO_TMUX_SESSION"
-    if [ "${GAPK_AUTO:-0}" = 1 ]; then
-        ensure_gapk || rc=$?     # ensure_gapk appelle lui-même ensure_pulse
-    else
-        mod_say "pont gapk auto DESACTIVE (GAPK_AUTO=0) : il doublait l'audio de l'ecouteur"
-        ensure_pulse || rc=$?    # le serveur audio reste indispensable
-    fi
+    ensure_gapk || rc=$?     # ensure_gapk appelle lui-même ensure_pulse
     cd "$retour"
     [ "$rc" -eq 0 ] || { mod_fail "ensure_gapk a rendu $rc"; return $MOD_RC_FAIL; }
     mod_ok
@@ -126,13 +112,11 @@ mod_audio_wait() {
     # Le SUPERVISEUR gapk, pas le transcodeur : `gapk-start.sh auto` ne lance
     # osmo-gapk qu'à l'établissement d'un appel. Exiger le binaire hors appel
     # était un faux négatif permanent — le pont était en place et déclaré mort.
-    if [ "${GAPK_AUTO:-0}" = 1 ]; then
-        wait_until "${MOD_TIMEOUT[audio]}" "superviseur gapk" _audio_gapk_vivant || {
-            mod_hint "regardez $LOG_DIR/gapk-auto.log : le superviseur s'est arrêté aussitôt lancé"
-            mod_fail "le superviseur gapk ne tourne pas"
-            return $MOD_RC_FAIL
-        }
-    fi
+    wait_until "${MOD_TIMEOUT[audio]}" "superviseur gapk" _audio_gapk_vivant || {
+        mod_hint "regardez $LOG_DIR/gapk-auto.log : le superviseur s'est arrêté aussitôt lancé"
+        mod_fail "le superviseur gapk ne tourne pas"
+        return $MOD_RC_FAIL
+    }
     mod_ok
 }
 

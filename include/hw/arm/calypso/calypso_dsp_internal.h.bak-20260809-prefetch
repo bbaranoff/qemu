@@ -213,14 +213,6 @@ struct dsp_shunt_state {
      * via calypso_dsp_shunt_set_dcch). Sert UNIQUEMENT a couper l ecriture du
      * bloc SI du camp dans a_cd pendant la fenetre ou le mobile est deja en
      * dedie mais ou gr-gsm n a pas encore decode la 1re SACCH. */
-    /* [2026-08-09] FILE DE PREFETCH DE LA VOIX DL. Le passage poll->dispatch se
-     * faisait par UN SEUL emplacement (tch_dl_fr + tch_dl_valid) entre deux
-     * boucles de cadences differentes : tout tick de dispatch tombant sur un
-     * slot vide perdait 20 ms de voix. Mesure : 50,0 trames/s au sideband contre
-     * 46 a 48,6 TRAFFIC_IND/s livres. */
-    uint8_t    tch_dl_q[8][33];
-    uint32_t   tch_dl_q_seq[8];
-    unsigned   tch_dl_q_head, tch_dl_q_tail;
     uint32_t   dcch_guard_tick;
     bool       dcch_guard_armed;
     bool       sdcch_ch8;            /* true = derniere assignation = SDCCH/8 (sinon /4) */

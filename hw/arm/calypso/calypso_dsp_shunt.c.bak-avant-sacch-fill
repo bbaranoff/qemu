@@ -877,13 +877,14 @@ static bool shunt_dcch_si_guard(void)
      *
      * On ne supprime donc que si un SACCH dedie alimente REELLEMENT a_cd. Sinon
      * on laisse passer le camp, on ravale les 0x07, et le canal vit. */
-    /* [2026-08-09] LE REMPLACANT EXISTE MAINTENANT — cf. shunt_dcch_sacch_fill().
-     * La revision precedente renoncait a supprimer quand aucun SACCH dedie
-     * n alimentait a_cd (mesure : elle renoncait 3 fois sur 4, faute de source
-     * SDCCH). On ne renonce plus : le site d appel ecrit une trame de bourrage
-     * LAPDm valide a la place. La garde redevient donc stricte sur tout canal
-     * dedie -- c est le sens de l original, sans la famine. */
-    return true;
+    if (!shunt_tch_fresh(g_shunt.tsacch_dl_valid, g_shunt.tsacch_dl_tick)) {
+        static unsigned long long sans_relais;
+        if (++sans_relais % 5000 == 1)
+            SHUNT_LOG("DCCH-GARDE : inactive #%llu -- aucun SACCH dedie ne "
+                      "remplacerait le camp, on laisse passer (0x07 possibles)\n",
+                      sans_relais);
+        return false;
+    }
     if ((uint32_t)(g_shunt.tick_cnt - g_shunt.dcch_guard_tick) > (uint32_t)ttl) {
         g_shunt.dcch_guard_armed = false;      /* plus de bloc dedie depuis ttl : canal fini */
         SHUNT_LOG("DCCH-GARDE : levee (peremption) -- SI du camp retabli\n");
@@ -1205,68 +1206,6 @@ int calypso_dsp_shunt_tch_dl_written(const uint8_t *fr33)
 /* TCHT (13) DL = voix (a_dd_0) + FACCH (a_fd) + mesures. Le firmware relit
  * a_dd_0 en fin de bloc (fn%13%4==3) ssi B_BLUD, et a_fd au meme instant.
  * On presente les deux : la FACCH porte le CONNECT/ALERTING, la voix le son. */
-/* PRESENTATION DU SI6 SUR LA SACCH DU CANAL DEDIE — le site qui manquait.
- *
- * LE TROU. sacch_buf contient un SI6 valide au format B4 : soit le SI5/SI6 REEL
- * decode par gr-gsm (calypso_dsp_shunt_feed_sacch, l.2672), soit, tant qu aucun
- * reel n est arrive, un SI6 derive du SI3 (l.3826) avec l identite de cellule et
- * le LAI VERITABLES de la cellule. sacch_have marque sa disponibilite. Un
- * commentaire annonce meme « presente fn%51 {42-45} »... mais AUCUN code ne le
- * presentait. Le tampon etait rempli et jamais lu.
- *
- * CONSEQUENCE MESUREE. Sur SDCCH -- donc pendant TOUT l etablissement d appel --
- * a_cd n avait que deux ecrivains : le SI du camp (contenu FAUX sur un canal
- * dedie, rejete en « Short header message type 0x07 ») et TCH-SACCH-DL, qui ne
- * tire que sur TCH. Le mobile n avait donc jamais de SACCH valide pendant qu il
- * devait monter son LAPDm : cote a_fu on observait RR, puis REJ, puis DISC, et
- * cote BSC « Timeout (rll_ready=no) » -- 41 echecs d assignation en une journee.
- *
- * POURQUOI CE N EST PAS UNE BEQUILLE. On ne fabrique aucune information : le SI6
- * porte l identite de cellule et le LAI lus dans le SI3 de cette meme cellule,
- * et il cede la place au SI5/SI6 reel des que gr-gsm en decode un (sacch_real).
- * C est la presentation qui manquait, pas la donnee.
- *
- * NOTE SUR UNE FAUSSE PISTE. Une premiere version presentait ici une trame de
- * bourrage LAPDm vide (L=0, remplissage 0x2B), en croyant reproduire ce qu emet
- * une BTS sans rien a dire. Le mobile l a REFUSEE : gsm48_rr.c:6259 traite toute
- * trame B4 de longueur N201_B4 comme un SYSTEM INFORMATION et commute sur le
- * premier octet L3 -- il lisait donc le bourrage, d ou « ACCH message type 0x2b
- * unknown » puis « MDL-Error (cause 11) ». Sur SACCH dediee, osmocom-bb n accepte
- * QUE SI5 / SI5bis / SI5ter / SI6. Il n existe pas de SACCH vide.
- *
- * CALYPSO_DCCH_SACCH_FILL=0 desactive cette presentation (retour a l etat
- * anterieur : SI du camp et 0x07). */
-static void shunt_dcch_sacch_present(uint16_t *d)
-{
-    static int on = -1;
-    if (on < 0) {
-        const char *e = getenv("CALYPSO_DCCH_SACCH_FILL");
-        on = (e && *e == '0') ? 0 : 1;
-        SHUNT_LOG("DCCH-SACCH : presentation du SI6 sur canal dedie %s\n",
-                  on ? "ACTIVE" : "desactivee");
-    }
-    if (!on) return;
-
-    if (!g_shunt.sacch_have) {
-        /* Rien de valide a presenter : on ne met PAS de bourrage (le mobile le
-         * refuserait), on laisse le camp reprendre la main -- ses 0x07 sont un
-         * NOTICE, alors qu une trame invalide leve une MDL-Error. */
-        static unsigned long long muet;
-        if (++muet % 5000 == 1)
-            SHUNT_LOG("DCCH-SACCH : aucun SI6 disponible (#%llu) -- le camp reprend\n", muet);
-        return;
-    }
-
-    shunt_ndb_hdr(d, ndb_w(g_ndb.a_cd), true);
-    shunt_ndb_put_l2(d, ndb_w(g_ndb.a_cd), g_shunt.sacch_buf);
-
-    static unsigned long long n;
-    if (++n <= 3 || (n % 2000) == 0)
-        SHUNT_LOG("DCCH-SACCH #%llu : SI6 presente dans a_cd (mt=0x%02x, %s)\n",
-                  n, g_shunt.sacch_buf[6],
-                  g_shunt.sacch_real ? "REEL gr-gsm" : "derive du SI3");
-}
-
 static void shunt_dispatch_tch_dl(uint8_t page_idx)
 {
     (void)page_idx;                     /* a_dd_0/a_fd non pages (T_NDB partage) */
@@ -2155,15 +2094,6 @@ void calypso_dsp_shunt_on_frame_tick(void)
                 if (_acd++ < 5000)
                     SHUNT_LOG("CAMP: a_cd<-SI type_slot=%d have[0-5]=%d%d%d%d%d%d tick=%u",
                               g_shunt.si_rr, g_shunt.si_set_have[0],g_shunt.si_set_have[1],g_shunt.si_set_have[2],g_shunt.si_set_have[3],g_shunt.si_set_have[4],g_shunt.si_set_have[5], g_shunt.tick_cnt);
-            } else if (shunt_dcch_si_guard()
-                       && !shunt_tch_fresh(g_shunt.tsacch_dl_valid, g_shunt.tsacch_dl_tick)
-                       && !g_shunt.tch_cfg_valid
-                       && g_shunt.c54x && g_shunt.c54x->data) {
-                /* Canal dedie, garde armee, et AUCUNE source de SACCH descendante :
-                 * c est le cas du SDCCH pendant tout l etablissement d appel. On ne
-                 * laisse ni le SI du camp (0x07) ni le vide (famine) -- on presente
-                 * une trame de bourrage LAPDm valide. Cf. shunt_dcch_sacch_fill(). */
-                shunt_dcch_sacch_present(g_shunt.c54x->data);
             }
             static unsigned _lg = 0;
             if (_lg++ < 12)
