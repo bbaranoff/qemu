@@ -680,12 +680,9 @@ static void shunt_latch_task(uint16_t new_d_dsp_page)
           {
               static int once = -1, ttl = 60;
               if (once < 0) {
-                  /* [2026-08-10] DEFAUT ON — valide. Empeche la republication de
-                   * la meme SABM a chaque trame, qui faisait protester le BSC
-                   * (« SABM frame with information not allowed in this state »)
-                   * sur un lien deja etabli. =0 pour republier comme avant. */
+                  /* [2026-08-10] DEFAUT OFF POUR LE BISSECT (etait ON). */
                   const char *e = getenv("CALYPSO_SDCCH_UL_ONCE");
-                  once = (e && *e == '0') ? 0 : 1;
+                  once = (e && *e == '1') ? 1 : 0;
                   const char *t = getenv("CALYPSO_SDCCH_UL_TTL");
                   if (t && *t) ttl = atoi(t);
                   SHUNT_LOG("SDCCH-UL consommation unique : %s (fenetre %d ticks)\n",
@@ -1308,13 +1305,8 @@ static void shunt_dcch_sacch_present(uint16_t *d)
          * « Short header 0x07 » et fait decoder un jeu complet de SI5, mais un
          * binaire le contenant a casse le LOCATION UPDATING ACCEPT. On l eteint
          * par defaut le temps d isoler le coupable. =1 pour l allumer. */
-        /* [2026-08-10] DEFAUT ON — valide. Presente le SI5/SI6 reel sur la SACCH
-         * du canal dedie, UNIQUEMENT dans la fenetre GSM 05.02 du sous-canal.
-         * Supprime les « Short header 0x07 » sans casser le LOCATION UPDATING
-         * ACCEPT, ce que la version « partout sauf le canal principal » faisait.
-         * =0 pour revenir au SI du camp. */
         const char *e = getenv("CALYPSO_DCCH_SACCH_FILL");
-        on = (e && *e == '0') ? 0 : 1;
+        on = (e && *e == '1') ? 1 : 0;
         SHUNT_LOG("DCCH-SACCH : presentation du SI6 sur canal dedie %s\n",
                   on ? "ACTIVE" : "desactivee");
     }
