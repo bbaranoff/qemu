@@ -1330,25 +1330,10 @@ static void shunt_dcch_sacch_present(uint16_t *d)
      *      [base, base+3] ; la SACCH a ses propres blocs ailleurs.
      * Mesure apres correctif : 5001 ecritures evitees, et les ERROR INDICATION
      * cessent. */
-    /* [2026-08-10] FENETRE SACCH POSITIVE — corrige la version precedente.
-     *
-     * CE QUI ETAIT FAUX. La condition disait « presenter partout SAUF dans la
-     * fenetre du canal principal [base, base+3] ». Or a_cd n est pas libre le reste
-     * du temps : sur un SDCCH/4 la SACCH a ses PROPRES blocs, et le firmware lit
-     * a_cd a des instants differents selon qu il attend du canal principal ou de la
-     * SACCH. En ecrivant a tout autre moment, on lui livrait du SI5 quand il
-     * attendait autre chose. Mesure du 10/08 : CALYPSO_DCCH_SACCH_FILL=1 cassait le
-     * LOCATION UPDATING ACCEPT, meme avec la garde anti-ecrasement active.
-     *
-     * LA BONNE CONDITION (GSM 05.02, SDCCH/4 + SACCH sur TS0 combine, cycle 102) :
-     *   SS0 -> fn%102 42..45     SS1 -> 46..49
-     *   SS2 -> fn%102 93..96     SS3 -> 97..100
-     * On ne presente QUE la. Le canal principal garde ses blocs, et le UA passe.
-     *
-     * Par-dessus, on conserve la garde anti-ecrasement : meme dans la bonne
-     * fenetre, on n ecrit pas sur un bloc que le firmware n a pas encore lu.
-     * CALYPSO_DCCH_SACCH_GUARD=0 retire cette garde seule. */
     {
+        /* [2026-08-10] Vanne distincte, pour separer ce garde-fou de la
+         * presentation elle-meme pendant le bissect. CALYPSO_DCCH_SACCH_GUARD=0
+         * presente sans proteger le canal principal. */
         static int garde = -1;
         if (garde < 0) {
             const char *g = getenv("CALYPSO_DCCH_SACCH_GUARD");
@@ -1356,32 +1341,28 @@ static void shunt_dcch_sacch_present(uint16_t *d)
             SHUNT_LOG("DCCH-SACCH : garde du canal principal %s\n",
                       garde ? "ACTIVE" : "desactivee");
         }
-        static const uint8_t sacch_base[4] = { 42, 46, 93, 97 };
-        unsigned ss_idx;
-        switch (g_shunt.sdcch_ss) {          /* base fn%51 -> index de sous-canal */
-        case 26: ss_idx = 1; break;
-        case 32: ss_idx = 2; break;
-        case 36: ss_idx = 3; break;
-        default: ss_idx = 0; break;          /* 22 = SS0 */
-        }
-        uint32_t f102 = (uint32_t)calypso_trx_get_fn() % 102u;
-        uint32_t b    = sacch_base[ss_idx];
-        if (f102 < b || f102 > b + 3u) {
-            static unsigned long long hors;
-            if (++hors % 20000 == 1)
-                SHUNT_LOG("DCCH-SACCH : fn%%102=%u hors fenetre SACCH [%u-%u] du SS%u "
-                          "(#%llu) -- on ne presente pas\n",
-                          f102, b, b + 3u, ss_idx, hors);
+        uint16_t hdr = garde ? d[ndb_w(g_ndb.a_cd)] : 0;
+        if (hdr & (1u << B_BLUD)) {
+            static unsigned long long non_lu;
+            if (++non_lu % 5000 == 1)
+                SHUNT_LOG("DCCH-SACCH : bloc precedent non lu (#%llu) -- on se tait "
+                          "pour ne pas ecraser le canal principal\n", non_lu);
             return;
         }
-        if (garde && (d[ndb_w(g_ndb.a_cd)] & (1u << B_BLUD))) {
-            static unsigned long long non_lu;
-            if (++non_lu % 500 == 1)
-                SHUNT_LOG("DCCH-SACCH : bloc non lu (#%llu) -- on se tait\n", non_lu);
+        if (!garde) goto sacch_pas_de_garde;
+        uint32_t s51 = (uint32_t)calypso_trx_get_fn() % 51u;
+        uint32_t base = g_shunt.sdcch_ss;
+        if (s51 >= base && s51 <= base + 3u) {
+            static unsigned long long fenetre;
+            if (++fenetre % 5000 == 1)
+                SHUNT_LOG("DCCH-SACCH : fn%%51=%u dans la fenetre du canal principal "
+                          "[%u-%u] (#%llu) -- on laisse la place au SDCCH\n",
+                          s51, base, base + 3u, fenetre);
             return;
         }
     }
 
+sacch_pas_de_garde:
     if (!g_shunt.sacch_have) {
         /* Rien de valide a presenter : on ne met PAS de bourrage (le mobile le
          * refuserait), on laisse le camp reprendre la main -- ses 0x07 sont un
