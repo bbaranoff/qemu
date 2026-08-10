@@ -912,6 +912,30 @@ void calypso_dsp_shunt_set_dcch_active(int on)
     }
 }
 
+/* [2026-08-10] LA PRESENTATION a_cd N'A DE SENS QUE SUR SDCCH.
+ * set_dcch() n'est appelee que pour SDCCH/4 et SDCCH/8 (kind >= 0) : sur un TCH
+ * elle ne l'est PAS, et g_shunt.sdcch_ss gardait donc la fenetre du SDCCH
+ * precedent. Comme la GARDE, elle, est bien rafraichie sur tout canal dedie
+ * (TCH compris, c'est ce qui avait tue le 0x07 en signalisation), la
+ * presentation continuait de tirer pendant tout l'appel voix sur une fenetre
+ * fn%51 qui ne veut rien dire dans une multitrame de 26 -> le firmware relisait
+ * du SI5/SI6 pose hors phase dans a_cd et rendait « Short header message type
+ * 0x07 unsupported » EN RAFALE PENDANT LA COMMUNICATION (mesure du 10/08 :
+ * 5 occurrences entre 09:12:05 et 09:12:29, sur un run ou le LU passait).
+ * On coupe donc la presentation sur TCH : le SACCH de l'appel arrive par le
+ * decodeur TCH (si_bridge, is_sacch = fn%26), pas par cette fenetre-ci. */
+void calypso_dsp_shunt_set_dcch_tch(int on);   /* -Werror=missing-prototypes */
+void calypso_dsp_shunt_set_dcch_tch(int on)
+{
+    bool v = (on != 0);
+    if (g_shunt.dcch_is_tch == v) {
+        return;                                 /* transition seule : pas de bruit */
+    }
+    g_shunt.dcch_is_tch = v;
+    SHUNT_LOG("DCCH-TYPE : dedie = %s -- presentation SACCH a_cd %s\n",
+              v ? "TCH" : "SDCCH", v ? "SUSPENDUE" : "retablie");
+}
+
 /* Declaration anticipee : la garde interroge la fraicheur du SACCH dedie,
  * defini plus bas. Idiome du fichier, il n y a pas d en-tete. */
 static bool shunt_tch_fresh(bool valid, uint32_t tick);
@@ -1319,6 +1343,9 @@ static void shunt_dcch_sacch_present(uint16_t *d)
                   on ? "ACTIVE" : "desactivee");
     }
     if (!on) return;
+    /* [2026-08-10] cf. calypso_dsp_shunt_set_dcch_tch : sur TCH la fenetre
+     * fn%51 heritee du SDCCH est hors phase -> 0x07 en rafale. */
+    if (g_shunt.dcch_is_tch) return;
 
     /* [2026-08-09] NE PAS ECRASER LE CANAL PRINCIPAL.
      * La premiere version presentait a CHAQUE tick ou la garde est armee, sans

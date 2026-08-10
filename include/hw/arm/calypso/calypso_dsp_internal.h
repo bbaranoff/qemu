@@ -224,6 +224,7 @@ struct dsp_shunt_state {
     uint32_t   dcch_guard_tick;
     bool       dcch_guard_armed;
     bool       sdcch_ch8;            /* true = derniere assignation = SDCCH/8 (sinon /4) */
+    bool       dcch_is_tch;         /* true = le dedie courant est un TCH (pas de fenetre a_cd) */
     /* PM REEL (no-hardcode) : magnitude moyenne du dernier burst DL (feed_iq).
      * Remplace le canned 0x7000 / le 0=-110 : le firmware en derive le vrai rxlev. */
     uint16_t   last_pm;
