@@ -1007,16 +1007,62 @@ static int calypso_ul_sb_read(const char *path, int *fdp, uint8_t *l2, uint32_t 
 }
 
 /* Voix montante : 64 o, seq@0 l1s_fn@4 fn@8 fr[33]@16. */
+/* [2026-08-12] Lecteur d'ANNEAU. Le producteur (calypso_dsp_shunt.c,
+ * tch_ul_publish_speech) ecrivait dans un SLOT UNIQUE : toute trame non lue
+ * avant la suivante etait perdue sans trace, et ce lecteur-ci relisait
+ * indefiniment « la derniere » — d'ou la latence montante, variable et
+ * croissante avec la derive des deux horloges.
+ *
+ * On consomme desormais EN ORDRE (seq+1), ce qui est le point : de la voix
+ * rejouee dans le desordre ou avec des trous n'est pas de la voix. Si on a pris
+ * trop de retard (plus d'un tour d'anneau), on SAUTE a la plus ancienne trame
+ * encore valide plutot que de servir du perime : un trou est audible une fois,
+ * du retard cumule l'est en permanence.
+ *
+ * Compat : un fichier de 64 o = ancien format slot unique (producteur pas encore
+ * recompile) -> on le lit comme avant. Sans ca, un binaire neuf face a un vieux
+ * shunt rendrait un montant MUET, ce qui est le pire des diagnostics.
+ *
+ * ⚠️ On relit l'entete a chaque appel (pread, pas de cache) : le producteur peut
+ * recreer le fichier entre deux appels. Cf. la regle du projet — lire /dev/shm
+ * avec un lecteur bufferise fige la valeur, `pread` est obligatoire. */
 static int calypso_tch_speech_ul_read(uint8_t *fr, uint32_t *seq_out)
 {
     static int fd = -1;
+    static uint32_t last_seq = 0;
     if (fd < 0) fd = open("/dev/shm/calypso_tch_ul", O_RDONLY);
     if (fd < 0) return 0;
+
+    uint32_t hdr[2];
+    if (pread(fd, hdr, sizeof(hdr), 0) != (ssize_t)sizeof(hdr)) return 0;
+    uint32_t w_seq = hdr[0], n_slots = hdr[1];
+
+    /* Ancien format : 64 o pile, pas d'entete -> hdr[0] est le seq. */
+    struct stat st;
+    if (fstat(fd, &st) == 0 && st.st_size == 64) {
+        uint8_t buf[64];
+        if (pread(fd, buf, sizeof(buf), 0) != (ssize_t)sizeof(buf)) return 0;
+        uint32_t seq; memcpy(&seq, buf, 4);
+        if (seq == 0) return 0;
+        if (seq_out) *seq_out = seq;
+        if (fr)      memcpy(fr, buf + 16, 33);
+        return 1;
+    }
+    if (w_seq == 0 || n_slots == 0 || n_slots > 1024) return 0;
+
+    uint32_t target = last_seq + 1;
+    if (last_seq == 0 || (w_seq >= n_slots && target < w_seq - n_slots + 1))
+        target = (w_seq >= n_slots) ? (w_seq - n_slots + 1) : 1;  /* trop tard : on saute */
+    if (target > w_seq) return 0;                                  /* rien de neuf */
+
     uint8_t buf[64];
-    if (pread(fd, buf, sizeof(buf), 0) != (ssize_t)sizeof(buf)) return 0;
-    uint32_t seq; memcpy(&seq, buf, 4);
-    if (seq == 0) return 0;
-    if (seq_out) *seq_out = seq;
+    off_t off = 8 + (off_t)((target - 1) % n_slots) * 64;
+    if (pread(fd, buf, sizeof(buf), off) != (ssize_t)sizeof(buf)) return 0;
+    uint32_t slot_seq; memcpy(&slot_seq, buf, 4);
+    if (slot_seq != target) return 0;   /* slot en cours d'ecriture : on repassera */
+
+    last_seq = target;
+    if (seq_out) *seq_out = target;
     if (fr)      memcpy(fr, buf + 16, 33);
     return 1;
 }
