@@ -2147,7 +2147,33 @@ int32_t uhdwrap_read(void *dev, uint32_t num_chans)
                  * tombe hors fenêtre. CALYPSO_UL_SDCCH_SMP_OFS=N (échantillons, sweepable,
                  * peut être négatif) décale le burst normal pour caler le TSC. */
                 static int sd_smp = -999999;
-                if (sd_smp == -999999) { const char *e = getenv("CALYPSO_UL_SDCCH_SMP_OFS"); sd_smp = e ? atoi(e) : 0; }
+                if (sd_smp == -999999) {
+                    const char *e = getenv("CALYPSO_UL_SDCCH_SMP_OFS");
+                    sd_smp = e ? atoi(e) : 0;
+                    /* [2026-08-12] ANNONCE. Regle du projet : une sonde qui ne
+                     * s'annonce pas rend son silence indecidable. Ici c'etait
+                     * pire qu'une sonde — c'est la GEOMETRIE du burst montant,
+                     * donc la boucle TA de la BTS, et rien nulle part ne disait
+                     * quelle valeur avait ete recue.
+                     *
+                     * CE QUE CA TRANCHE, et que rien d'autre ne tranchait :
+                     * mesure du 12/08, un calypso-ipc-device vivant avait ZERO
+                     * variable CALYPSO_* dans son environ quand QEMU en avait
+                     * 183 (lance sous un autre serveur tmux, environnement
+                     * fossilise). Une gate posee dans un fichier .env et une
+                     * gate jamais recue par le binaire donnaient exactement le
+                     * meme journal. On imprime donc la valeur EFFECTIVE et si
+                     * elle vient de l'environnement ou du defaut compile.
+                     *
+                     * Volontairement au premier burst SDCCH et pas au demarrage
+                     * du process : c'est ici que la valeur est lue, et une
+                     * annonce placee ailleurs pourrait mentir si ce chemin
+                     * n'etait jamais atteint. Une seule fois (static). */
+                    LOGP(DDEV, LOGL_NOTICE,
+                         "SDCCH-UL TOA : CALYPSO_UL_SDCCH_SMP_OFS=%d echantillons (%s)\n",
+                         sd_smp, e ? "recu de l'environnement"
+                                   : "ABSENT de l'environnement -> defaut compile 0");
+                }
                 /* Offset dans LE chunk courant : dc_local, deja ramene dans la
                  * demi-trame par la phase. Sans config dedie lue, dc_local vaut
                  * 1875 = l'ancien ul_slotoff, donc comportement inchange. */
