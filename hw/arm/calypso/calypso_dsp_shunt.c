@@ -971,7 +971,34 @@ static bool shunt_dcch_si_guard(void)
      * SDCCH). On ne renonce plus : le site d appel ecrit une trame de bourrage
      * LAPDm valide a la place. La garde redevient donc stricte sur tout canal
      * dedie -- c est le sens de l original, sans la famine. */
-    return true;
+    /* [2026-08-12] LE FILET DE SECURITE ETAIT DU CODE MORT — RETABLI.
+     *
+     * Il y avait ici un `return true;` SEC, place AVANT le test de peremption
+     * ci-dessous : tout le bloc etait donc inatteignable. La garde ne pouvait
+     * plus se lever que par DM_REL_REQ. Or DM_REL_REQ n arrive PAS quand
+     * l etablissement echoue avant le mode dedie (RR passe de
+     * « connection pending » a « release pending » sans jamais etre etabli) :
+     * la garde restait armee POUR TOUJOURS et le SI du camp ne revenait
+     * jamais dans a_cd. C est exactement le defaut que le commentaire de la
+     * garde disait vouloir eviter (« si le DM_REL_REQ est manque, la garde se
+     * leve seule plutot que d affamer le camp en SI pour toujours — le defaut
+     * no-cell-info a deja ete paye une fois »).
+     *
+     * MESURE QUI L ETABLIT (run 10:06:33 -> 10:10:16, profil shunt_legit) :
+     *   - qemu.log : « DCCH-GARDE : ARMEE » UNE fois (ligne 2600 / 27131),
+     *     « levee » ZERO fois sur tout le reste du journal ;
+     *   - mobile.log : camp C3 + LU OK a 10:06:37, deux tentatives d appel a
+     *     10:06:44 et 10:06:51, puis « MM IDLE, no cell available » a 10:07:12
+     *     et 45 boucles « C0 null » <-> « C6 any cell selection » jusqu a la
+     *     fin du run, sans jamais revenir en C3 ;
+     *   - la synchro, elle, reste bonne pendant tout ce temps (SCH decode,
+     *     BSIC=7, « Channel provides data ») : seul le SI manque.
+     *
+     * PIEGE DE MESURE A CONNAITRE : la sonde « feed_si: SI reel N o injecte
+     * -> a_cd » est EN AMONT de cette garde (point d injection, l. ~4185) et
+     * continue d imprimer alors que plus rien n atteint a_cd. Le juge correct
+     * est la paire ARMEE/levee ci-dessus, et la sonde « CAMP: a_cd<-SI » du
+     * site de presentation. */
     if ((uint32_t)(g_shunt.tick_cnt - g_shunt.dcch_guard_tick) > (uint32_t)ttl) {
         g_shunt.dcch_guard_armed = false;      /* plus de bloc dedie depuis ttl : canal fini */
         SHUNT_LOG("DCCH-GARDE : levee (peremption) -- SI du camp retabli\n");
