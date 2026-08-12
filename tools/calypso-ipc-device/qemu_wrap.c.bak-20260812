@@ -168,33 +168,6 @@ static volatile size_t      g_dl_fifo_tail = 0;   /* next push index */
 static pthread_mutex_t      g_dl_fifo_mutex = PTHREAD_MUTEX_INITIALIZER;
 static volatile uint32_t    g_last_qfn_sent = UINT32_MAX;
 
-/* [2026-08-12] Gates du rattrapage DL (cf. DL-FIFO-TRIM dans clk_listener).
- * Lus une fois ; appeles uniquement depuis clk_listener (mono-thread). */
-static int dl_catchup_off(void)
-{
-    static int v = -1;
-    if (v < 0) {
-        const char *e = getenv("CALYPSO_DL_FIFO_CATCHUP_OFF");
-        v = (e && atoi(e)) ? 1 : 0;
-    }
-    return v;
-}
-/* Profondeur au-dela de laquelle on purge, en entrees (1 entree = 1 trame TDMA
- * = 4.615 ms). Defaut 4*DL_PREFILL = 128 ~= 590 ms : bien au-dessus du jitter
- * normal (coussin DL_PREFILL = 32 ~= 148 ms), bien en-dessous du decalage
- * pathologique observe (22 s). Reglable par CALYPSO_DL_FIFO_MAX_DEPTH. */
-static size_t dl_max_depth(void)
-{
-    static size_t v = 0;
-    if (!v) {
-        const char *e = getenv("CALYPSO_DL_FIFO_MAX_DEPTH");
-        long n = e ? atol(e) : 0;
-        v = (n >= DL_PREFILL * 2 && n < (long)DL_FIFO_SIZE)
-              ? (size_t)n : (size_t)(DL_PREFILL * 4);
-    }
-    return v;
-}
-
 /* GMSK signature : a FCCH burst (148 zero bits) has dphi = +π/2 every
  * sample at 1 SPS. We measure the fraction of positive dphi samples ;
  * ≥ 95 % positive = FCCH. Same logic as tools/dump_chunks_pattern.py. */
@@ -335,37 +308,6 @@ static void *clk_listener(void *arg)
             LOGP(DDEV, LOGL_NOTICE,
                  "DL FIFO pre-filled to %d, starting to serve at qfn=%u\n",
                  DL_PREFILL, fn);
-        }
-        /* ---- [2026-08-12] DL-FIFO-TRIM : rattrapage CONTINU ----
-         * Le rattrapage one-shot du premier tick (DL-FIFO-CATCHUP, plus haut)
-         * ne suffit PAS : il s'execute des le 1er tick QEMU (mesure : qfn=434),
-         * AVANT que le backlog ne se forme, donc depth0 <= DL_PREFILL et il ne
-         * jette rien -- verifie, 0 occurrence de DL-FIFO-CATCHUP en session
-         * alors que "first QEMU tick received" est bien present. Le backlog qui
-         * s'accumule ENSUITE n'etait donc jamais purge : Fix D cadence le DEBIT
-         * (1 burst/tick) mais ne corrige jamais l'OFFSET, d'ou un decalage fige
-         * qui ne derive plus.
-         * Mesure du 12/08 : 22,14 s de latence MONTANTE de bout en bout (bip
-         * 1 kHz injecte dans le sink gsm_mic, retrouve par Goertzel dans le
-         * -ul.wav de MixMonitor, corrobore par le temps mural). Le MS asservit
-         * son horloge au downlink : ce retard frappe LES DEUX SENS, pas
-         * seulement le montant.
-         * Sur : la FN de l'en-tete vient de e->ts (VRAIE FN du burst), pas du
-         * qfn courant -- jeter des entrees ne desaligne donc pas la FN, le MS
-         * se re-synchronise sur SCH. */
-        if (!dl_catchup_off() && (tail - head) > dl_max_depth()) {
-            size_t depth_before = tail - head;
-            size_t dropped = depth_before - DL_PREFILL;
-            head = tail - DL_PREFILL;
-            g_dl_fifo_head = head;
-            static uint64_t trim_count = 0;
-            if (trim_count < 10 || (trim_count % 100) == 0)
-                LOGP(DDEV, LOGL_NOTICE,
-                     "DL-FIFO-TRIM #%llu: dropping %zu stale entries "
-                     "(depth %zu -> %u, ~%zu ms of lag) at qfn=%u\n",
-                     (unsigned long long)trim_count, dropped,
-                     depth_before, DL_PREFILL, (dropped * 4615) / 1000, fn);
-            trim_count++;
         }
         if (head == tail) {
             /* Empty FIFO — nothing to serve this tick. */
