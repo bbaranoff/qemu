@@ -232,8 +232,11 @@ def make_tch_binary():
       - l.123 UDP_CLIENT : c'est la VRAIE sortie GSMTAP. En mode TCHF,
         tch_f_decoder ET cch_decoder y publient (l.213-214).
     On bind donc le serveur sur un port libre, et on pointe le client droit sur
-    4730, que le shunt ecoute : il dispatche par sub_type — TCH_F (0x02) ->
-    feed_facch, TCH_ACCH (0x82) -> feed_tch_sacch (calypso_dsp_shunt.c:3126-3134).
+    4730, que le shunt ecoute : il dispatche par sub_type — FACCH/F (0x09) ->
+    feed_facch, SACCH du dedie (0x89) -> feed_tch_sacch. ⚠️ Ces deux valeurs
+    sont celles de libosmocore/gr-gsm (GSMTAP_CHANNEL_FACCH_F = 0x09) ; le shunt
+    les comparait a 0x08/0x88 jusqu'au 12/08, ce qui rendait les deux feeds
+    inatteignables (0x08 est en fait SDCCH/8).
     Pas de parsing de stdout : les donnees vont du decodeur au shunt en direct.
     ⚠️ Remplacements CIBLES ligne par ligne : un `replace("4729","4730")` global
     ferait binder le serveur sur 4730 et entrerait en conflit avec le shunt.
