@@ -45,76 +45,6 @@ def gsmtap(fn, chan, l2):
 
 n = 0; nsch = 0; nsd = 0; nsa = 0; last_fn = 0; last_sd_fn = -1; last_sa_fn = -1
 
-# ---- SOUS-VOIE DEDIEE ACTIVE : lue, plus jamais supposee (12/08/2026) --------
-#
-# Ce fichier ne relayait le descendant dedie que pour `fn%51 in {22..25}`, soit le
-# SEUL sous-canal SS0 du SDCCH/4 combine. Mesure du 12/08 : sur trois tentatives
-# de LOCATION UPDATING consecutives, le BSC a donne SS2, puis SS1, puis SS0 ; les
-# deux premieres sont mortes sur `RR_REL_IND` a +6 s faute d'UA descendante, et
-# seule la troisieme a rendu `RR_EST_CNF` puis `LOCATION UPDATING ACCEPT`.
-# 48 secondes pour un LU, et deux tentatives perdues, par cette seule ligne.
-#
-# gr-gsm, lui, decode BIEN les quatre sous-canaux — releve sur /root/grgsm_clair.raw
-# (toutes les lignes du decodeur, AVANT cette gate) :
-#     fn%51=22 : 43 blocs (SS0)   fn%51=26 : 56 (SS1)
-#     fn%51=32 : 56   (SS2)       fn%51=36 : 36 (SS3)
-# Le probleme n'a donc jamais ete le decodage : c'etait ce filtre.
-#
-# SOURCE AUTORITAIRE — la MEME que celle qui pilote deja la fenetre de
-# presentation du shunt : le `chan_nr` que le FIRMWARE annonce, publie par
-# l1ctl_sock.c:418 dans /dev/shm/calypso_dcch_cfg.
-#   16 o : seq u32 LE @0 | kind @4 (0=SDCCH/4, 1=SDCCH/8) | ss @5 | tn @6 | chan_nr @7
-# ⚠️ NE PAS apprendre la sous-voie depuis les IMM ASSIGN du CCCH : il porte ceux
-#    de TOUS les abonnes (mesure du 08/08 : 68 IMM ASSIGN d'un RA etranger pour
-#    un RACH a nous). C'est la fausse piste que l1ctl_sock.c documente en tete.
-# ⚠️ os.pread obligatoire : un BufferedReader avec seek(0)+read() rendrait
-#    eternellement la premiere valeur.
-DCCH_CFG_PATH = "/dev/shm/calypso_dcch_cfg"
-_SD4_DL    = (22, 26, 32, 36)   # base fn%51  du canal principal, SDCCH/4 combine
-_SD4_SACCH = (42, 46, 93, 97)   # base fn%102 de la SACCH        (GSM 05.02)
-_dcch_vu = [None]
-
-def dcch_sousvoie():
-    """(base_dl fn%51, base_sacch fn%102, kind). Repli (22, 42, 0) = ancien defaut."""
-    try:
-        fd = os.open(DCCH_CFG_PATH, os.O_RDONLY)
-        try:
-            b = os.pread(fd, 16, 0)
-        finally:
-            os.close(fd)
-    except OSError:
-        return 22, 42, 0
-    if len(b) < 8 or int.from_bytes(b[0:4], "little") == 0:
-        return 22, 42, 0
-    kind, ss = b[4], b[5]
-    if kind:
-        # SDCCH/8 : base principale ss*4, alignee sur calypso_dsp_shunt_set_dcch.
-        # Sa SACCH n'est modelisee NI ici NI dans le shunt (sacch_base n'a que 4
-        # entrees, indexees par les bases du /4) — et de toute facon aucun
-        # decodeur SDCCH/8 ne tourne : `-m BCCH_SDCCH4` ne peut pas les produire.
-        # On ne fabrique donc pas une fenetre SACCH qu'on ne sait pas calculer.
-        return (ss & 7) * 4, None, 1
-    i = ss & 3
-    return _SD4_DL[i], _SD4_SACCH[i], 0
-
-def dcch_annonce(base_dl, base_sa, kind):
-    """Une ligne a CHAQUE changement de sous-voie : sans elle, un relais sur la
-    mauvaise sous-voie serait indiscernable d'une absence de relais."""
-    etat = (base_dl, base_sa, kind)
-    if _dcch_vu[0] == etat:
-        return
-    _dcch_vu[0] = etat
-    if kind:
-        print("[si-bridge] sous-voie dediee : SDCCH/8 base fn%%51 %d-%d — "
-              "AUCUN decodeur ne produit ces blocs (-m BCCH_SDCCH4 ne les voit "
-              "pas) et leur SACCH n'est pas modelisee : ce dedie restera muet"
-              % (base_dl, base_dl + 3), flush=True)
-    else:
-        print("[si-bridge] sous-voie dediee : SDCCH/4 SS%d -> relais DL fn%%51 "
-              "%d-%d, SACCH fn%%102 %d-%d"
-              % (_SD4_DL.index(base_dl), base_dl, base_dl + 3,
-                 base_sa, base_sa + 3), flush=True)
-
 def handle_line(line):
     global n, nsch, nsd, nsa, last_fn, last_sd_fn, last_sa_fn
     # --- SCH reel : "SCHBSIC <bsic> <fn> <toa>" -> 4731 + horloge FN ---
@@ -153,15 +83,10 @@ def handle_line(line):
             print("[si-bridge] %s (mt=0x%02x) FN=%d (%%51=%d %s) -> %s (4730)  #%d"
                   % (name, by[2], si_fn, si_fn%51, fn51_role(si_fn),
                      "feed_agch/PCH" if is_ccch else "feed_si", n), flush=True)
-    # --- DL du canal dedie (#2) : LAPDm (UA/AUTH), pas du RR ---
-    # La fenetre suit la sous-voie REELLEMENT active (cf. dcch_sousvoie), elle
-    # n'est plus figee sur SS0. C'est la correction du 12/08 : deux LU sur trois
-    # mouraient parce que le BSC avait donne SS2 puis SS1.
+    # --- SDCCH/4 SS0 DL (#2) : LAPDm (UA/AUTH), pas du RR -> gate fn%51 in {22-25} ---
     mfn_sd = re.match(r"^\s*(\d+)\b", lstr)
     sd_fn = int(mfn_sd.group(1)) if mfn_sd else last_fn
-    _b_dl, _b_sa, _kind = dcch_sousvoie()
-    dcch_annonce(_b_dl, _b_sa, _kind)
-    if len(by) >= 3 and _b_dl <= (sd_fn % 51) <= _b_dl + 3:
+    if len(by) >= 3 and (sd_fn % 51) in (22, 23, 24, 25):
         L2 = (by[:23] + b"\x2b"*23)[:23]
         # DEDUP PAR FN (corrige) : gr-gsm peut re-decoder le MEME bloc on-air (meme FN)
         # -> il faut sauter ce doublon (re-decode). MAIS la BTS RE-EMET legitimement le
@@ -180,8 +105,8 @@ def handle_line(line):
             s.sendto(gsmtap(sd_fn, GSMTAP_SDCCH4, L2), ("127.0.0.1", 4730))
             nsd += 1
             if nsd <= 20 or nsd % 50 == 0:
-                print("[si-bridge] SDCCH/%d DL (a0=0x%02x c=0x%02x) FN=%d (%%51=%d, base %d) -> feed_sdcch (4730)  #%d [new]"
-                      % (8 if _kind else 4, by[0], ctrl, sd_fn, sd_fn%51, _b_dl, nsd), flush=True)
+                print("[si-bridge] SDCCH/4 SS0 DL (a0=0x%02x c=0x%02x) FN=%d (%%51=%d) -> feed_sdcch (4730)  #%d [new]"
+                      % (by[0], ctrl, sd_fn, sd_fn%51, nsd), flush=True)
             # ARMEMENT DU TCH : l'ASSIGNMENT COMMAND passe par ce meme bloc DL.
             check_assignment(by, sd_fn)
     # --- SACCH (SDCCH/4 SS0) DL : SI5(0x1d)/SI6(0x1e) REELS -> feed_sacch ---
@@ -189,12 +114,7 @@ def handle_line(line):
     # bloc 23o = [L1 hdr 2][LAPDm: 03 03 len 06 mt L3...]. On detecte le RR header
     # "06 1d"/"06 1e" et on forwarde le bloc TEL QUEL au shunt (sub_type 0x87 =
     # SDCCH4|ACCH) -> feed_sacch REEL, remplace la fabrication SI3->SI6.
-    # ⚠️ fn%102 et NON fn%51 : en 05.02 les SACCH de SS0/SS1 sont dans la
-    # premiere moitie du cycle 102 et celles de SS2/SS3 dans la seconde
-    # (42,46,93,97). Teste modulo 51, {42..45} acceptait AUSSI la SACCH de SS2
-    # (93-96 % 51 = 42-45) : on livrait la SACCH d'une autre sous-voie comme si
-    # c'etait la notre, et on ne voyait jamais celles de SS1/SS3.
-    if len(by) >= 8 and _b_sa is not None and _b_sa <= (sd_fn % 102) <= _b_sa + 3:
+    if len(by) >= 8 and (sd_fn % 51) in (42, 43, 44, 45):
         mt_sa = None
         for off in range(2, min(9, len(by) - 1)):
             if by[off] == 0x06 and by[off + 1] in (0x1d, 0x1e):
