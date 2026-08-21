@@ -1491,41 +1491,22 @@ static void shunt_dcch_sacch_present(uint16_t *d)
             SHUNT_LOG("DCCH-SACCH : garde du canal principal %s\n",
                       garde ? "ACTIVE" : "desactivee");
         }
-        /* [2026-08-21] CE SWITCH NE CONNAISSAIT QUE LES BASES DU SDCCH/4.
-         * g_shunt.sdcch_ss porte la base DL fn%51 posee par set_dcch() :
-         *   /4 -> {22,26,32,36}[ss]      /8 -> ss*4  ∈ {0,4,8,...,28}
-         * Sur un /8, AUCUN case ne matchait (26/32/36 sont hors de {0..28}) :
-         * ss_idx retombait a 0 et la SACCH dediee etait presentee en fn%102 42-45,
-         * la fenetre du SDCCH/4 SS0, alors qu'elle arrive en 32-35 (SS0 du /8).
-         * La SACCH d'un SDCCH/8 n'a donc JAMAIS ete presentee au bon endroit.
-         * Miroir exact, cote shunt, du plan /4-en-dur corrige le meme jour dans
-         * pont.py. Tables GSM 05.02, sur la 102-multitrame :
-         *   SACCH/C4 SS0..3 -> 42, 46, 93, 97
-         *   SACCH/C8 SS0..7 -> 32, 36, 40, 44, 83, 87, 91, 95
-         * (les sous-voies hautes vivent dans la seconde moitie de la 102.) */
-        static const uint8_t sacch_base4[4] = { 42, 46, 93, 97 };
-        static const uint8_t sacch_base8[8] = { 32, 36, 40, 44, 83, 87, 91, 95 };
+        static const uint8_t sacch_base[4] = { 42, 46, 93, 97 };
         unsigned ss_idx;
-        uint32_t b;
-        if (g_shunt.sdcch_ch8) {
-            ss_idx = (g_shunt.sdcch_ss / 4u) & 7u;   /* base = ss*4 -> ss */
-            b = sacch_base8[ss_idx];
-        } else {
-            switch (g_shunt.sdcch_ss) {      /* base fn%51 -> index de sous-canal */
-            case 26: ss_idx = 1; break;
-            case 32: ss_idx = 2; break;
-            case 36: ss_idx = 3; break;
-            default: ss_idx = 0; break;      /* 22 = SS0 */
-            }
-            b = sacch_base4[ss_idx];
+        switch (g_shunt.sdcch_ss) {          /* base fn%51 -> index de sous-canal */
+        case 26: ss_idx = 1; break;
+        case 32: ss_idx = 2; break;
+        case 36: ss_idx = 3; break;
+        default: ss_idx = 0; break;          /* 22 = SS0 */
         }
         uint32_t f102 = (uint32_t)calypso_trx_get_fn() % 102u;
+        uint32_t b    = sacch_base[ss_idx];
         if (f102 < b || f102 > b + 3u) {
             static unsigned long long hors;
             if (++hors % 20000 == 1)
-                SHUNT_LOG("DCCH-SACCH : fn%%102=%u hors fenetre SACCH [%u-%u] du "
-                          "SDCCH/%d SS%u (#%llu) -- on ne presente pas\n",
-                          f102, b, b + 3u, g_shunt.sdcch_ch8 ? 8 : 4, ss_idx, hors);
+                SHUNT_LOG("DCCH-SACCH : fn%%102=%u hors fenetre SACCH [%u-%u] du SS%u "
+                          "(#%llu) -- on ne presente pas\n",
+                          f102, b, b + 3u, ss_idx, hors);
             return;
         }
         if (garde && (d[ndb_w(g_ndb.a_cd)] & (1u << B_BLUD))) {
