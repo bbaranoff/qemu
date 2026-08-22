@@ -5248,74 +5248,6 @@ static void c54x_par_postmod(C54xState *s, int ar, int mod)
     }
 }
 
-/* ================================================================
- * [2026-08-22] FIX ISA — adressage a BITS INVERSES (reverse carry)
- *     mode 7 = *ARn+0B      mode 4 = *ARn-0B
- *
- * RACINE. Ces deux modes etaient traites comme un +/-AR0 PLAT. Le commentaire
- * « GAP bitrev » qui les accompagnait posait deja le diagnostic et la condition
- * de levee : « tout chemin FCCH/SCH bit-reverse mal-adresserait EN SILENCE.
- * A implementer si une sonde le montre exerce en bitrev. »
- * La sonde manquante : PDROM 0xf1b3 `mar *AR2+0B` (smem=0xBA -> mod=7, AR2),
- * DANS la region du correlateur FB/SB, juste apres la boucle de correlation
- * (0xf16c..0xf17e) et la passe `norm` de 512 mots (0xf195..0xf19b) : c'est le
- * bit-reversal d'une FFT.
- *
- * POURQUOI CA COLLE AU SYMPTOME. Une FFT dont la retenue inversee est ignoree
- * rend des magnitudes et une phase plausibles mais un ORDRE DE BINS faux :
- * l'angle converge (mesure : -6 Hz stable) tandis que la POSITION du pic est
- * fausse ou collee au bord de fenetre (mesure : TOA=39 = bord r39, ou aberrant).
- *
- * SEMANTIQUE (SPRU131G) : la retenue se propage vers les bits de POIDS FAIBLE
- * au lieu des poids forts. Equivalent exact et sans boucle : inverser les bits
- * des deux operandes, additionner normalement, re-inverser le resultat.
- *
- * /!\ EFFET GLOBAL : ces modes servent a toute FFT/IFFT du firmware.
- * Bascule A/B : CALYPSO_ISA_BITREV=0 restaure le +/-AR0 plat.
- * ================================================================ */
-static int c54x_bitrev_on(void)
-{
-    static int g = -1;
-    if (g < 0) {
-        g = calypso_gate("CALYPSO_ISA_BITREV", 1);
-        fprintf(stderr, "[c54x] ISA-BITREV %s : *ARn+0B / *ARn-0B = retenue "
-                "INVERSEE (etait un +/-AR0 plat)\n",
-                g ? "ACTIF (fidele SPRU131G)" : "INACTIF (ancien +/-AR0 plat)");
-    }
-    return g;
-}
-
-static inline uint16_t c54x_bitrev16(uint16_t v)
-{
-    v = (uint16_t)(((v & 0xAAAAu) >> 1) | ((v & 0x5555u) << 1));
-    v = (uint16_t)(((v & 0xCCCCu) >> 2) | ((v & 0x3333u) << 2));
-    v = (uint16_t)(((v & 0xF0F0u) >> 4) | ((v & 0x0F0Fu) << 4));
-    v = (uint16_t)(((v & 0xFF00u) >> 8) | ((v & 0x00FFu) << 8));
-    return v;
-}
-
-static uint16_t c54x_revcarry(C54xState *s, uint16_t ar, uint16_t ar0, int sub)
-{
-    uint16_t plat = (uint16_t)(sub ? (ar - ar0) : (ar + ar0));
-    uint16_t r;
-    if (!c54x_bitrev_on())
-        return plat;
-    r = c54x_bitrev16(ar);
-    r = (uint16_t)(sub ? (r - c54x_bitrev16(ar0)) : (r + c54x_bitrev16(ar0)));
-    r = c54x_bitrev16(r);
-    {   /* Sonde : prouve que le mode est REELLEMENT exerce, et montre l'ecart
-         * avec l'ancien calcul plat. Plafonnee — ne jamais en tirer un taux. */
-        static unsigned n = 0;
-        if (n < 24) {
-            n++;
-            fprintf(stderr, "[c54x] BITREV #%u PC=0x%04x AR=0x%04x %c AR0=0x%04x "
-                    "-> 0x%04x (plat: 0x%04x) insn=%u\n",
-                    n, s->pc, ar, sub ? '-' : '+', ar0, r, plat, s->insn_count);
-        }
-    }
-    return r;
-}
-
 /* Resolve Smem operand: direct or indirect addressing.
  * Returns the data memory address. */
 static uint16_t resolve_smem(C54xState *s, uint16_t opcode, bool *indirect)
@@ -5399,8 +5331,8 @@ static uint16_t resolve_smem(C54xState *s, uint16_t opcode, bool *indirect)
          * Ordre réel : 4=-0B 5=-0 6=+0 7=+0B 8=-% 9=-0% 10=+% 11=+0%.
          * Circulaire (8-11) via c54x_circ_ref → BK=0 reste LINÉAIRE (règle
          * #6396 : STM #0,BK délibéré, confirmé par sonde BK-WR). */
-        case 0x4: /* *ARn-0B — retenue INVERSEE (fix 2026-08-22) */
-            s->ar[cur_arp] = c54x_revcarry(s, s->ar[cur_arp], s->ar[0], 1);
+        case 0x4: /* *ARn-0B (bit-reversed) — reverse-carry différé, voir GAP */
+            s->ar[cur_arp] -= s->ar[0];
             break;
         case 0x5: /* *ARn-0 */
             s->ar[cur_arp] -= s->ar[0];
@@ -5408,13 +5340,12 @@ static uint16_t resolve_smem(C54xState *s, uint16_t opcode, bool *indirect)
         case 0x6: /* *ARn+0 */
             s->ar[cur_arp] += s->ar[0];
             break;
-        case 0x7: /* *ARn+0B — retenue INVERSEE (fix 2026-08-22) */
-            s->ar[cur_arp] = c54x_revcarry(s, s->ar[cur_arp], s->ar[0], 0);
+        case 0x7: /* *ARn+0B (bit-reversed) — reverse-carry différé, voir GAP */
+            s->ar[cur_arp] += s->ar[0];
             break;
-        /* GAP bitrev LEVE le 2026-08-22 : la sonde demandee est PDROM 0xf1b3
-         * `mar *AR2+0B`, dans le correlateur FB/SB. Modes 4/7 = retenue
-         * inversee (c54x_revcarry). Gate CALYPSO_ISA_BITREV=0 pour revenir
-         * au +/-AR0 plat. */
+        /* GAP bitrev (4/7) : ±AR0 plat, signe correct, reverse-carry ignoré.
+         * OK hors-FFT ; tout chemin FCCH/SCH bit-reverse mal-adresserait en
+         * silence. À implémenter si une sonde le montre exercé en bitrev. */
         case 0x8: /* *ARn-% (circular -1) */
             s->ar[cur_arp] = c54x_circ_ref(s->ar[cur_arp], -1, s->bk);
             break;
@@ -5543,10 +5474,8 @@ static uint16_t resolve_lmem(C54xState *s, uint16_t opcode)
     case 0x1: s->ar[nar] -= 2; break;                             /* *ARn-     */
     case 0x2: s->ar[nar] += 2; break;                             /* *ARn+     */
     case 0x3: s->ar[nar] += 2; addr = s->ar[nar] & 0xFFFE; break; /* *+ARn     */
-    case 0x4: s->ar[nar] = c54x_revcarry(s, s->ar[nar], s->ar[0], 1); break; /* *ARn-0B */
-    case 0x5: s->ar[nar] -= s->ar[0]; break;                                 /* *ARn-0  */
-    case 0x6: s->ar[nar] += s->ar[0]; break;                                 /* *ARn+0  */
-    case 0x7: s->ar[nar] = c54x_revcarry(s, s->ar[nar], s->ar[0], 0); break; /* *ARn+0B */
+    case 0x4: case 0x5: s->ar[nar] -= s->ar[0]; break;            /* *ARn-0(B) */
+    case 0x6: case 0x7: s->ar[nar] += s->ar[0]; break;            /* *ARn+0(B) */
     case 0x8: s->ar[nar] = c54x_circ_ref(s->ar[nar], -2, s->bk); break;                 /* *ARn-%  */
     case 0x9: s->ar[nar] = c54x_circ_ref(s->ar[nar], -(int16_t)s->ar[0], s->bk); break; /* *ARn-0% */
     case 0xA: s->ar[nar] = c54x_circ_ref(s->ar[nar], +2, s->bk); break;                 /* *ARn+%  */

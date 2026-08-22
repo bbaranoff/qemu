@@ -5248,74 +5248,6 @@ static void c54x_par_postmod(C54xState *s, int ar, int mod)
     }
 }
 
-/* ================================================================
- * [2026-08-22] FIX ISA — adressage a BITS INVERSES (reverse carry)
- *     mode 7 = *ARn+0B      mode 4 = *ARn-0B
- *
- * RACINE. Ces deux modes etaient traites comme un +/-AR0 PLAT. Le commentaire
- * « GAP bitrev » qui les accompagnait posait deja le diagnostic et la condition
- * de levee : « tout chemin FCCH/SCH bit-reverse mal-adresserait EN SILENCE.
- * A implementer si une sonde le montre exerce en bitrev. »
- * La sonde manquante : PDROM 0xf1b3 `mar *AR2+0B` (smem=0xBA -> mod=7, AR2),
- * DANS la region du correlateur FB/SB, juste apres la boucle de correlation
- * (0xf16c..0xf17e) et la passe `norm` de 512 mots (0xf195..0xf19b) : c'est le
- * bit-reversal d'une FFT.
- *
- * POURQUOI CA COLLE AU SYMPTOME. Une FFT dont la retenue inversee est ignoree
- * rend des magnitudes et une phase plausibles mais un ORDRE DE BINS faux :
- * l'angle converge (mesure : -6 Hz stable) tandis que la POSITION du pic est
- * fausse ou collee au bord de fenetre (mesure : TOA=39 = bord r39, ou aberrant).
- *
- * SEMANTIQUE (SPRU131G) : la retenue se propage vers les bits de POIDS FAIBLE
- * au lieu des poids forts. Equivalent exact et sans boucle : inverser les bits
- * des deux operandes, additionner normalement, re-inverser le resultat.
- *
- * /!\ EFFET GLOBAL : ces modes servent a toute FFT/IFFT du firmware.
- * Bascule A/B : CALYPSO_ISA_BITREV=0 restaure le +/-AR0 plat.
- * ================================================================ */
-static int c54x_bitrev_on(void)
-{
-    static int g = -1;
-    if (g < 0) {
-        g = calypso_gate("CALYPSO_ISA_BITREV", 1);
-        fprintf(stderr, "[c54x] ISA-BITREV %s : *ARn+0B / *ARn-0B = retenue "
-                "INVERSEE (etait un +/-AR0 plat)\n",
-                g ? "ACTIF (fidele SPRU131G)" : "INACTIF (ancien +/-AR0 plat)");
-    }
-    return g;
-}
-
-static inline uint16_t c54x_bitrev16(uint16_t v)
-{
-    v = (uint16_t)(((v & 0xAAAAu) >> 1) | ((v & 0x5555u) << 1));
-    v = (uint16_t)(((v & 0xCCCCu) >> 2) | ((v & 0x3333u) << 2));
-    v = (uint16_t)(((v & 0xF0F0u) >> 4) | ((v & 0x0F0Fu) << 4));
-    v = (uint16_t)(((v & 0xFF00u) >> 8) | ((v & 0x00FFu) << 8));
-    return v;
-}
-
-static uint16_t c54x_revcarry(C54xState *s, uint16_t ar, uint16_t ar0, int sub)
-{
-    uint16_t plat = (uint16_t)(sub ? (ar - ar0) : (ar + ar0));
-    uint16_t r;
-    if (!c54x_bitrev_on())
-        return plat;
-    r = c54x_bitrev16(ar);
-    r = (uint16_t)(sub ? (r - c54x_bitrev16(ar0)) : (r + c54x_bitrev16(ar0)));
-    r = c54x_bitrev16(r);
-    {   /* Sonde : prouve que le mode est REELLEMENT exerce, et montre l'ecart
-         * avec l'ancien calcul plat. Plafonnee — ne jamais en tirer un taux. */
-        static unsigned n = 0;
-        if (n < 24) {
-            n++;
-            fprintf(stderr, "[c54x] BITREV #%u PC=0x%04x AR=0x%04x %c AR0=0x%04x "
-                    "-> 0x%04x (plat: 0x%04x) insn=%u\n",
-                    n, s->pc, ar, sub ? '-' : '+', ar0, r, plat, s->insn_count);
-        }
-    }
-    return r;
-}
-
 /* Resolve Smem operand: direct or indirect addressing.
  * Returns the data memory address. */
 static uint16_t resolve_smem(C54xState *s, uint16_t opcode, bool *indirect)
@@ -5399,8 +5331,8 @@ static uint16_t resolve_smem(C54xState *s, uint16_t opcode, bool *indirect)
          * Ordre réel : 4=-0B 5=-0 6=+0 7=+0B 8=-% 9=-0% 10=+% 11=+0%.
          * Circulaire (8-11) via c54x_circ_ref → BK=0 reste LINÉAIRE (règle
          * #6396 : STM #0,BK délibéré, confirmé par sonde BK-WR). */
-        case 0x4: /* *ARn-0B — retenue INVERSEE (fix 2026-08-22) */
-            s->ar[cur_arp] = c54x_revcarry(s, s->ar[cur_arp], s->ar[0], 1);
+        case 0x4: /* *ARn-0B (bit-reversed) — reverse-carry différé, voir GAP */
+            s->ar[cur_arp] -= s->ar[0];
             break;
         case 0x5: /* *ARn-0 */
             s->ar[cur_arp] -= s->ar[0];
@@ -5408,13 +5340,12 @@ static uint16_t resolve_smem(C54xState *s, uint16_t opcode, bool *indirect)
         case 0x6: /* *ARn+0 */
             s->ar[cur_arp] += s->ar[0];
             break;
-        case 0x7: /* *ARn+0B — retenue INVERSEE (fix 2026-08-22) */
-            s->ar[cur_arp] = c54x_revcarry(s, s->ar[cur_arp], s->ar[0], 0);
+        case 0x7: /* *ARn+0B (bit-reversed) — reverse-carry différé, voir GAP */
+            s->ar[cur_arp] += s->ar[0];
             break;
-        /* GAP bitrev LEVE le 2026-08-22 : la sonde demandee est PDROM 0xf1b3
-         * `mar *AR2+0B`, dans le correlateur FB/SB. Modes 4/7 = retenue
-         * inversee (c54x_revcarry). Gate CALYPSO_ISA_BITREV=0 pour revenir
-         * au +/-AR0 plat. */
+        /* GAP bitrev (4/7) : ±AR0 plat, signe correct, reverse-carry ignoré.
+         * OK hors-FFT ; tout chemin FCCH/SCH bit-reverse mal-adresserait en
+         * silence. À implémenter si une sonde le montre exercé en bitrev. */
         case 0x8: /* *ARn-% (circular -1) */
             s->ar[cur_arp] = c54x_circ_ref(s->ar[cur_arp], -1, s->bk);
             break;
@@ -5543,10 +5474,8 @@ static uint16_t resolve_lmem(C54xState *s, uint16_t opcode)
     case 0x1: s->ar[nar] -= 2; break;                             /* *ARn-     */
     case 0x2: s->ar[nar] += 2; break;                             /* *ARn+     */
     case 0x3: s->ar[nar] += 2; addr = s->ar[nar] & 0xFFFE; break; /* *+ARn     */
-    case 0x4: s->ar[nar] = c54x_revcarry(s, s->ar[nar], s->ar[0], 1); break; /* *ARn-0B */
-    case 0x5: s->ar[nar] -= s->ar[0]; break;                                 /* *ARn-0  */
-    case 0x6: s->ar[nar] += s->ar[0]; break;                                 /* *ARn+0  */
-    case 0x7: s->ar[nar] = c54x_revcarry(s, s->ar[nar], s->ar[0], 0); break; /* *ARn+0B */
+    case 0x4: case 0x5: s->ar[nar] -= s->ar[0]; break;            /* *ARn-0(B) */
+    case 0x6: case 0x7: s->ar[nar] += s->ar[0]; break;            /* *ARn+0(B) */
     case 0x8: s->ar[nar] = c54x_circ_ref(s->ar[nar], -2, s->bk); break;                 /* *ARn-%  */
     case 0x9: s->ar[nar] = c54x_circ_ref(s->ar[nar], -(int16_t)s->ar[0], s->bk); break; /* *ARn-0% */
     case 0xA: s->ar[nar] = c54x_circ_ref(s->ar[nar], +2, s->bk); break;                 /* *ARn+%  */
@@ -10139,50 +10068,6 @@ static int c54x_exec_one(C54xState *s)
          * Encoding: 1110 00SD IAAAAAAA (1 word)
          * Per SPRU172C p.4-35: if |A(32-16)| >= |Smem| then TC=1,
          * TRN = (TRN<<1)|1, dst=A; else TC=0, TRN=(TRN<<1), dst=Smem<<16 */
-        /* ================================================================
-         * [2026-08-22] FIX ISA (RAPPORT_OPCODES.md E-1, gravite 1) —
-         * 0xE0-0xE3 N'EST PAS `CMPS`. Le vrai CMPS est 0x8E00/0xFE00, deja
-         * correctement decode plus bas (corrige le 2026-06-02). Ce catch-all
-         * etait un doublon parasite — meme schema que 0xC7->RPTB et 0xE4->BITF.
-         * Encodages reels (SPRU172C, XXXXYYYY en bits 7:0) :
-         *     0xE0 FIRS  Xmem,Ymem,pmad   ** 2 MOTS **
-         *     0xE1 LMS   Xmem,Ymem        1 mot
-         *     0xE2 SQDST Xmem,Ymem        1 mot
-         *     0xE3 ABDST Xmem,Ymem        1 mot
-         * Le seul degat GRAVE est 0xE0 compte pour 1 mot -> desynchronisation.
-         * On corrige donc d'abord le NOMBRE DE MOTS, et on rend E1-E3 inertes
-         * plutot que de leur faire ecrire A/B/TC/TRN a tort (une semantique
-         * fausse est pire qu'une absence : cf. le patron « neutralisation
-         * plausible » de l'audit). Implementation fidele de FIRS/LMS/SQDST/
-         * ABDST = travail separe, a faire si une sonde montre qu'ils portent.
-         * Bascule A/B : CALYPSO_ISA_E0_FAM=0 restaure l'ancien CMPS.
-         * ================================================================ */
-        {
-            static int _e0_fam = -1;
-            if (_e0_fam < 0) {
-                _e0_fam = calypso_gate("CALYPSO_ISA_E0_FAM", 1);
-                fprintf(stderr, "[c54x] ISA-E0-FAM %s : 0xE0=FIRS(2 mots) "
-                        "0xE1=LMS 0xE2=SQDST 0xE3=ABDST (PAS CMPS)\n",
-                        _e0_fam ? "ACTIF (largeur de mot fidele)"
-                                : "INACTIF (ancien CMPS 1 mot)");
-            }
-            if (_e0_fam && (op & 0xFC00) == 0xE000) {
-                static unsigned _e0_n = 0;
-                if (hi8 == 0xE0) {
-                    (void)prog_fetch(s, s->pc + 1);   /* FIRS : pmad = 2e mot */
-                    consumed = 2;
-                }
-                if (_e0_n < 40) {
-                    _e0_n++;
-                    C54_LOG("E0-FAM non implemente op=0x%04x (%s) PC=0x%04x "
-                            "consumed=%d insn=%u", op,
-                            hi8 == 0xE0 ? "FIRS" : hi8 == 0xE1 ? "LMS" :
-                            hi8 == 0xE2 ? "SQDST" : "ABDST",
-                            s->pc, consumed, s->insn_count);
-                }
-                return consumed + s->lk_used;
-            }
-        }
         if ((op & 0xFC00) == 0xE000) {
             int src_s = (op >> 9) & 1;
             int dst_d = (op >> 8) & 1;
@@ -10266,55 +10151,6 @@ static int c54x_exec_one(C54xState *s)
                 case 3: s->ar[yar] = c54x_circ_ref(ya, +(int16_t)s->ar[0], s->bk); break; /* *AR+0% circ modulo BK — fix 2026-06-01 */
             }
             return consumed + s->lk_used;
-        }
-        /* ================================================================
-         * [2026-08-22] FIX ISA (RAPPORT_OPCODES.md E-2, gravite 1) —
-         *     ST src,Ymem || LD Xmem,T      encodage 111001S0 XXXXYYYY
-         *     = 0xE400 masque 0xFD00  (donc 0xE4xx ET 0xE6xx, b8=0 fixe)
-         *
-         * L'emulateur decodait 0xE4 en « BITF Smem,#lk » sur **2 MOTS** ->
-         * un mot avale par site -> desynchronisation du flux d'instructions.
-         * Or le VRAI BITF est 0x6100/0xFF00, deja correctement decode ailleurs
-         * dans ce fichier : c'etait un doublon parasite, exactement comme
-         * 0xC7 -> RPTB (le vrai RPTB etant 0xF072).
-         *
-         * /!\ NE PAS elargir le masque a 0xFC00 : 0xE5xx = MVDD et 0xE7xx =
-         * MVMM sont des instructions DIFFERENTES (b8 discrimine) et sont
-         * reellement utilisees (79 MVDD dans PROM0, dont le corps du
-         * correlateur en PDROM). Le masque projet 0xFC00 les volait.
-         *
-         * Semantique (SPRU172C p.4-178, syntaxe 2) :
-         *     Ymem = (src << ASM) >> 16   ;   T = Xmem
-         * S = b9 (0xE4 -> A, 0xE6 -> B). 1 MOT.
-         * Bascule A/B : CALYPSO_ISA_E4_PAR=0 restaure l'ancien BITF 2 mots.
-         * ================================================================ */
-        {
-            static int _e4_par = -1;
-            if (_e4_par < 0) {
-                _e4_par = calypso_gate("CALYPSO_ISA_E4_PAR", 1);
-                fprintf(stderr, "[c54x] ISA-E4-PAR %s : 0xE4xx/0xE6xx = "
-                        "ST src,Ymem || LD Xmem,T (1 mot, masque 0xFD00)\n",
-                        _e4_par ? "ACTIF (fidele SPRU172C)"
-                                : "INACTIF (ancien BITF 2 mots)");
-            }
-            if (_e4_par && (op & 0xFD00) == 0xE400) {
-                int s_acc = (op >> 9) & 1;
-                int xmod  = (op >> 6) & 3;
-                int xar   = ((op >> 4) & 3) + 2;
-                int ymod  = (op >> 2) & 3;
-                int yar   = ( op       & 3) + 2;
-                uint16_t yaddr = s->ar[yar];
-                uint16_t xval  = data_read(s, s->ar[xar]);
-                int64_t  sv    = s_acc ? s->b : s->a;
-                int      ash   = asm_shift(s);
-                int64_t  sh    = (ash >= 0) ? (sv << ash) : (sv >> (-ash));
-
-                data_write(s, yaddr, (uint16_t)((sh >> 16) & 0xFFFF));
-                s->t = xval;                      /* LD Xmem, T */
-                c54x_par_postmod(s, xar, xmod);
-                c54x_par_postmod(s, yar, ymod);
-                return consumed + s->lk_used;
-            }
         }
         if (hi8 == 0xE4) {
             /* E4xx: BITF Smem, #lk (2-word) or BIT Smem, bit */
