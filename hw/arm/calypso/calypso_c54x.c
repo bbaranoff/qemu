@@ -2926,7 +2926,7 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
                  *   NB      : ce site ne teste PAS SHUNT_NO_LEGIT ; c'est shunt_no_legit.env qui
                  *             pose TRF_RXLEV=1 explicitement.
                  */
-                static int _tp = -1, _tgt = -60;
+                static int _tp = -1, _tgt = -60, _rssi = -1;
                 if (_tp < 0) {
                     /* [2026-08-03] `CALYPSO_TRF_RXLEV=0` ne coupait PAS sous SHUNT_LEGIT=1 :
                  * l'idiome `(d=='1') || (l=='1')` laisse le parapluie ecraser un 0
@@ -2937,14 +2937,23 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
                     const char *t = getenv("CALYPSO_TRF_TARGET_RF");
                     _tp = calypso_gate("CALYPSO_TRF_RXLEV", (l && *l == '1') ? 1 : 0);
                     if (t && *t) _tgt = atoi(t);
+                    /* [2026-08-22] MODELE INTEGRATEUR RSSI HW = vrai pm_meas natif.
+                     * a_pm depuis la MAV reelle du DL (calypso_dsp_shunt_rssi_apm),
+                     * pas la cible -60 figee ni le 0x7000 canne. Defaut ON en natif ;
+                     * prime sur trf. CALYPSO_PM_RSSI=0 le coupe (retombe sur trf). */
+                    const char *r = getenv("CALYPSO_PM_RSSI");
+                    const char *m = getenv("CALYPSO_MODE");
+                    int native = (m && strstr(m, "native")) ? 1 : 0;
+                    _rssi = r ? (atoi(r) != 0) : native;
                 }
                 /* DSP 33-36 : db_r = {..d_task_ra(7), a_serv_demod[4](8..11),
                  * a_pm[3](12..14), a_sch[5](15..19)}. a_pm read page 0 = word 12
                  * = data[base0x28+12+0x800]=data[0x834..0x836] ; page 1 =
                  * data[0x3C+12+0x800]=data[0x848..0x84A]. (0x830/0x844 = a_serv_demod!) */
-                if (_tp && ((addr >= 0x0834 && addr <= 0x0836) ||
+                if ((_rssi || _tp) && ((addr >= 0x0834 && addr <= 0x0836) ||
                             (addr >= 0x0848 && addr <= 0x084A))) {
-                    val = calypso_trf6151_apm_for_rf(_tgt);
+                    val = _rssi ? calypso_dsp_shunt_rssi_apm()
+                                : calypso_trf6151_apm_for_rf(_tgt);
                 }
             }
         }
@@ -3673,14 +3682,18 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
      * (= la routine FB-det code DSP qui calcule les vraies valeurs). Si
      * apres tout le run on ne voit que les 3 PCs garbage → le vrai code
      * n'est jamais atteint. Cap 200 entries. */
-    if (addr >= 0x08FA && addr <= 0x08FD) {
-        if (s->pc != 0x821a && s->pc != 0x8213 && s->pc != 0x8217) {
+    if ((addr >= 0x08FA && addr <= 0x08FD) ||
+        (addr >= 0x0830 && addr <= 0x0833) ||
+        (addr >= 0x0844 && addr <= 0x0847)) {
+        {   /* [2026-08-22] FILTRE PC RETIRE : on VEUT voir les writers 0x821a/0x8213/
+             * 0x8217 (supposes « garbage ») — ce sont peut-etre les VRAIS writers du TOA
+             * que lit le firmware. + a_serv_demod (0x830/0x844, lu par FB0/FB1_SEARCH). */
             static unsigned sd_log;
             const unsigned LIMIT = 200;
             if (sd_log < LIMIT) {
-                const char *name = (addr == 0x08FA) ? "TOA"
-                                 : (addr == 0x08FB) ? "PM"
-                                 : (addr == 0x08FC) ? "ANGLE"
+                const char *name = (addr==0x08FA||addr==0x0830||addr==0x0844) ? "TOA"
+                                 : (addr==0x08FB||addr==0x0831||addr==0x0845) ? "PM"
+                                 : (addr==0x08FC||addr==0x0832||addr==0x0846) ? "ANGLE"
                                  : "SNR";
                 fprintf(stderr,
                         "[c54x] SYNC-DEMOD-WR #%u %s[0x%04x] <- 0x%04x "
@@ -7959,19 +7972,31 @@ static int c54x_exec_one(C54xState *s)
             if ((op & 0xFEFF) == 0xF48F) {
                 int src = (op >> 8) & 1;
                 int64_t val = sext40(src ? s->b : s->a);
-                /* Check bits 39 and 38 — if they differ, shift left */
                 int bit39 = (val >> 39) & 1;
                 int bit38 = (val >> 38) & 1;
-                if (bit39 != bit38) {
+                /* [2026-08-22] FIX_NORM_T — le vrai C54x NORM decale l'accu de T
+                 * (exposant produit par EXP) en un cycle, SANS ecrire T (SPRU172C).
+                 * L'ancien modele decalait 1 bit + T-- -> les paires exp;norm ISOLEES
+                 * (reference correlateur 0x796c/796d, division SNR 0x79b1) ne recalaient
+                 * jamais en pleine echelle -> reference {0,-1}, SNR minuscule. Prouve par
+                 * le firmware : 0x79ca stm #1->T puis rptb norm A = decalage variable
+                 * data-dependant, n'a de sens que si NORM decale de T. Meme classe que
+                 * FIX_SFTA_CARRY. Gate CALYPSO_FIX_NORM_T (defaut ON) ; =0 = ancien 1-bit. */
+                static int fix_norm = -1;
+                if (fix_norm < 0) fix_norm = calypso_gate("CALYPSO_FIX_NORM_T", 1);
+                if (fix_norm) {
+                    int16_t t = (int16_t)s->t;               /* compte signe */
+                    if (t >= 0) val = sext40(val << t);
+                    else        val = sext40(val >> (-t));   /* decalage arithmetique (SXM) */
+                    if (src) s->b = val; else s->a = val;
+                    /* NE PAS modifier T (SPRU172C : NORM lit T, ne l'ecrit pas) */
+                } else if (bit39 != bit38) {
                     val = sext40(val << 1);
                     if (src) s->b = val; else s->a = val;
                     s->t = (uint16_t)(s->t - 1);
                 }
-                /* TC flag: set if shift occurred */
-                if (bit39 != bit38)
-                    s->st0 |= ST0_TC;
-                else
-                    s->st0 &= ~ST0_TC;
+                if (bit39 != bit38) s->st0 |= ST0_TC;
+                else                s->st0 &= ~ST0_TC;
                 return consumed + s->lk_used;
             }
 
@@ -8261,19 +8286,24 @@ static int c54x_exec_one(C54xState *s)
                 if ((op & 0xFEFF) == 0xF48F) {
                     int src = (op >> 8) & 1;
                     int64_t val = sext40(src ? s->b : s->a);
-                    /* Check bits 39 and 38 — if they differ, shift left */
                     int bit39 = (val >> 39) & 1;
                     int bit38 = (val >> 38) & 1;
-                    if (bit39 != bit38) {
+                    /* [2026-08-22] FIX_NORM_T (copie 2, cf. ~7972) — NORM decale de T,
+                     * pas 1 bit, et n'ecrit pas T. Gate CALYPSO_FIX_NORM_T (defaut ON). */
+                    static int fix_norm_2 = -1;
+                    if (fix_norm_2 < 0) fix_norm_2 = calypso_gate("CALYPSO_FIX_NORM_T", 1);
+                    if (fix_norm_2) {
+                        int16_t t = (int16_t)s->t;
+                        if (t >= 0) val = sext40(val << t);
+                        else        val = sext40(val >> (-t));
+                        if (src) s->b = val; else s->a = val;
+                    } else if (bit39 != bit38) {
                         val = sext40(val << 1);
                         if (src) s->b = val; else s->a = val;
                         s->t = (uint16_t)(s->t - 1);
                     }
-                    /* TC flag: set if shift occurred */
-                    if (bit39 != bit38)
-                        s->st0 |= ST0_TC;
-                    else
-                        s->st0 &= ~ST0_TC;
+                    if (bit39 != bit38) s->st0 |= ST0_TC;
+                    else                s->st0 &= ~ST0_TC;
                     return consumed + s->lk_used;
                 }
                 /* F49F: DELAY (pipeline flush, NOP) */
@@ -11963,6 +11993,23 @@ static int c54x_exec_one(C54xState *s)
             int ymod_d = (op >> 2) & 0x03;
             uint16_t xval_d = data_read(s, s->ar[xar_d]);
             uint16_t yval_d = data_read(s, s->ar[yar_d]);
+            {   /* [2026-08-22] MAC-PROBE : trace le corrélateur TOA (SB/FB) au MAC
+                 * dual autour de PC=0xf170. Montre Xmem(AR5=IQ)/Ymem(AR3=référence),
+                 * leurs adresses et valeurs lues + T : tranche « référence DC (AR3) »
+                 * vs « IQ buffer non nourri (AR5, ex 0x0e4e) ». LECTURE SEULE, plafonnée.
+                 * Gate CALYPSO_MAC_PROBE. */
+                static int _mp = -1; static unsigned _mpn = 0;
+                if (_mp < 0) _mp = calypso_gate("CALYPSO_MAC_PROBE", 0);
+                if (_mp && s->pc >= 0xf150 && s->pc <= 0xf190 && _mpn < 80) {
+                    _mpn++;
+                    fprintf(stderr, "[c54x] MAC-PROBE PC=0x%04x op=0x%04x "
+                            "Xar=AR%d@0x%04x=0x%04x Yar=AR%d@0x%04x=0x%04x "
+                            "T=0x%04x AR3=0x%04x AR5=0x%04x insn=%u\n",
+                            s->pc, op, xar_d, s->ar[xar_d], xval_d,
+                            yar_d, s->ar[yar_d], yval_d, s->t,
+                            s->ar[3], s->ar[5], s->insn_count);
+                }
+            }
             /* Post-modify (SPRU131G Table 5-8) */
             switch (xmod_d) {
             case 1: s->ar[xar_d]--; break;

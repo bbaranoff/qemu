@@ -1955,6 +1955,35 @@ static uint16_t shunt_pm_decan_apm(int fallback_target)
     return calypso_trf6151_apm_for_rf(fallback_target);
 }
 
+/* [2026-08-22] MODÈLE INTÉGRATEUR RSSI HW — le vrai pm_meas natif.
+ * Sur vrai Calypso la tâche PM (md=1) ne calcule PAS a_pm depuis les samples : le
+ * DSP zéro-remplit la page résultat (PROM0 0xb446 : `stl *AR1+,A` en rptb 80), puis
+ * un intégrateur lit un REGISTRE HW de puissance (côté ABB/RF) et pose a_pm — jamais
+ * depuis 0x2a00. Ce registre n'est pas dans l'ADC modélisé ; on le MODÉLISE depuis la
+ * vraie magnitude du signal DL : g_shunt.last_pm = MAV(|I|+|Q|) mesurée dans feed_iq
+ * sur les échantillons réellement reçus. a_pm = calib_RF(20·log10(MAV/MAV_REF)+RF_REF).
+ * → a_pm SUIT le signal (aucun 0x7000 canné). L'ancrage MAV_REF→RF_REF est la
+ * calibration du frontend (comme le gain trf6151), pas une valeur décrétée : deux
+ * signaux différents donnent deux a_pm différents. Utilisé par le hook a_pm de
+ * calypso_c54x.c, qui intercepte l'écriture DSP vers data[0x834..836]/[0x848..84A]. */
+uint16_t calypso_dsp_shunt_rssi_apm(void)
+{
+    static double mav_ref = 20929.0, rf_ref = -60.0; static int init = 0;
+    if (!init) {
+        init = 1;
+        const char *mr = getenv("CALYPSO_DECAN_PM_MAV_REF"); if (mr && *mr) mav_ref = atof(mr);
+        const char *rr = getenv("CALYPSO_DECAN_PM_RF_REF");  if (rr && *rr) rf_ref = atof(rr);
+        if (mav_ref < 1.0) mav_ref = 1.0;
+    }
+    double mav = (double)g_shunt.last_pm;
+    if (mav < 1.0) mav = 1.0;
+    double rf = 20.0 * log10(mav / mav_ref) + rf_ref;
+    if (rf < -100.0) rf = -100.0;   /* plancher : suit le signal faible sans rejeter */
+    if (rf >  -30.0) rf =  -30.0;
+    int rfi = (int)(rf >= 0 ? rf + 0.5 : rf - 0.5);
+    return calypso_trf6151_apm_for_rf(rfi);
+}
+
 void calypso_dsp_shunt_on_frame_tick(void)
 {
     if (!g_shunt.active)
