@@ -528,12 +528,26 @@ void calypso_rhea_dma_rx_request(C54xState *s)
          * lit une fois sur deux (desasm PROM 0xb2c4=0x0cce / 0xb2c9=0x0d2e) ->
          * energie=0 -> d_fb_det jamais pose. Triangule doc + disasm + logs.
          * A/B : CALYPSO_RHEA_DMA_PAGE_OFF=1 restaure le dst fixe (ancien comportement). */
-        unsigned pdst = dst_idx;
+        /* [2026-08-22 soir] CORRELATEUR = 296 MOTS PLATS, PAS 2 PAGES DE 96.
+         * Le correlateur FB lit un buffer CONTIGU de 296 mots (=148 IQ @1SPS).
+         * Le ping-pong §11.3.5 a 2 pages (dst_idx / dst_idx+96 = 192 mots) repliait
+         * le burst 296 : page2->dst_idx (ecrase page0), page3->dst_idx+96 (ecrase
+         * page1). Resultat : FCCH corrompue, le correlateur pique au BORD (TOA=39).
+         * Le double-buffer HW est un artefact TEMPS-REEL (le DSP consomme la page 0
+         * pendant que le DMA remplit la page 1) ; il n'a PAS lieu d'etre quand on
+         * draine tout le burst en une passe synchrone. On ecrit donc les pages
+         * CONTIGUES : page k -> dst_idx + k*96, soit [0x0cce..0x0df6) plat -> le
+         * correlateur voit les 296 mots.
+         * A/B : CALYPSO_RHEA_DMA_PINGPONG=1 restaure l'ancien ping-pong 2-pages. */
+        unsigned pdst = dst_idx + (unsigned)(pages * max_words);
         {
-            static int pgfix = -1;
-            if (pgfix < 0) pgfix = getenv("CALYPSO_RHEA_DMA_PAGE_OFF") ? 0 : 1;
-            if (pgfix && (rd.ch[n].ctrl & CTRL_CURRENT_PAGE))
-                pdst = dst_idx + (unsigned)max_words;   /* 2e page API = AAD+ALGTH */
+            static int pingpong = -1;
+            if (pingpong < 0) pingpong = getenv("CALYPSO_RHEA_DMA_PINGPONG") ? 1 : 0;
+            if (pingpong) {
+                pdst = dst_idx;
+                if (rd.ch[n].ctrl & CTRL_CURRENT_PAGE)
+                    pdst = dst_idx + (unsigned)max_words;   /* 2e page API = AAD+ALGTH */
+            }
         }
         for (int i = 0; i < got; i++)
             if (pdst + (unsigned)i < C54X_API_SIZE)
