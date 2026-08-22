@@ -1885,7 +1885,11 @@ void calypso_bsp_deliver_buffered(uint32_t current_fn)
                         dlv_n, (unsigned)sl->fn, (unsigned)tn, n);
             dlv_n++;
         }
-        calypso_twl3025_apply_phase(sl->iq, sl->n / 2, sl->fn, (uint8_t)tn);
+        /* [2026-08-22] apply_phase DÉPLACÉ vers c54x_bsp_load (point de convergence
+         * de TOUS les feeds -> RIF). Ce chemin (deliver_buffered) n'est pas le
+         * chemin natif vivant, et l'appliquer ici seul laissait la boucle AFC
+         * ouverte sur le natif. Le laisser ici EN PLUS ferait une double rotation
+         * (deliver_buffered passe aussi par c54x_bsp_load). Retiré donc. */
 
         uint16_t samples[296];
         for (int i = 0; i < n && i < 296; i++)

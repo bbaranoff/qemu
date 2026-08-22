@@ -19773,11 +19773,31 @@ void c54x_bsp_load(C54xState *s, const uint16_t *samples, int n)
     s->bsp_len = n;
     s->bsp_pos = 0;
 
+    /* [2026-08-22] AFC AU POINT DE CONVERGENCE. La rotation VCXO (apply_phase)
+     * n'etait appliquee que dans calypso_bsp_deliver_buffered (calypso_bsp.c:1888),
+     * qui N'EST PAS le chemin natif vivant (mesure : b-bsp-load-ok=0 ; le feed passe
+     * ailleurs). Le DSP natif recevait donc des samples NON tournes -> boucle AFC
+     * OUVERTE -> le firmware integre l'erreur sans effet sur les samples -> DAC
+     * runaway (-700 -> 4095, +34 kHz) -> rotation FCCH hors capture DSP (+-20 kHz)
+     * -> TOA delirant. Ici TOUS les feeds convergent (c54x_bsp_load -> RIF), donc on
+     * applique la rotation UNE fois, sur bsp_buf (mutable), et on feede bsp_buf a la
+     * RIF. Doc CHAINE_RF_MATERIELLE.md:106 : "apply_phase juste avant c54x_bsp_load".
+     * tn=0 (FB/SB = TS0 ; un offset de phase constant ne change pas la FREQUENCE
+     * corrigee). Inerte si CALYPSO_TWL3025_AFC=0 (apply_phase retourne tot). */
+    {
+        extern void calypso_twl3025_apply_phase(int16_t *iq_samples, int n_samples,
+                                                uint32_t fn, uint8_t tn);
+        extern uint32_t calypso_trx_get_fn(void);
+        calypso_twl3025_apply_phase((int16_t *)s->bsp_buf, n / 2,
+                                    calypso_trx_get_fn(), 0);
+    }
+
     /* [2026-08-03] Le meme burst alimente la FIFO de reception du RIF, qui est
      * la voie par laquelle le firmware DSP le lit reellement (PORTR DRR apres
      * avoir vu SPCR). bsp_buf reste en place pour les sondes et pour l'ancien
-     * chemin PORTR PA=0xF430 (CALYPSO_FIX_PORTR). */
-    calypso_rif_rx_burst(s, samples, n);
+     * chemin PORTR PA=0xF430 (CALYPSO_FIX_PORTR). On feede bsp_buf (= samples
+     * tournes par l'AFC ci-dessus), pas `samples` (const, non tourne). */
+    calypso_rif_rx_burst(s, s->bsp_buf, n);
 
     /* Confirm what the PORTR PA=0x0034 serving path will hand the DSP,
      * and also flag if the DSP consumed less than half of the previous
