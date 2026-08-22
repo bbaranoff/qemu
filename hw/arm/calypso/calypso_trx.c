@@ -272,6 +272,11 @@ void calypso_trx_api_commit_w(uint32_t arm_offset, uint16_t value)
 static int64_t g_auto_fn_off = 0;
 static int     g_auto_fn_armed = 0;
 
+/* Appelee depuis calypso_dsp_shunt.c (chemin SCH gr-gsm), qui la declare en
+ * `extern`. Sans prototype visible ici, -Werror=missing-prototypes casse le
+ * build. Meme convention que calypso_dsp_shunt_set_dcch plus haut. */
+void calypso_trx_autosync_fn(uint32_t sch_fn);   /* -Werror=missing-prototypes */
+
 void calypso_trx_autosync_fn(uint32_t sch_fn)
 {
     if (g_auto_fn_armed || !g_trx) return;

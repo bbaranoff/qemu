@@ -2676,68 +2676,8 @@ static void stkw_rec(C54xState *s, uint16_t addr, uint16_t val)
     }
 }
 
-/* [2026-08-22] SCRATCH-WR (CALYPSO_SCRATCH_WR, defaut OFF) — la table de
- * coefficients du FIRS est-elle JAMAIS ecrite ?
- * FIRS-COEF a montre prog[0x61..0x66]=0xF4E4 (remplissage) ET data[0x61..0x66]=0
- * au moment de l execution. Le PROGRAMME 0x0000-0x6FFF n est couvert par aucun
- * fichier ROM (PROM0 debute a 0x7000) — c est exactement la que tombe pmad=0x61.
- *   aucune ecriture   -> segment ROM manquant ;
- *   ecriture tardive  -> ordonnancement.
- * On date (insn) et on situe (PC) chaque ecriture des DEUX espaces, avec bilan
- * periodique pour distinguer « rien ecrit » de « sonde muette ». LECTURE SEULE. */
-static int scratchwr_on(void)
-{
-    static int g = -1;
-    if (g < 0) {
-        g = calypso_gate("CALYPSO_SCRATCH_WR", 0);
-        fprintf(stderr, "[c54x] SCRATCH-WR %s : ecritures dans 0x0060-0x007F "
-                "(scratch-pad DARAM + espace PROGRAMME via MVDP) — zone des "
-                "coefficients du FIRS (pmad=0x0061)\n",
-                g ? "ACTIVE" : "INACTIVE (defaut)");
-    }
-    return g;
-}
-
-static void scratchwr_note(C54xState *s, uint16_t a, uint16_t v, const char *espace)
-{
-    if (!scratchwr_on()) return;
-    /* [2026-08-22] v2 : plafond PAR ADRESSE, jamais global. La v1 avait un
-     * plafond global de 40 lignes, consomme par data[0x74] a insn ~5000-10000 ;
-     * les ecritures des coefficients (MVDD a insn ~1376674) n ont donc jamais
-     * ete affichees et j ai lu ce plafond comme une absence. */
-    int zone = -1;
-    if (a >= 0x0060 && a <= 0x007F)      zone = 0;   /* destination */
-    else if (a >= 0x2CB0 && a <= 0x2CBF) zone = 1;   /* SOURCE de la table */
-    if (zone < 0) return;
-
-    static unsigned long long cum[2] = {0, 0};
-    static unsigned long long cum_coef = 0;   /* 0x0061..0x0066 seulement */
-    static unsigned long long cum_src  = 0;   /* 0x2CB9..0x2CBF seulement */
-    static unsigned char shown[2][0x20];
-
-    cum[zone]++;
-    if (a >= 0x0061 && a <= 0x0066) cum_coef++;
-    if (a >= 0x2CB9 && a <= 0x2CBF) cum_src++;
-
-    unsigned idx = (zone == 0) ? (unsigned)(a - 0x0060) : (unsigned)(a - 0x2CB0);
-    if (idx < 0x20 && shown[zone][idx] < 3) {
-        shown[zone][idx]++;
-        fprintf(stderr, "[c54x] SCRATCH-WR %s[0x%04x] <- 0x%04x PC=0x%04x insn=%u%s\n",
-                espace, a, v, s->pc, s->insn_count,
-                (a >= 0x0061 && a <= 0x0066) ? "  <<<< COEFFICIENTS (destination)" :
-                (a >= 0x2CB9 && a <= 0x2CBF) ? "  <<<< SOURCE de la table" : "");
-    }
-    if (((cum[0] + cum[1]) % 500) == 0)
-        fprintf(stderr, "[c54x] SCRATCH-WR bilan : scratch(0x60-0x7F)=%llu "
-                "source(0x2CB0-0x2CBF)=%llu | dont coefficients(0x61-0x66)=%llu "
-                "source utile(0x2CB9-0x2CBF)=%llu\n",
-                (unsigned long long)cum[0], (unsigned long long)cum[1],
-                (unsigned long long)cum_coef, (unsigned long long)cum_src);
-}
-
 static void data_write(C54xState *s, uint16_t addr, uint16_t val)
 {
-    scratchwr_note(s, addr, val, "data");
     {   /* [2026-08-03] HANDLER-WATCH — CALYPSO_DISPATCH_PROBE=1, lecture seule.
          *
          * data[0x43d8] est le slot du HANDLER COURANT : le dispatcher fait
@@ -7995,33 +7935,12 @@ static int c54x_exec_one(C54xState *s)
             }
 
             /* F48C/F58C: MPYA dst (mask FEFF, 1 word)
-             * [2026-08-22] FIX : AFFECTE, n'accumule PAS.
-             * SPRU172C : `MPYA dst` -> dst = T x A(32-16). C'est un MULTIPLY ;
-             * MAC accumule, MPY/MPYA affecte. L'ancien code faisait
-             * `dst = dst + T*AH` — incoherent avec ses deux voisins immediats :
-             * la forme Smem `MPYA Smem` (0x3100) fait `s->b = sext40(prod)`, et
-             * `SQUR A,dst` (0xF48D) juste dessous aussi. Le commentaire disait
-             * « accumulate into dst » : l'intention etait deja fausse.
-             * OU CA MORD : chaine du TOA en PROM0
-             *   0x7944 add *AR4,A ; 0x7945 sub #2,A ; 0x7947 mpya A ; 0x7948 add B
-             *   ... 0x795a stl B -> a_sync_demod[D_TOA]
-             * A est non nul en 0x7947, donc accumuler fausse le TOA publie.
-             * (En 0x7920 `mpya B` l'ecart est nul : B y vaut d_fb_mode = 0.)
-             * Bascule A/B : CALYPSO_ISA_MPYA_ASSIGN=0 restaure l'accumulation. */
+             * Multiply T * A(high), accumulate into dst */
             if ((op & 0xFEFF) == 0xF48C) {
-                static int _mpa = -1;
-                if (_mpa < 0) {
-                    _mpa = calypso_gate("CALYPSO_ISA_MPYA_ASSIGN", 1);
-                    fprintf(stderr, "[c54x] ISA-MPYA %s : MPYA dst = T x A(32-16)\n",
-                            _mpa ? "AFFECTE (fidele SPRU172C)"
-                                 : "ACCUMULE (ancien comportement)");
-                }
                 int dst = (op >> 8) & 1;
                 int64_t prod = (int64_t)(int16_t)s->t * (int64_t)(int16_t)((s->a >> 16) & 0xFFFF);
                 if (s->st1 & ST1_FRCT) prod <<= 1;
-                int64_t res = _mpa ? prod
-                                   : ((dst ? s->b : s->a) + prod);
-                if (dst) s->b = sext40(res); else s->a = sext40(res);
+                if (dst) s->b = sext40(s->b + prod); else s->a = sext40(s->a + prod);
                 return consumed + s->lk_used;
             }
 
@@ -9975,48 +9894,6 @@ static int c54x_exec_one(C54xState *s)
                     }
                 }
             }
-            /* [2026-08-22] FIX — les conditions ACCUMULATEUR sont evaluees
-             * pour de vrai, et le DELAI est honore.
-             *
-             * MESURE (sonde TOA-TRACE, run natif propre) :
-             *     @0x7918 BCD 0x7923 si B!=0 ... B=0
-             *     @0x7923 *** BRANCHE PRISE ***
-             * `BNEQ` avec B=0 branchait quand meme, systematiquement : le
-             * fallback ci-dessous traitait TOUT FAxx non-TC comme un
-             * branchement INCONDITIONNEL. Consequence : la route FB0
-             * (0x791c..0x7921), qui calcule TOA = (d[0x3fb4]-3)*48 + d[0x0c3d],
-             * n'etait JAMAIS empruntee — le TOA venait de la route FB1 avec
-             * cpt1[0x3fb3]=296 fige, donc hors de la plage 0..1249 attendue
-             * par osmocom (prim_fbsb.c, BITS_PER_TDMA=1250).
-             *
-             * De plus BCD est RETARDE : les 2 mots suivants s'executent AVANT
-             * le saut. Le fallback faisait `s->pc = op2` immediatement, donc le
-             * slot 0x791a `stm #0x0030` (T = 48, le pas du TOA) etait saute.
-             *
-             * PORTEE : on n'elargit qu'aux conditions ACCUMULATEUR (cc & 0x40),
-             * qui testent A ou B et sont fiables. TC/carry gardent EXACTEMENT
-             * l'ancien comportement — ce sont elles que le commentaire du
-             * 2026-05-15 accusait d'avoir casse le firmware. Les deux ensembles
-             * sont disjoints (fa_sub 2/3 implique cc & 0x40 == 0).
-             * Bascule A/B : CALYPSO_ISA_BCD_COND=0 restaure l'inconditionnel. */
-            {
-                static int _bcd = -1;
-                if (_bcd < 0) {
-                    _bcd = calypso_gate("CALYPSO_ISA_BCD_COND", 1);
-                    fprintf(stderr, "[c54x] ISA-BCD-COND %s : BCD pmad,cond "
-                            "(conditions accumulateur evaluees + 2 delay slots)\n",
-                            _bcd ? "ACTIF (fidele SPRU172C)"
-                                 : "INACTIF (branchement inconditionnel)");
-                }
-                uint8_t _cc = (uint8_t)(op & 0x7F);
-                if (_bcd && (_cc & 0x40)) {
-                    if (c54x_cond_true(s, _cc)) {
-                        s->delayed_pc  = op2;
-                        s->delay_slots = 2;
-                    }
-                    return consumed + s->lk_used;   /* non prise : on continue */
-                }
-            }
             /* NEAR FAxx fallback: simplified treat as branch (unchanged,
              * proven-safe default for every case not handled above). */
             s->pc = op2;
@@ -10292,195 +10169,8 @@ static int c54x_exec_one(C54xState *s)
             if (_e0_fam && (op & 0xFC00) == 0xE000) {
                 static unsigned _e0_n = 0;
                 if (hi8 == 0xE0) {
-                    uint16_t pmad0 = prog_fetch(s, s->pc + 1);
+                    (void)prog_fetch(s, s->pc + 1);   /* FIRS : pmad = 2e mot */
                     consumed = 2;
-                    /* [2026-08-22] FIRS-COEF (CALYPSO_FIRS_COEF, defaut OFF).
-                     * Ou sont les coefficients ? pmad=0x0061 est SOUS la fenetre
-                     * OVLY (qui commence a 0x80), donc prog_read retombe sur
-                     * s->prog[] ou rien n est charge sous 0x7000 -> 0xF4E4.
-                     * 0x0060-0x007F est le SCRATCH-PAD DARAM du C54x. On lit les
-                     * DEUX espaces au moment du FIRS :
-                     *   data[] non nul -> etendre l alias OVLY a 0x60 ;
-                     *   prog[] non nul -> MVDP les a deposes, rien a corriger ;
-                     *   les deux nuls  -> la table est ailleurs.
-                     * LECTURE SEULE, independante de CALYPSO_ISA_FIRS. */
-                    {
-                        static int _fc = -1;
-                        if (_fc < 0) {
-                            _fc = calypso_gate("CALYPSO_FIRS_COEF", 0);
-                            fprintf(stderr, "[c54x] FIRS-COEF %s : dump prog[pmad..+5] "
-                                    "ET data[pmad..+5] a chaque FIRS (pmad attendu 0x0061, "
-                                    "sous la fenetre OVLY qui debute a 0x0080)\n",
-                                    _fc ? "ACTIVE" : "INACTIVE (defaut)");
-                        }
-                        if (_fc) {
-                            static unsigned _fcn = 0;
-                            if (_fcn < 12) {
-                                _fcn++;
-                                char pb[96], db[96], sb2[96];
-                                int po = 0, dof = 0, so = 0;
-                                int nzp = 0, nzd = 0, nzs = 0;
-                                /* la SOURCE de la table : MVDD (0x833c) copie
-                                 * data[0x2cbf] en DESCENDANT vers data[0x0060]
-                                 * en montant. Si elle est vide, la destination
-                                 * l est aussi — c est le vrai point d entree. */
-                                for (int k = 0; k < 7; k++) {
-                                    uint16_t sv = s->data[0x2CB9 + k];
-                                    if (sv) nzs++;
-                                    so += snprintf(sb2 + so, sizeof(sb2) - so, " %04x", sv);
-                                }
-                                /* [2026-08-22] v3 : le tampon de burst est-il
-                                 * VIVANT a l instant ou le DSP le lit ? Toute la
-                                 * chaine (0x8202 -> 0x2cba -> MVDD -> 0x0061 ->
-                                 * FIRS) rend zero parce que l amont est nul, et
-                                 * l amont c est 0x2a00. Un tampon vide ICI n est
-                                 * pas un tampon mal ecrit : DARAM-WR-JUDGE avait
-                                 * mesure coh=0.998 A L ECRITURE, sous verrou. */
-                                /* [2026-08-22] v4 : dispersion des DEUX tampons du
-                                 * correlateur (A=0x2c56, B=0x2c88, 50 mots chacun,
-                                 * BRC=0x31). distinct==1 => il n accumule pas par
-                                 * decalage : argmax sans objet. */
-                                int dstA = 0, dstB = 0;
-                                int16_t mnA = 32767, mxA = -32768;
-                                int16_t mnB = 32767, mxB = -32768;
-                                {
-                                    int16_t va[50], vb[50];
-                                    for (int k = 0; k < 50; k++) {
-                                        va[k] = (int16_t)s->data[0x2C56 + k];
-                                        vb[k] = (int16_t)s->data[0x2C88 + k];
-                                        if (va[k] < mnA) mnA = va[k];
-                                        if (va[k] > mxA) mxA = va[k];
-                                        if (vb[k] < mnB) mnB = vb[k];
-                                        if (vb[k] > mxB) mxB = vb[k];
-                                    }
-                                    for (int k = 0; k < 50; k++) {
-                                        int dupA = 0, dupB = 0;
-                                        for (int j = 0; j < k; j++) {
-                                            if (va[j] == va[k]) dupA = 1;
-                                            if (vb[j] == vb[k]) dupB = 1;
-                                        }
-                                        if (!dupA) dstA++;
-                                        if (!dupB) dstB++;
-                                    }
-                                }
-                                int nzb = 0; unsigned long eb = 0;
-                                for (int k = 0; k < 304; k++) {
-                                    int16_t s16 = (int16_t)s->data[0x2A00 + k];
-                                    if (s16) nzb++;
-                                    eb += (unsigned long)(s16 < 0 ? -(long)s16 : (long)s16);
-                                }
-                                for (int k = 0; k < 6; k++) {
-                                    uint16_t a = (uint16_t)(pmad0 + k);
-                                    uint16_t pv = s->prog[c54x_prog_xlate(s, a)];
-                                    uint16_t dv = s->data[a];
-                                    if (pv && pv != 0xF4E4) nzp++;
-                                    if (dv) nzd++;
-                                    po  += snprintf(pb + po,  sizeof(pb) - po,  " %04x", pv);
-                                    dof += snprintf(db + dof, sizeof(db) - dof, " %04x", dv);
-                                }
-                                fprintf(stderr, "[c54x] FIRS-COEF #%u PC=0x%04x pmad=0x%04x "
-                                        "OVLY=%d | AR2=0x%04x(*=0x%04x) AR3=0x%04x AR5=0x%04x"
-                                        " | prog[]=%s (utiles=%d) | data[]=%s (utiles=%d)"
-                                        " | SOURCE data[0x2CB9..]=%s (utiles=%d)"
-                                        " | BURST 0x2a00 : %d/304 non nuls, energie=%lu,"
-                                        " *AR2=0x%04x *AR3=0x%04x"
-                                        " | CORR A(0x2c56) distinct=%d/50 [%d..%d]"
-                                        " B(0x2c88) distinct=%d/50 [%d..%d]"
-                                        " | VERDICT=%s insn=%u\n",
-                                        _fcn, s->pc, pmad0, !!(s->pmst & PMST_OVLY),
-                                        s->ar[2], s->data[s->ar[2]], s->ar[3], s->ar[5],
-                                        pb, nzp, db, nzd, sb2, nzs,
-                                        nzb, eb, s->data[s->ar[2]], s->data[s->ar[3]],
-                                        dstA, (int)mnA, (int)mxA, dstB, (int)mnB, (int)mxB,
-                                        nzd ? "SCRATCH-PAD (etendre OVLY a 0x60)"
-                                            : (nzp ? "PROGRAMME (MVDP a depose)"
-                                                   : "TABLE INTROUVABLE dans les deux espaces"),
-                                        s->insn_count);
-                            }
-                        }
-                    }
-                    /* [2026-08-22] FIRS IMPLEMENTE. Il est dans le chemin de
-                     * PRODUCTION DES BITS SOUPLES du SCH :
-                     *   0x8492 rpt #5 ; 0x8493 firs 0x0061 ; 0x8497 sth *AR6+,B
-                     * Le test de perturbation a innocente le papillon de Viterbi
-                     * (le syndrome varie des que les 78 mots d'entree sont
-                     * couverts) -> le defaut est en amont, ici.
-                     * Semantique (spru172c.md:1212) :
-                     *     B = B + A(32-16) x Pmem[pmad] ; A = (Xmem+Ymem)<<16
-                     * Sous RPT, pmad s'auto-incremente a chaque repetition.
-                     * Gate CALYPSO_ISA_FIRS=0 -> ancien comportement inerte. */
-                    static int _fi = -1;
-                    if (_fi < 0) {
-                        _fi = calypso_gate("CALYPSO_ISA_FIRS", 1);
-                        fprintf(stderr, "[c54x] ISA-FIRS %s : B += A(32-16)*Pmem[pmad] ; "
-                                "A = (Xmem+Ymem)<<16 (pmad auto-incremente sous RPT)\n",
-                                _fi ? "IMPLEMENTE"
-                                   : "ARITHMETIQUE DESACTIVEE (les pointeurs avancent quand meme)");
-                    }
-                    /* [2026-08-22] Operandes decodes HORS du gate : leurs
-                     * post-modifications doivent avoir lieu meme quand
-                     * l arithmetique est desactivee (voir plus bas). */
-                    int xmod = (op >> 6) & 0x03;
-                    int xar  = ((op >> 4) & 0x03) + 2;
-                    int ymod = (op >> 2) & 0x03;
-                    int yar  = ( op       & 0x03) + 2;
-
-                    if (_fi) {
-                        /* pmad auto-increment : meme PC repete => on avance. */
-                        static uint16_t _fpm = 0; static uint16_t _fpc = 0xFFFF;
-                        if (s->pc != _fpc) { _fpm = pmad0; _fpc = s->pc; }
-                        else               { _fpm++; }
-
-                        uint16_t xv = data_read(s, s->ar[xar]);
-                        uint16_t yv = data_read(s, s->ar[yar]);
-                        int16_t  coef = (int16_t)prog_fetch(s, _fpm);
-
-                        int64_t prod = (int64_t)(int16_t)((s->a >> 16) & 0xFFFF)
-                                     * (int64_t)coef;
-                        if (s->st1 & ST1_FRCT) prod <<= 1;
-                        s->b = sext40(s->b + prod);
-                        s->a = sext40(((int64_t)(int16_t)xv
-                                     + (int64_t)(int16_t)yv) << 16);
-                        {   static unsigned _fn2 = 0;
-                            if (_fn2 < 16) {
-                                _fn2++;
-                                fprintf(stderr, "[c54x] FIRS #%u PC=0x%04x pmad=0x%04x "
-                                        "coef(prog)=0x%04x data[pmad]=0x%04x OVLY=%d "
-                                        "Xar=AR%d@0x%04x=0x%04x "
-                                        "Yar=AR%d@0x%04x=0x%04x -> A=0x%010llx "
-                                        "B=0x%010llx insn=%u\n",
-                                        _fn2, s->pc, _fpm, (unsigned)(uint16_t)coef,
-                                        (unsigned)s->data[_fpm],
-                                        !!(s->pmst & PMST_OVLY),
-                                        xar, s->ar[xar], xv, yar, s->ar[yar], yv,
-                                        (unsigned long long)(s->a & 0xFFFFFFFFFFULL),
-                                        (unsigned long long)(s->b & 0xFFFFFFFFFFULL),
-                                        s->insn_count);
-                            }
-                        }
-                    }
-                    /* [2026-08-22] POST-MODIFICATIONS HORS DU GATE.
-                     * Un gate de diagnostic doit COMPARER, pas corrompre. Sur le
-                     * C54x, FIRS avance Xmem et Ymem, que l on modelise ou non
-                     * son arithmetique.
-                     * Mesure qui l impose (point d arret sur s->pc == 0x8478) :
-                     * avec ISA_FIRS=0, AR2 et AR3 restaient figes a 0x2a8e et
-                     * 0x2a9a sur SIX executions. La boucle RPTB de l etage
-                     * (BRC=0x8d, 142 tours) emportait alors AR3 hors du tampon de
-                     * burst jusqu a 0x2ceb, ou il ecrasait la REFERENCE DE
-                     * CORRELATION — capture au point de surveillance materiel,
-                     * six declenchements en alternance parfaite :
-                     *   0x7c50 : 0x223c -> 0x0200  (installe la reference)
-                     *   0x847a : 0x0200 -> 0x223c  (l ecrase, via AR3)
-                     * D ou tampon A du correlateur fige, argmax sans objet, SB
-                     * jamais decode.
-                     * ISA_FIRS=0 signifie desormais « pas d arithmetique », plus
-                     * « pas d instruction du tout ».
-                     * ⚠️ Effet GLOBAL comme tout correctif d ISA : le FIRS sert
-                     * ailleurs que dans le banc du SCH. */
-                    c54x_par_postmod(s, xar, xmod);
-                    c54x_par_postmod(s, yar, ymod);
-                    return consumed + s->lk_used;
                 }
                 if (_e0_n < 40) {
                     _e0_n++;
@@ -12087,9 +11777,7 @@ static int c54x_exec_one(C54xState *s)
             addr = resolve_smem(s, op, &ind);
             op2 = prog_fetch(s, s->pc + 1);
             consumed = 2;
-            {   uint16_t _mv = data_read(s, addr);
-                scratchwr_note(s, (uint16_t)op2, _mv, "prog");
-                s->prog[op2] = _mv; }
+            s->prog[op2] = data_read(s, addr);
             return consumed + s->lk_used;
         }
 
@@ -12667,66 +12355,6 @@ ba_handler:
             int64_t *acc = dst ? &s->b : &s->a;
             *acc = sext40(*acc & ((int64_t)op2 << 16));
             return consumed + s->lk_used;
-        }
-        /* [2026-08-22] 4e CLASSE — famille 0xA000-0xA1FF entiere mal decodee.
-         * binutils (doc/opcodes/tic54x-opc.c) n a qu UNE entree sur la plage :
-         *     { "add", 1,3,3, 0xA000, 0xFE00, {OP_Xmem,OP_Ymem,OP_DST} }
-         *   ADD Xmem, Ymem, dst  ->  dst = (Xmem << 16) + (Ymem << 16)
-         * Le handler qui suit la traitait comme des operations sur accumulateur
-         * (LD B,A / NEG / ABS / SAT / SFTA / SFTL) ; or celles-ci sont toutes en
-         * 0xF4xx-0xF0xx d apres la meme table (ld 0xF482, neg 0xF484, abs 0xF485,
-         * sat 0xF483, sfta 0xF460, sftl 0xF0E0). Aucune n est en 0xA0.
-         *
-         * RACINE MESUREE. Derniere instruction du corps de boucle du correlateur
-         * (RPTB 0x84b0, REA=0x84c6) :
-         *     0x84c6 : 0xA09A = add *AR3+, *AR4+, A
-         * Bas-octet 0x9A -> Xar=AR3 (*AR+), Yar=AR4 (*AR+) : les deux pointeurs
-         * d ENTREE du correlateur (0x2a27 / 0x2ae7 dans le tampon de burst).
-         * C est elle qui fait GLISSER la fenetre d un mot par decalage. L ancien
-         * code y voyait sub=0x9A, bit 7 arme, et executait un SFTL de 77 bits :
-         * aucun pointeur n avancait, les 50 decalages correlaient la meme
-         * fenetre (mesure : distinct = 3/50 et 5/50), l argmax perdait tout sens,
-         * et le SB n etait jamais decode.
-         * gr-gsm confirme la semantique : la reference repart de zero a chaque
-         * lag, c est l entree qui glisse. osmocom-bb ne correle rien lui-meme.
-         * Gate CALYPSO_ISA_A0_ADD (defaut 1) ; =0 restaure l ancien decodage.
-         * ⚠️ EFFET GLOBAL : ADD Xmem,Ymem,dst ne sert pas qu au correlateur. */
-        if ((op & 0xFE00) == 0xA000) {
-            static int _a0 = -1;
-            if (_a0 < 0) {
-                _a0 = calypso_gate("CALYPSO_ISA_A0_ADD", 1);
-                fprintf(stderr, "[c54x] ISA-A0-ADD %s : 0xA000-0xA1FF = "
-                        "ADD Xmem,Ymem,dst (dst = (Xmem+Ymem)<<16, post-modif des "
-                        "DEUX pointeurs) au lieu des operations accumulateur\n",
-                        _a0 ? "ACTIF" : "INACTIF (ancien decodage)");
-            }
-            if (_a0) {
-                int xmod = (op >> 6) & 0x03;
-                int xar  = ((op >> 4) & 0x03) + 2;
-                int ymod = (op >> 2) & 0x03;
-                int yar  = ( op       & 0x03) + 2;
-                int64_t *dst = ((op >> 8) & 1) ? &s->b : &s->a;
-                int16_t xv = (int16_t)data_read(s, s->ar[xar]);
-                int16_t yv = (int16_t)data_read(s, s->ar[yar]);
-                *dst = sext40(((int64_t)xv + (int64_t)yv) << 16);
-                c54x_par_postmod(s, xar, xmod);
-                c54x_par_postmod(s, yar, ymod);
-                {   static int _t = -1; static unsigned _tn = 0;
-                    if (_t < 0) _t = calypso_gate("CALYPSO_ISA_A0_TRACE", 0);
-                    if (_t && _tn < 24) {
-                        _tn++;
-                        fprintf(stderr, "[c54x] A0-ADD #%u PC=0x%04x op=0x%04x "
-                                "Xar=AR%d@0x%04x=%d Yar=AR%d@0x%04x=%d -> %s"
-                                "=0x%010llx | AR%d->0x%04x AR%d->0x%04x insn=%u\n",
-                                _tn, s->pc, op, xar, s->ar[xar], (int)xv,
-                                yar, s->ar[yar], (int)yv,
-                                ((op >> 8) & 1) ? "B" : "A",
-                                (unsigned long long)(*dst & 0xFFFFFFFFFFULL),
-                                xar, s->ar[xar], yar, s->ar[yar], s->insn_count);
-                    }
-                }
-                return consumed + s->lk_used;
-            }
         }
         if (hi8 == 0xA0) {
             /* A0xx: accumulator operations — LD/NEG/ABS/NOT/SFTA/SFTL/SAT
@@ -15805,92 +15433,6 @@ int c54x_run(C54xState *s, int n_insns)
          * quel slot est lu ? AR7 = l index de dispatch. data[AR7] = handler choisi
          * (0xab38 idle = storm). data[0x43c0] = le pointeur go-live (0xa4c7) VOISIN.
          * Montre si le terminal lit le mauvais slot (0x4387 idle au lieu de 0x43c0). */
-        /* [2026-08-22] FIRS-BANK (CALYPSO_FIRS_BANK, defaut OFF) — le banc de
-         * filtres polyphase de PROM0 est-il entre par son PROLOGUE ou au MILIEU ?
-         * Huit FIRS en quatre paires (pmad 0x64,0x63,0x62,0x61), precedes d un
-         * prologue qui charge AR2/AR5 <- 0x0060 puis d une table de dispatch de
-         * six entrees en 0x8359..0x8363. Sur deux runs le premier FIRS execute
-         * est TOUJOURS 0x8478 (dernier etage), et rien n ecrit le tampon
-         * 0x0060..0x0066 qui est pourtant le Xmem du FIRS.
-         * On compte le passage par chaque site : « jamais atteint » se distingue
-         * ainsi de « atteint puis silencieux ». LECTURE SEULE. */
-        {
-            static int _fb = -1;
-            if (_fb < 0) {
-                _fb = calypso_gate("CALYPSO_FIRS_BANK", 0);
-                fprintf(stderr, "[c54x] FIRS-BANK %s : prologue (0x8336/0x834b/0x834f), "
-                        "table de dispatch (0x8359..0x8363) et six etages du banc\n",
-                        _fb ? "ACTIVE" : "INACTIVE (defaut)");
-            }
-            if (_fb) {
-                static const uint16_t sites[] = {
-                    0x8336, 0x834b, 0x834f,                       /* prologue   */
-                    0x8359, 0x835b, 0x835d, 0x835f, 0x8361, 0x8363, /* dispatch */
-                    0x8365, 0x8394, 0x83c9, 0x83ff, 0x8435, 0x846b  /* etages   */
-                };
-                static const char *quoi[] = {
-                    "PROLOGUE stm #0x60,AR2", "PROLOGUE stm #0x60,AR5", "PROLOGUE branche table",
-                    "DISPATCH->0x8365", "DISPATCH->0x8394", "DISPATCH->0x83c9",
-                    "DISPATCH->0x83ff", "DISPATCH->0x8435", "DISPATCH->0x846b",
-                    "ETAGE 0x8365", "ETAGE 0x8394", "ETAGE 0x83c9",
-                    "ETAGE 0x83ff", "ETAGE 0x8435", "ETAGE 0x846b"
-                };
-                static unsigned long long hits[15];
-                static unsigned shown[15];
-                for (int k = 0; k < 15; k++) {
-                    if (exec_pc != sites[k]) continue;
-                    hits[k]++;
-                    if (shown[k] < 3) {
-                        shown[k]++;
-                        fprintf(stderr, "[c54x] FIRS-BANK 0x%04x %-24s #%llu "
-                                "AR2=0x%04x AR3=0x%04x AR5=0x%04x AR6=0x%04x insn=%u\n",
-                                sites[k], quoi[k], (unsigned long long)hits[k],
-                                s->ar[2], s->ar[3], s->ar[5], s->ar[6], s->insn_count);
-                    }
-                    break;
-                }
-                {   /* bilan periodique : qui a ete atteint, qui jamais */
-                    static unsigned long long tick = 0;
-                    if ((++tick % 4000000) == 0) {
-                        fprintf(stderr, "[c54x] FIRS-BANK bilan :");
-                        for (int k = 0; k < 15; k++)
-                            fprintf(stderr, " %04x=%llu", sites[k],
-                                    (unsigned long long)hits[k]);
-                        fprintf(stderr, "\n");
-                    }
-                }
-            }
-        }
-        /* [2026-08-22] CORR-SLIDE (CALYPSO_CORR_SLIDE, defaut OFF) — la fenetre
-         * du correlateur glisse-t-elle ? distinct=3..4 sur 50 decalages alors que
-         * le tampon de burst est vivant : les sorties viennent par plages
-         * identiques. On regarde AR1..AR5 et les accumulateurs aux trois points
-         * cles de chaque tour du RPTB 0x84b0..0x84c6. LECTURE SEULE. */
-        {
-            static int _cs = -1;
-            if (_cs < 0) {
-                _cs = calypso_gate("CALYPSO_CORR_SLIDE", 0);
-                fprintf(stderr, "[c54x] CORR-SLIDE %s : AR1..AR5 + accumulateurs en "
-                        "0x84b4 (entree tour), 0x84bc (store A) et 0x84c5 (store B)\n",
-                        _cs ? "ACTIVE" : "INACTIVE (defaut)");
-            }
-            if (_cs && (exec_pc == 0x84b4 || exec_pc == 0x84bc || exec_pc == 0x84c5)) {
-                static unsigned _n = 0;
-                if (_n < 24) {
-                    _n++;
-                    const char *ou = (exec_pc == 0x84b4) ? "entree tour" :
-                                     (exec_pc == 0x84bc) ? "store A    " : "store B    ";
-                    fprintf(stderr, "[c54x] CORR-SLIDE #%2u 0x%04x %s | AR0=%d "
-                            "AR1=0x%04x AR2=0x%04x AR3=0x%04x AR4=0x%04x AR5=0x%04x "
-                            "| A=0x%010llx B=0x%010llx BK=0x%04x insn=%u\n",
-                            _n, exec_pc, ou, (int)(int16_t)s->ar[0],
-                            s->ar[1], s->ar[2], s->ar[3], s->ar[4], s->ar[5],
-                            (unsigned long long)(s->a & 0xFFFFFFFFFFULL),
-                            (unsigned long long)(s->b & 0xFFFFFFFFFFULL),
-                            s->bk, s->insn_count);
-                }
-            }
-        }
         if (exec_pc == 0xb40e || exec_pc == 0xb40f) {
             static unsigned tn = 0;
             if (tn++ < 8)
