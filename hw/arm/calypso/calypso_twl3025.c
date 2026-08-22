@@ -173,10 +173,17 @@ double calypso_twl3025_get_afc_phase_step(void)
     if (!twl.afc_enabled) return 0.0;   /* CALYPSO_TWL3025_AFC=0 → pas de rotation AFC */
     double hz = calypso_twl3025_get_afc_hz();
     if (hz == 0.0) return 0.0;
-    /* Phase step per sample = 2π × freq / fs.
-     * Signe : VCXO + → osc UP → received baseband freq DOWN (down-conv).
-     * Compensation = rotation samples par -phase_step. */
-    return -2.0 * M_PI * hz / GSM_SAMPLE_RATE_HZ;
+    /* Phase step per sample = ±2π × freq / fs.
+     * [2026-08-22] SIGNE INVERSÉ (- -> +). Une fois la boucle AFC réellement
+     * fermée (apply_phase déplacé dans c54x_bsp_load, point de convergence des
+     * feeds), l'ancien signe (-) donnait un feedback POSITIF : la DAC partait en
+     * runaway (-700 -> 4095, +34 kHz) au lieu de converger vers -700. Le
+     * raisonnement d'origine « VCXO+ -> baseband DOWN -> -phase_step » ne
+     * correspond pas au signe de la mesure freq_error du DSP émulé. Défaut = +
+     * (converge) ; A/B : CALYPSO_TWL3025_AFC_SIGN_OLD=1 restaure l'ancien -. */
+    static int sign_old = -1;
+    if (sign_old < 0) sign_old = getenv("CALYPSO_TWL3025_AFC_SIGN_OLD") ? 1 : 0;
+    return (sign_old ? -1.0 : 1.0) * 2.0 * M_PI * hz / GSM_SAMPLE_RATE_HZ;
 }
 
 void calypso_twl3025_apply_phase(int16_t *iq_samples, int n_samples,
