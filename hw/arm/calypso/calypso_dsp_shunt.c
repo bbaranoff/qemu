@@ -3316,6 +3316,9 @@ static void shunt_gsmtap_init(void)
  * SHUNT_CANNED_BSIC. C'est le "DSP qui poste son decode SCH dans le NDB". */
 static int g_sch_fd = -1;
 
+/* [2026-08-22] auto-recalage FN sur SCH (calypso_trx.c) — decl scope FICHIER. */
+extern void calypso_trx_autosync_fn(uint32_t sch_fn);
+
 static void shunt_sch_read(void *opaque)
 {
     uint8_t buf[64];
@@ -3369,6 +3372,9 @@ static void shunt_sch_read(void *opaque)
                         "delta=%d sch%%51=%u toa=%d\n",
                         (unsigned)fn, trx_fn, d, (unsigned)((uint32_t)fn % 51),
                         (int)g_shunt.sb_toa);
+            /* [2026-08-22] VRAI FIX : recaler l'horloge FN sur ce SCH (1er SCH ->
+             * offset auto figé). Remplace la béquille codée en dur CALYPSO_DL_FN_OFFSET. */
+            calypso_trx_autosync_fn((uint32_t)fn);
         }
     }
 }

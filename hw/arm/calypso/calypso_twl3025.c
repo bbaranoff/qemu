@@ -161,10 +161,29 @@ double calypso_twl3025_get_afc_hz(void)
 {
     twl3025_lazy_env();
     if (twl.force_hz != 0) return (double)twl.force_hz;
-    /* Effective DAC = écriture firmware - calibration baseline.
-     * Cf comment en tête du fichier sur la sémantique baseline. */
+    /* Effective DAC = écriture firmware - calibration baseline (-700 = calib E88,
+     * effective=0 au reset firmware, PAS de hack d'init). */
     int32_t effective_dac = (int32_t)twl.dac_value - TWL3025_AFC_INITIAL_DAC_VALUE;
-    return (double)effective_dac * TWL3025_AFC_SLOPE_HZ_PER_LSB;
+
+    /* [2026-08-22] PENTE VCXO BAND-AWARE — le vrai fix (relire osmocom afc.c).
+     * afc_correct() choisit AFC_NORM_FACTOR selon la BANDE : GSM/850 -> 2^15/947
+     * (=34.6), tout le reste (DCS/PCS) -> 2^15/1894 (=17.3, moitié). Physique : le
+     * VCXO 13 MHz est multiplié jusqu'au LO (900 vs 1800 MHz), donc UN LSB DAC
+     * décale le baseband DEUX FOIS plus en DCS. Pour un gain de boucle = 1, la
+     * pente Hz/LSB de l'émulateur doit suivre : GSM = slope/34.6 = 8.29 ; DCS =
+     * slope/17.3 = 16.6 (×2). L'ému hardcodait la valeur GSM -> en DCS (ARFCN 514)
+     * gain = 0.5 -> l'AFC sous-corrige, converge trop lentement vers le null, et le
+     * reset FBSB l'interrompt avant -> TOA reste bloqué à r39=39 au lieu de 23.
+     * Sélection par CALYPSO_TWL3025_AFC_BAND (défaut GSM ; =DCS/1800/PCS -> ×2). */
+    static double hz_lsb = 0.0;
+    if (hz_lsb == 0.0) {
+        const char *b = getenv("CALYPSO_TWL3025_AFC_BAND");
+        int dcs = (b && (b[0]=='D' || b[0]=='d' || b[0]=='P' || b[0]=='p' ||
+                         (b[0]=='1' && b[1]=='8')));   /* DCS / PCS / 1800 */
+        hz_lsb = dcs ? (TWL3025_AFC_SLOPE / (TWL3025_AFC_NORM_FACTOR_GSM / 2.0))
+                     : TWL3025_AFC_SLOPE_HZ_PER_LSB;
+    }
+    return (double)effective_dac * hz_lsb;
 }
 
 double calypso_twl3025_get_afc_phase_step(void)

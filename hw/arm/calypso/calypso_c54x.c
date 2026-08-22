@@ -19729,6 +19729,12 @@ void c54x_wake(C54xState *s)
     s->idle = false;
 }
 
+/* [2026-08-22] déclarations au scope FICHIER (évite -Wnested-externs). */
+extern void calypso_twl3025_apply_phase(int16_t *iq_samples, int n_samples,
+                                        uint32_t fn, uint8_t tn);
+extern uint32_t calypso_trx_get_fn(void);
+/* calypso_dsp_shunt_get_task_md() : déjà déclaré via calypso_dsp_shunt.h inclus. */
+
 void c54x_bsp_load(C54xState *s, const uint16_t *samples, int n)
 {
     if (n > 2048) n = 2048;
@@ -19773,6 +19779,36 @@ void c54x_bsp_load(C54xState *s, const uint16_t *samples, int n)
     s->bsp_len = n;
     s->bsp_pos = 0;
 
+    /* [2026-08-22] NORMALISATION DU RATE — UN SEUL point de décimation. Les feeds
+     * natifs arrivent à des rates INCOHERENTS : g_shunt.last_iq (route shunt, = le
+     * MEME feed que shunt_legit) est @4SPS BRUT (1083333 Hz = 4×270833, non décimé,
+     * cf. osmo-trx rx-sps=4) ; le chemin BSP deliver_buffered décime déjà ÷4 @1SPS.
+     * Selon le chemin actif, c54x_bsp_load recevait donc du 4SPS OU du 1SPS -> le
+     * corrélateur + apply_phase (qui veulent 1SPS, FCCH=+pi/2/samp) manglaient les
+     * bursts 4SPS -> dphi incohérent (tonalité repliée à DC). On décime ÷DECIM ICI,
+     * mais UNIQUEMENT si l'entrée est sur-échantillonnée (n indique 4SPS : 148 sym
+     * ×4×2 = 1184 mots, vs 296 @1SPS) -> jamais de double-décim, sortie TOUJOURS
+     * 1SPS, tous les chemins uniformes (comme shunt_legit).
+     * DECIM = CALYPSO_BSP_IQ_DECIM (défaut 4). */
+    {
+        static int decim = -1;
+        if (decim < 0) {
+            const char *d = getenv("CALYPSO_BSP_IQ_DECIM");
+            decim = (d && *d) ? atoi(d) : 4;
+            if (decim < 1) decim = 1;
+        }
+        if (decim > 1 && n > 2 * 296) {          /* 4SPS détecté (n ~1184) */
+            int oc = 0;
+            for (int k = 0; (k * decim) * 2 + 1 < n; k++) {
+                s->bsp_buf[2 * oc]     = s->bsp_buf[2 * (k * decim)];
+                s->bsp_buf[2 * oc + 1] = s->bsp_buf[2 * (k * decim) + 1];
+                oc++;
+            }
+            n = oc * 2;                          /* n devient le compte 1SPS */
+            s->bsp_len = n;
+        }
+    }
+
     /* [2026-08-22] AFC AU POINT DE CONVERGENCE. La rotation VCXO (apply_phase)
      * n'etait appliquee que dans calypso_bsp_deliver_buffered (calypso_bsp.c:1888),
      * qui N'EST PAS le chemin natif vivant (mesure : b-bsp-load-ok=0 ; le feed passe
@@ -19784,20 +19820,42 @@ void c54x_bsp_load(C54xState *s, const uint16_t *samples, int n)
      * RIF. Doc CHAINE_RF_MATERIELLE.md:106 : "apply_phase juste avant c54x_bsp_load".
      * tn=0 (FB/SB = TS0 ; un offset de phase constant ne change pas la FREQUENCE
      * corrigee). Inerte si CALYPSO_TWL3025_AFC=0 (apply_phase retourne tot). */
-    {
-        extern void calypso_twl3025_apply_phase(int16_t *iq_samples, int n_samples,
-                                                uint32_t fn, uint8_t tn);
-        extern uint32_t calypso_trx_get_fn(void);
-        calypso_twl3025_apply_phase((int16_t *)s->bsp_buf, n / 2,
-                                    calypso_trx_get_fn(), 0);
-    }
+    calypso_twl3025_apply_phase((int16_t *)s->bsp_buf, n / 2,
+                                calypso_trx_get_fn(), 0);
 
     /* [2026-08-03] Le meme burst alimente la FIFO de reception du RIF, qui est
      * la voie par laquelle le firmware DSP le lit reellement (PORTR DRR apres
      * avoir vu SPCR). bsp_buf reste en place pour les sondes et pour l'ancien
      * chemin PORTR PA=0xF430 (CALYPSO_FIX_PORTR). On feede bsp_buf (= samples
      * tournes par l'AFC ci-dessus), pas `samples` (const, non tourne). */
-    calypso_rif_rx_burst(s, s->bsp_buf, n);
+    /* [2026-08-22] GATING FN — ne pousser au RIF/corrélateur QUE les bursts de
+     * trame FCCH pendant l'acquisition FB. RACINE (workflow): ce feed n'avait AUCUN
+     * gate FN (DIRECT_FEED bypasse le match), donc le buffer corrélateur 0x0cce
+     * recevait TOUS les bursts (surtout non-FCCH), mélangés/écrasés -> magnitude
+     * VARIABLE (~100..28000, vs FCCH constant) -> surface de corrélation plate ->
+     * argmax = bord de fenêtre r39 -> TOA=39 (jamais 23). En ne feedant que les
+     * trames FCCH {1,11,21,31,41} (offset ému, cf. calypso_dsp_shunt.c:3710), le
+     * corrélateur ne voit que la vraie tonalité. Gate CALYPSO_RIF_FCCH_ONLY (défaut
+     * OFF, réversible). On ne gate QU'en mode FB (d_task_md 5/8) pour ne pas priver
+     * les autres tâches (SB/NB) de leur burst. */
+    {
+        static int rif_fcch = -1;
+        if (rif_fcch < 0) rif_fcch = calypso_gate("CALYPSO_RIF_FCCH_ONLY", 0);
+        int _push = 1;
+        if (rif_fcch) {
+            /* On filtre en FB (task_md 5/8) ET en IDLE (0) : le stage RIF ne garde
+             * que le DERNIER burst poussé ; si on laisse passer les bursts non-FCCH
+             * de l'idle (87% du temps), le DMA FB draine un burst pollué. On ne
+             * filtre PAS en SB (6) / NB : ces tâches ont besoin de LEUR trame. */
+            uint16_t _md = calypso_dsp_shunt_get_task_md();   /* FB=5, TCH_FB=8, SB=6 */
+            if (_md == 5 || _md == 8 || _md == 0) {
+                int _p = (int)(calypso_trx_get_fn() % 51u);
+                _push = ((_p % 10) == 1) && (_p <= 41);       /* FCCH ∈ {1,11,21,31,41} */
+            }
+        }
+        if (_push)
+            calypso_rif_rx_burst(s, s->bsp_buf, n);
+    }
 
     /* Confirm what the PORTR PA=0x0034 serving path will hand the DSP,
      * and also flag if the DSP consumed less than half of the previous
