@@ -5233,21 +5233,6 @@ static uint16_t c54x_circ_ref(uint16_t ar, int step, uint16_t bk)
     return (uint16_t)(base + idx);
 }
 
-/* [2026-08-22] Post-modification d'un AR pour les familles dual-operand et
- * parallele (SPRU131G Table 5-8) :
- *   00 = *ARi (aucune)   01 = *ARi-   10 = *ARi+   11 = *ARi+0% (circulaire BK)
- * Utilise c54x_circ_ref, la reference canonique corrigee le 2026-07-29 (base
- * alignee sur 2^N, PAS sur une grille de multiples de BK). */
-static void c54x_par_postmod(C54xState *s, int ar, int mod)
-{
-    switch (mod) {
-    case 1: s->ar[ar]--; break;
-    case 2: s->ar[ar]++; break;
-    case 3: s->ar[ar] = c54x_circ_ref(s->ar[ar], +(int16_t)s->ar[0], s->bk); break;
-    default: break;
-    }
-}
-
 /* Resolve Smem operand: direct or indirect addressing.
  * Returns the data memory address. */
 static uint16_t resolve_smem(C54xState *s, uint16_t opcode, bool *indirect)
@@ -12328,112 +12313,6 @@ ba_handler:
         goto unimpl;
 
     case 0xC: case 0xD:
-        /* ================================================================
-         * [2026-08-22] FIX ISA STRUCTUREL — famille parallele
-         *     ST src,Ymem || <op> Xmem,dst      (1 MOT, SPRU172C 4-177..4-185)
-         *
-         * RACINE. Toute la plage 0xC000-0xDFFF est UNE seule famille (table
-         * binutils versee au depot, doc/opcodes/tic54x-opc.c L477-493 : quatre
-         * entrees "st" de masque 0xFC00 + celles de 0xD000/D400/D800/DC00,
-         * toutes marquees FL_PAR). L'emulateur la decoupait en instructions
-         * SANS RAPPORT, dont deux de 2 MOTS :
-         *     0xC2/C3/C6/C7 -> RPTB[D] pmad (2 mots)   0xC4 -> PSHD dmad (2 mots)
-         *     0xC0/C1 -> PSHD/RPT Smem                 0xCC -> SACCD
-         *     0xDA -> RPTBD (2 mots)                   0xDF -> DELAY Smem
-         *     0xC5/CD/CE/CF/DD/DE -> NOP muet
-         * Or le VRAI RPTB est 0xF072 et RPTBD 0xF272 (deja corrects ailleurs),
-         * PSHD 0x4B00, RPT Smem 0x4700, SACCD 0x9E00, DELAY 0x4D00.
-         *
-         * EFFET MESURE. Le noyau du correlateur FB/SB (PDROM 0xf16c..0xf17e,
-         * boucle `rptbd 0xf178`) est bati sur cette famille :
-         *     0xf172 c780 = ST||SUB    0xf173 ce91 = ST||MPY
-         *     0xf176 c709 = ST||SUB    0xf178 ce98 = ST||MPY
-         * Decodes en RPTB de 2 mots, ils (a) avalaient le mot suivant -> flux
-         * d'instructions desynchronise, (b) ecrasaient rea/rsa/rptb_active/BRAF
-         * de la boucle rptbd VIVANTE qui les contient. La surface de correlation
-         * etait donc calculee sur un programme different de celui du silicium ->
-         * pic faux -> argmax faux -> a_sync_demod[D_TOA] = mot arbitraire
-         * (osmocon : TOA=-7791 / -3691 / +8026 / -28903, hors plage 0..156)
-         * et d_fb_det=1 seulement ~1 fois sur 95.
-         *
-         * SEMANTIQUE (SPRU172C, encodage `1100xxSD`/`1101RSD` XXXXYYYY) :
-         *   store   : Ymem = (src << ASM) >> 16          (src = b9, PAS b8)
-         *   op      : C0-C3 dst += Xmem<<16 | C4-C7 dst = Xmem<<16 - dst
-         *             C8-CB dst  = Xmem<<16 | CC-CF dst = T*Xmem
-         *             D0-D7 dst += T*Xmem   | D8-DF dst -= T*Xmem  (R=b10 arrondi)
-         *   Xmem est lu AVANT le store (« If src is equal to dst, the value
-         *   stored in Ymem is the value of src before the execution »).
-         *   T n'est JAMAIS ecrit par cette famille.
-         *
-         * /!\ EFFET GLOBAL, comme tout correctif d'ISA : cette famille sert aussi
-         * aux filtres, au Viterbi et aux tampons I/Q. Bascule A/B :
-         * CALYPSO_ISA_PAR_ST=0 restaure INTEGRALEMENT l'ancien decodage (les
-         * anciennes branches sont conservees telles quelles ci-dessous).
-         * A verifier en shunt_legit : camp + LU + SMS, comme pour LDK8_SHIFT16.
-         * Source de verite : doc/RAPPORT_OPCODES.md section A (C-1..C-9).
-         * ================================================================ */
-        {
-            static int _par_st = -1;
-            if (_par_st < 0) {
-                _par_st = calypso_gate("CALYPSO_ISA_PAR_ST", 1);
-                fprintf(stderr, "[c54x] ISA-PAR-ST %s : 0xC000-0xDFFF = "
-                        "ST src,Ymem || add/sub/ld/mpy/mac[r]/mas[r] Xmem,dst (1 mot)\n",
-                        _par_st ? "ACTIF (fidele SPRU172C)"
-                                : "INACTIF (ancien decodage RPTB/PSHD/SACCD/NOP)");
-            }
-            if (_par_st) {
-                int s_acc = (op >> 9) & 1;        /* S = b9 : acc source du ST        */
-                int d_acc = (op >> 8) & 1;        /* D = b8 : acc destination de l'op */
-                int xmod  = (op >> 6) & 3;
-                int xar   = ((op >> 4) & 3) + 2;  /* Xmem : AR2..AR5 */
-                int ymod  = (op >> 2) & 3;
-                int yar   = ( op       & 3) + 2;  /* Ymem : AR2..AR5 */
-                uint16_t xaddr = s->ar[xar];
-                uint16_t yaddr = s->ar[yar];
-                uint16_t xval  = data_read(s, xaddr);   /* lu AVANT le store */
-                int64_t  sv    = s_acc ? s->b : s->a;
-                int64_t *dstp  = d_acc ? &s->b : &s->a;
-                int      ash   = asm_shift(s);
-                int64_t  sh    = (ash >= 0) ? (sv << ash) : (sv >> (-ash));
-                int64_t  xs    = (int64_t)(int16_t)xval;
-                int64_t  prod;
-
-                /* ST src,Ymem : Ymem = (src << ASM) >> 16 */
-                data_write(s, yaddr, (uint16_t)((sh >> 16) & 0xFFFF));
-
-                switch ((op >> 10) & 7) {         /* bits 12:10 = sous-classe */
-                case 0:  /* C0-C3 : || ADD Xmem,dst */
-                    *dstp = sext40(*dstp + (xs << 16));
-                    break;
-                case 1:  /* C4-C7 : || SUB Xmem,dst  ->  Xmem<<16 - dst */
-                    *dstp = sext40((xs << 16) - *dstp);
-                    break;
-                case 2:  /* C8-CB : || LD Xmem,dst */
-                    *dstp = sext40(xs << 16);
-                    break;
-                case 3:  /* CC-CF : || MPY Xmem,dst */
-                    prod = (int64_t)(int16_t)s->t * xs;
-                    if (s->st1 & ST1_FRCT) prod <<= 1;
-                    *dstp = sext40(prod);
-                    break;
-                default: /* D0-D7 MAC[R] (b11=0) , D8-DF MAS[R] (b11=1) */
-                    prod = (int64_t)(int16_t)s->t * xs;
-                    if (s->st1 & ST1_FRCT) prod <<= 1;
-                    if (op & 0x0400) {            /* R = b10 : arrondi */
-                        prod += 0x8000;
-                        prod &= ~0xFFFFLL;
-                    }
-                    *dstp = sext40((op & 0x0800) ? (*dstp - prod)
-                                                 : (*dstp + prod));
-                    break;
-                }
-                /* T n'est PAS modifie (contrairement a l'ancien handler MAC dual). */
-                c54x_par_postmod(s, xar, xmod);
-                c54x_par_postmod(s, yar, ymod);
-                return consumed + s->lk_used;
-            }
-        }
-        /* ---- ci-dessous : ANCIEN decodage, conserve pour CALYPSO_ISA_PAR_ST=0 ---- */
         /* C/Dxxx: PSHM, POPM, PSHD, POPD, RPT, FRAME, etc. */
 
         /* ---- Dual-operand MAC/MAS Xmem, Ymem, dst (1-word) ----
