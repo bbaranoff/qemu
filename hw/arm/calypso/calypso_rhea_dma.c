@@ -520,8 +520,24 @@ void calypso_rhea_dma_rx_request(C54xState *s)
         if (got <= 0)
             break;
 
+        /* [2026-08-22] DOUBLE-BUFFER §11.3.5 (CAL207) — la destination SUIT
+         * CURRENT_PAGE. Doc DMA_CTRL bit4 : « 0 = 1re page API, 1 = 2e page API,
+         * automatiquement mis a jour pendant le transfert ». Page 0 = AAD
+         * (dst_idx), page 1 = AAD+ALGTH (dst_idx+max_words). L'ancien code ecrivait
+         * TOUJOURS dst_idx -> la 2e page (0x0d2e) restait VIDE, alors que le DSP y
+         * lit une fois sur deux (desasm PROM 0xb2c4=0x0cce / 0xb2c9=0x0d2e) ->
+         * energie=0 -> d_fb_det jamais pose. Triangule doc + disasm + logs.
+         * A/B : CALYPSO_RHEA_DMA_PAGE_OFF=1 restaure le dst fixe (ancien comportement). */
+        unsigned pdst = dst_idx;
+        {
+            static int pgfix = -1;
+            if (pgfix < 0) pgfix = getenv("CALYPSO_RHEA_DMA_PAGE_OFF") ? 0 : 1;
+            if (pgfix && (rd.ch[n].ctrl & CTRL_CURRENT_PAGE))
+                pdst = dst_idx + (unsigned)max_words;   /* 2e page API = AAD+ALGTH */
+        }
         for (int i = 0; i < got; i++)
-            api[dst_idx + i] = buf[i];
+            if (pdst + (unsigned)i < C54X_API_SIZE)
+                api[pdst + i] = buf[i];
 
         for (int i = 0; i < got; i++)
             if (buf[i]) nz_total++;
