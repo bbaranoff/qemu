@@ -9088,8 +9088,22 @@ static int c54x_exec_one(C54xState *s)
                         const char *e = getenv("CALYPSO_FIX_LK_SHFT");
                         fix = (e && *e && atoi(e)) ? 1 : 0;
                     }
-                    if (fix && subop >= 1 && subop <= 5)
+                    if (fix && subop >= 1 && subop <= 5 && (shift_raw & 0x8)) {
+                        /* COMPTEUR DE PORTEE. Le niveau 3 de fixes.env n a de sens
+                         * que si le correctif s EXECUTE sur le banc teste : un sas
+                         * jamais atteint donnerait un A/B identique et un faux
+                         * "aucun effet negatif". On compte donc les fois ou il
+                         * CHANGE effectivement le resultat (shift_raw >= 8, seul
+                         * cas ou signe et non signe divergent) et on l annonce
+                         * periodiquement. Sans cette ligne, l A/B n est pas lisible. */
+                        static unsigned long chg = 0;
+                        if (++chg == 1 || (chg % 20000) == 0)
+                            fprintf(stderr, "[c54x] FIX_LK_SHFT ACTIF #%lu "
+                                    "pc=0x%04x op=0x%04x subop=%d shift %d -> %d insn=%u\n",
+                                    chg, s->pc, op, subop,
+                                    shift_raw - 16, shift_raw, s->insn_count);
                         shift = shift_raw;          /* OP_SHFT : non signe, 0..15 */
+                    }
                 }
                 int src_b     = (op >> 9) & 1;
                 int dst_b     = (op >> 8) & 1;
