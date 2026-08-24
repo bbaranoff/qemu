@@ -6987,6 +6987,149 @@ static int c54x_exec_one(C54xState *s)
                         old, oldpg, s->insn_count);
         }
     }
+    /* === SBFN-PROBE (read-only, gate CALYPSO_SBFN) ============================
+     * Question : quelle trame le tampon DARAM contient-il AU MOMENT ou la tache
+     * SB (0x9841) le lit ? calypso_bsp.c:1600 documente que par defaut TOUTES les
+     * trames ecrivent 0x2a00, donc ~9 bursts non-FCCH s intercalent entre deux
+     * FCCH. Si le SB correle un burst quelconque, le mot SCH sort invalide et le
+     * DSP arme B_SCH_CRC a juste titre -- panne de TIMING, pas de traitement.
+     * On imprime : fn du dernier depot, fn%51 (SCH = {1,11,21,31,41}), combien de
+     * bursts ont ete deposes depuis le SB precedent, et l amplitude du tampon.
+     * Aucune ecriture : cette sonde ne peut rien changer au comportement. */
+    if (s->pc == 0x9841) {
+        static int on = -1;
+        if (on < 0) { const char *e = getenv("CALYPSO_SBFN"); on = (e && *e && atoi(e)) ? 1 : 0; }
+        if (on) {
+            static unsigned n = 0, prevwr = 0;
+            if (n++ < 400) {
+                int mn = 32767, mx = -32768; long en = 0;
+                for (int k = 0; k < 296; k++) {
+                    int v = (int16_t)s->data[(uint16_t)(0x2a00 + k)];
+                    if (v < mn) mn = v; if (v > mx) mx = v; en += (long)v * v;
+                }
+                unsigned fn = calypso_daram_last_fn;
+                fprintf(stderr, "[c54x] SBFN-PROBE #%u fn=%u p51=%u %s depots_depuis_SB=%u "
+                        "iq=[%d..%d] energie=%ld insn=%u\n",
+                        n, fn, fn % 51,
+                        ((fn % 51) % 10 == 1 && (fn % 51) <= 41) ? "SCH" :
+                        ((fn % 51) % 10 == 0 && (fn % 51) <= 40) ? "FCCH" : "AUTRE",
+                        calypso_daram_wr_count - prevwr, mn, mx, en, s->insn_count);
+                prevwr = calypso_daram_wr_count;
+            }
+        }
+    }
+    /* === SUBC-PROBE (lecture seule, gate CALYPSO_SUBC) ========================
+     * si.gdb noue toute la cascade sur UN point, le quotient de la division en
+     * 16 pas (desassemblage de l appelant) :
+     *     0x7d1c  RPT #15
+     *     0x7d1d  SUBC *(0x0b), A      ; division
+     *     0x7d1e  STL  A, *(0x0a)      ; LE QUOTIENT
+     *     0x7d21  LD   *(0x0a), T      ; T est charge ici
+     *     0x7d24  CALLD 0x81df         ; sous-programme du MPY 0x81e4
+     * quotient nul -> T nul -> produit nul -> blocs 3/4 ecrases -> source des
+     * coefficients vide -> le FIRS multiplie par du vide -> B_SCH_CRC arme.
+     * Le breakpoint gdb sur data_write n a jamais su la prendre : on la compile.
+     *
+     * CONTROLE OBLIGATOIRE, dans le meme gate : on compte aussi les passages en
+     * 0x989f (branche CRC-mauvais), dont on SAIT qu elle s execute. Si QUOTIENT
+     * reste a zero pendant que CONTROLE monte, le silence est un fait mesure ;
+     * si les deux sont muets, c est la sonde qui est morte, pas le code. */
+    if (s->pc == 0x7d19 || s->pc == 0x7d1b || s->pc == 0x7d1c ||
+        s->pc == 0x7d1e || s->pc == 0x81e4 || s->pc == 0x989f) {
+        static int on = -1;
+        if (on < 0) { const char *e = getenv("CALYPSO_SUBC"); on = (e && *e && atoi(e)) ? 1 : 0; }
+        if (on) {
+            static unsigned n_q = 0, n_mpy = 0, n_ctl = 0;
+            if (s->pc == 0x989f) {
+                n_ctl++;
+                if (n_ctl <= 3 || (n_ctl % 25) == 0)
+                    fprintf(stderr, "[c54x] SUBC-PROBE CONTROLE 0x989f #%u "
+                            "(quotient=%u mpy=%u) insn=%u\n",
+                            n_ctl, n_q, n_mpy, s->insn_count);
+            } else if (s->pc == 0x7d19 || s->pc == 0x7d1b || s->pc == 0x7d1c) {
+                /* Le dividende est la constante 1 decalee (ld #1,A ; sfta A,<n>).
+                 * Si le decalage laisse A sous le diviseur, le quotient est nul
+                 * PAR CONSTRUCTION -- ce ne serait pas un bug du SUBC. On releve
+                 * donc A aux trois instants : avant le LD, apres le LD, et juste
+                 * avant la division. */
+                static unsigned n_s = 0;
+                if (n_s++ < 60)
+                    fprintf(stderr, "[c54x] SUBC-PROBE DIVIDENDE@0x%04x A=0x%010llx "
+                            "op=0x%04x ST1=0x%04x diviseur=0x%04x insn=%u\n",
+                            s->pc, (unsigned long long)(s->a & 0xFFFFFFFFFFULL),
+                            prog_fetch(s, s->pc), s->st1,
+                            s->data[(uint16_t)(((s->st0 & 0x1FF) << 7) | 0x0B)],
+                            s->insn_count);
+            } else if (s->pc == 0x7d1e) {
+                if (n_q++ < 40) {
+                    unsigned dp = s->st0 & 0x1FF;
+                    uint16_t divis = s->data[(uint16_t)((dp << 7) | 0x0B)];
+                    uint16_t prev  = s->data[(uint16_t)((dp << 7) | 0x0A)];
+                    fprintf(stderr, "[c54x] SUBC-PROBE QUOTIENT #%u A=0x%010llx "
+                            "bas16=0x%04x diviseur[DP:0x0b]=0x%04x ancien[0x0a]=0x%04x "
+                            "T=0x%04x DP=0x%03x insn=%u\n",
+                            n_q, (unsigned long long)(s->a & 0xFFFFFFFFFFULL),
+                            (unsigned)(s->a & 0xFFFF), divis, prev, s->t, dp,
+                            s->insn_count);
+                }
+            } else {
+                if (n_mpy++ < 40)
+                    fprintf(stderr, "[c54x] SUBC-PROBE MPY@0x81e4 #%u T=0x%04x "
+                            "A=0x%010llx insn=%u\n",
+                            n_mpy, s->t, (unsigned long long)(s->a & 0xFFFFFFFFFFULL),
+                            s->insn_count);
+            }
+        }
+    }
+    /* === MVDD-PROBE (lecture seule, gate CALYPSO_SUBC) ========================
+     * DERNIER SAUT. Mesure etablie : le dividende de la division 0x7d1d n est pas
+     * une grandeur physique mais l INDEX du premier mot non nul des blocs 3/4
+     * (balayage arriere 0x7cf5..0x7d06, chute sur `xor A` quand rien n est trouve).
+     * Les blocs sont vides -> A=0 -> quotient 0 -> T=0 -> coefficients nuls. La
+     * fleche de si.gdb etait donc a l envers : ce n est pas T qui ecrase les blocs.
+     *
+     * Les blocs 3/4 sont censes etre remplis par deux copies de 7 mots :
+     *     0x7cda  stm #0x2cce, AR2        ; destination = bloc 3
+     *     0x7cdc  stm #0x2c56, AR3        ; source = CORR A
+     *     0x7cde  mar *AR3+0              ; AR3 += AR0   <-- decalage
+     *     0x7cdf  rpt #6 / 0x7ce0 mvdd
+     *     0x7ce1  mar *+AR3(0x2b) / 0x7ce3 rpt #6 / 0x7ce4 mvdd  ; bloc 4
+     * et cette copie est SAUTEE par `bcd 0x7ced, ANEQ` en 0x7ccd quand les blocs
+     * sont deja non nuls. On imprime donc : passe-t-on par 0x7ccd (et branche-t-on
+     * ?), la copie s execute-t-elle, avec quel AR0/AR3, et que vaut la source. */
+    if (s->pc == 0x7ccd || s->pc == 0x7ce0 || s->pc == 0x7ce4) {
+        static int on = -1;
+        if (on < 0) { const char *e = getenv("CALYPSO_SUBC"); on = (e && *e && atoi(e)) ? 1 : 0; }
+        if (on) {
+            static unsigned n_g = 0, n_c3 = 0, n_c4 = 0;
+            if (s->pc == 0x7ccd) {
+                if (n_g++ < 20) {
+                    long som = 0;
+                    for (int k = 0; k < 14; k++) som += (int16_t)s->data[(uint16_t)(0x2cce + k)];
+                    fprintf(stderr, "[c54x] MVDD-PROBE GARDE@0x7ccd A=0x%010llx "
+                            "(saute-la-copie si A!=0) somme_blocs=%ld AR0=0x%04x insn=%u\n",
+                            (unsigned long long)(s->a & 0xFFFFFFFFFFULL), som,
+                            s->ar[0], s->insn_count);
+                }
+            } else if (s->pc == 0x7ce0) {
+                if (n_c3++ < 20)
+                    fprintf(stderr, "[c54x] MVDD-PROBE COPIE bloc3 AR3(src)=0x%04x "
+                            "AR2(dst)=0x%04x AR0=0x%04x src[0..3]=%04x %04x %04x %04x insn=%u\n",
+                            s->ar[3], s->ar[2], s->ar[0],
+                            s->data[s->ar[3]], s->data[(uint16_t)(s->ar[3]+1)],
+                            s->data[(uint16_t)(s->ar[3]+2)], s->data[(uint16_t)(s->ar[3]+3)],
+                            s->insn_count);
+            } else {
+                if (n_c4++ < 20)
+                    fprintf(stderr, "[c54x] MVDD-PROBE COPIE bloc4 AR3(src)=0x%04x "
+                            "AR2(dst)=0x%04x src[0..3]=%04x %04x %04x %04x insn=%u\n",
+                            s->ar[3], s->ar[2],
+                            s->data[s->ar[3]], s->data[(uint16_t)(s->ar[3]+1)],
+                            s->data[(uint16_t)(s->ar[3]+2)], s->data[(uint16_t)(s->ar[3]+3)],
+                            s->insn_count);
+            }
+        }
+    }
     if (s->pc == 0x8341) {
         /* @BEQUILLE — FORCE_DP (+ FORCE_DP_FROM comme scope)  (CALYPSO_FORCE_DP, VALEUR,
          *              defaut OFF)
@@ -8907,6 +9050,47 @@ static int c54x_exec_one(C54xState *s)
                 int subop     = (op >> 4) & 0xF;
                 int shift_raw = op & 0xF;
                 int shift     = (shift_raw & 0x8) ? (shift_raw - 16) : shift_raw;
+                /* ─────────────────────────────────────────────────────────────
+                 * [2026-08-24] SAS FIX_LK_SHFT (CALYPSO_FIX_LK_SHFT, defaut OFF).
+                 *
+                 * LE DEFAUT. Le champ de decalage de ces formes #lk tient sur
+                 * QUATRE bits (`op & 0xF`), mais on lui applique la regle de signe
+                 * d un champ de CINQ bits (-16..15). C est incoherent en soi : on
+                 * ne represente pas -16..15 sur 4 bits. Consequence mesuree en
+                 * 0x7d19 (`f02f 0001` = LD #1, SHFT=15, A) : shift devient -1,
+                 * lk_val = 1 >> 1 = 0, et l accumulateur reste NUL.
+                 *
+                 * AUTORITE FORMELLE. doc/opcodes/tic54x-opc.c donne pour ces
+                 * formes l operande OP_SHFT (non signe) et non OP_SHIFT :
+                 *   { "ld",  0xF020, 0xFEF0, {OP_lk, OPT|OP_SHFT,  OP_DST} }
+                 *   { "sub"/"and"/"or"/"xor" ... OPT|OP_SHFT ... }
+                 *   { "add", 0xF000, 0xFCF0, {OP_lk, OPT|OP_SHIFT, ...} }  <- seul
+                 *
+                 * ARGUMENT PHYSIQUE. La sequence est l idiome C54x du reciproque :
+                 *     0x7d19  ld   #0x0001, A
+                 *     0x7d1b  sfta A
+                 *     0x7d1c  rpt  #15
+                 *     0x7d1d  subc @0x0b, A     ; division en 16 pas
+                 * SUBC exige un dividende cadre a gauche, sinon le quotient est nul
+                 * PAR CONSTRUCTION. Charger 1 pour le decaler a DROITE rendrait tout
+                 * le bloc mort. A gauche de 15 : 0x8000 / 0x0481 = 28, un reciproque
+                 * en Q15 -- ce que le firmware attend.
+                 *
+                 * PORTEE VOLONTAIREMENT ETROITE. On ne touche PAS le sous-code 0
+                 * (ADD), seul que la table marque OP_SHIFT. Corriger les deux d un
+                 * coup rendrait la mesure ininterpretable (protocole fixes.env).
+                 *
+                 * A EFFACER (la condition, pas le correctif) quand valide sous
+                 * charge : le sas se vide, la bequille reste. */
+                {
+                    static int fix = -1;
+                    if (fix < 0) {
+                        const char *e = getenv("CALYPSO_FIX_LK_SHFT");
+                        fix = (e && *e && atoi(e)) ? 1 : 0;
+                    }
+                    if (fix && subop >= 1 && subop <= 5)
+                        shift = shift_raw;          /* OP_SHFT : non signe, 0..15 */
+                }
                 int src_b     = (op >> 9) & 1;
                 int dst_b     = (op >> 8) & 1;
                 int64_t src   = src_b ? s->b : s->a;
