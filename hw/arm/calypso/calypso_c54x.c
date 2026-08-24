@@ -7005,7 +7005,9 @@ static int c54x_exec_one(C54xState *s)
                 int mn = 32767, mx = -32768; long en = 0;
                 for (int k = 0; k < 296; k++) {
                     int v = (int16_t)s->data[(uint16_t)(0x2a00 + k)];
-                    if (v < mn) mn = v; if (v > mx) mx = v; en += (long)v * v;
+                    if (v < mn) { mn = v; }
+                    if (v > mx) { mx = v; }
+                    en += (long)v * v;
                 }
                 unsigned fn = calypso_daram_last_fn;
                 fprintf(stderr, "[c54x] SBFN-PROBE #%u fn=%u p51=%u %s depots_depuis_SB=%u "
