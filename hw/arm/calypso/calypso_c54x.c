@@ -108,9 +108,11 @@ static inline int asm_shift(C54xState *s)
  * Memory access
  * ================================================================ */
 
-/* Forward decl: used by data_write() VECDUMP at MMR_PMST. */
+/* Forward decl: used by data_write() VECDUMP at MMR_PMST.
+ * prog_fetch() n est PAS redeclare ici : il a perdu son `static` pour
+ * ar_write_track() et sa declaration vit desormais dans calypso_c54x_trace.h,
+ * inclus plus haut. La repeter viole -Werror=redundant-decls. */
 static uint16_t prog_read(C54xState *s, uint32_t addr);
-uint16_t prog_fetch(C54xState *s, uint16_t pc);
 
 /* Propagated by D_BURST_D probe, consumed by A_CD-BY-BURST correlation. */
 static uint16_t g_last_d_burst_d;
@@ -2219,7 +2221,7 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
                      * ligne de commande le mentionne : `CALYPSO_MODE=native
                      * CALYPSO_TRF_RXLEV=0` rendait quand meme un a_pm fabrique par
                      * l hote, en silence. Or le protocole du projet veut qu une
-                     * bequille soit POSEE EXPLICITEMENT dans environnement/*.env, ou
+                     * bequille soit POSEE EXPLICITEMENT dans un profil de environnement/, ou
                      * elle est lisible et retirable. Le profil `native` la pose
                      * desormais lui-meme (modes.env) : comportement identique,
                      * declaration visible. */
