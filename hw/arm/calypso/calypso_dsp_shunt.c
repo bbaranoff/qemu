@@ -49,6 +49,7 @@
 #include "calypso_dsp_shunt.h"
 #include "hw/arm/calypso/calypso_trf6151.h"
 #include "hw/arm/calypso/calypso_twl3025.h"
+#include "hw/arm/calypso/calypso_gsm0502.h"  /* positions FCCH/SCH, definition unique */
 #include "calypso_c54x.h"   /* C54xState + c54x_bsp_load/run/interrupt_ex/wake (CALYPSO_DSP=c54x route) */
 #include "calypso_layer1.h" /* calypso_l1_c_active() : ungate SB/SI (+FB) sous CALYPSO_L1=c */
 #include "hw/arm/calypso/calypso_dsp_internal.h" /* shared state + NDB-write primitives (split) */
@@ -243,6 +244,28 @@ static void calypso_sdcch_ul_publish(const uint8_t *l2, uint16_t task_u,
 }
 
 static uint16_t shunt_pm_decan_apm(int fallback_target);   /* fwd : defini plus bas */
+static int feed_fn_canon(void);      /* fwd : defini plus bas (fix feed 22/08) */
+static int feed_decim_auto(void);    /* fwd : defini plus bas */
+static int feed_decim_eff(int decim, int n);  /* fwd : defini plus bas */
+
+/* [2026-08-22] Mesure ce qu'un feed vient d'ecrire. Les sondes precedentes
+ * n'imprimaient que les 3 premiers mots — inutilisable : un burst GSM commence
+ * par une garde, « s0=s1=s2=0 » ne dit RIEN du contenu. Piege vecu le 22/08. */
+static void feed_stats(const uint16_t *buf, int words, unsigned *nz,
+                       unsigned *maxi, unsigned *maxq, unsigned long long *nrj)
+{
+    unsigned _nz = 0, _mi = 0, _mq = 0;
+    unsigned long long _e = 0;
+    for (int i = 0; i < words; i++) {
+        int v = (int16_t)buf[i];
+        unsigned a2 = (v < 0) ? (unsigned)(-v) : (unsigned)v;
+        if (v) _nz++;
+        if (i & 1) { if (a2 > _mq) _mq = a2; }
+        else       { if (a2 > _mi) _mi = a2; }
+        _e += (unsigned long long)a2 * a2;
+    }
+    *nz = _nz; *maxi = _mi; *maxq = _mq; *nrj = _e;
+}
 
 /* Coherence interne des #define de repli (l'arithmetique NDB_W, pas l'accord
  * avec le firmware — c'est le role du resolveur DWARF ci-dessous). */
@@ -1747,164 +1770,6 @@ static void shunt_dispatch_tch_sacch(uint8_t page_idx)
  * helper wp_base() existant. Replique la DMA de trx calypso_dsp_done(@711) :
  * data[0x0584]=page, data[0x0585]=fn, data[0x0586+i]=wp[i] (i<20), et le mirror
  * api_ram[0x08E2 - C54X_API_BASE]=page (d_dsp_page cote DSP, lu par le firmware). */
-/* Lecture DIRECTE de l'espace data[] du c54x pour une adresse API ARM,
- * SANS round-trip MMIO calypso_dsp_read (qui prend calypso_pcb_daram_lock,
- * mutex non-recursif -> re-lock/abort quand on est deja dans le contexte
- * frame-tick). Meme mapping que calypso_dsp_read : ARM off O -> data[O/2+0x800]. */
-static inline uint16_t shunt_c54x_api_rd(C54xState *dsp, uint32_t arm_addr)
-{
-    return dsp->data[((arm_addr - 0xFFD00000UL) >> 1) + 0x0800];
-}
-
-/* [2026-07-24] CADENCE SPLIT : shunt_route_to_c54x() etait appelee UNIQUEMENT
- * quand g_shunt.pending (= l'ARM vient de poster un NOUVEAU d_dsp_page), soit
- * ~1 fois toutes les ~12 trames reelles en pratique (mesure runtime : 708 insn
- * DSP/tour mais ~57ms reels/tour -- le go-live retry loop du DSP n'a donc
- * qu'une fraction de son temps reel pour attraper la fenetre de survie de
- * data[0x0810]/d_ctrl_system, contrairement au natif ou c54x_run tourne a
- * chaque trame SANS gate sur un dispatch ARM frais). Le natif ne connait pas
- * ce probleme : calypso_tdma_tick() appelle c54x_run() inconditionnellement
- * (gate uniquement sur running/idle/shunt_active), jamais sur "tache neuve".
- *
- * Fix : separer le header (partie A, a besoin de page_idx/d_fn FRAIS, donc
- * reste gate sur pending -- cf le fix staleness du meme jour juste au-dessus)
- * du wake+run (partie B, ne depend pas d'un dispatch frais : rejoue le
- * dernier IQ connu, tire l'IT frame, tourne le budget DSP -- exactement ce
- * que native fait a chaque trame). Partie B devient appelable a CHAQUE trame,
- * pending ou pas, pour retrouver une cadence proche du natif (~217Hz au lieu
- * de ~17Hz). */
-static void shunt_route_to_c54x_header(uint8_t page_idx)
-{
-    C54xState *dsp = g_shunt.c54x;
-    if (!dsp)
-        return;
-    fprintf(stderr, "[c54x-route] enter page=%u dsp=%p\n", (unsigned)page_idx, (void*)dsp);
-
-    /* (a) API write-page -> DARAM 0x0586 (replique de la DMA trx gatee a :711).
-     * wp_base(page_idx) = adresse MMIO absolue de la write-page (== dsp_ram).
-     * Le mot d_dsp_page (NDB+0 = 0xFFD001A8) est lu live (= s->dsp_ram[0x01A8/2]
-     * cote trx) pour data[0x0584] et le mirror 0x08E2. */
-    {
-        uint32_t wbase    = wp_base(page_idx);
-        fprintf(stderr, "[c54x-route] a1 wbase=0x%08x\n", wbase);
-        /* [2026-07-24] FIX RACE : l'ancien lisait dsp->data[NDB_D_DSP_PAGE]=data[0x08E2]
-         * ICI-MEME (mid-frame), une cellule que data[0x08E2] toggle entre ce
-         * moment et le FRAME-IT qui suit dans CETTE MEME invocation (confirme
-         * runtime : a2 voit 186/186 fois 0x0000, FRAME-IT# voit 559/559 fois
-         * 0x0003, sur la MEME cellule -- pas un bug d'adresse, un bug de
-         * timing/staleness). page_idx (parametre) est DEJA la valeur fraiche,
-         * capturee au moment de l'ecriture ARM (cf ligne ~135 :
-         * page_idx = (new_d_dsp_page & B_GSM_PAGE) ? 1 : 0). On reconstruit
-         * dsp_page depuis cette valeur connue-fraiche au lieu de relire une
-         * cellule sujette a race, evitant de repropager du perime dans
-         * data[0x0584]/api_ram[0x08E2] ci-dessous. */
-        uint16_t dsp_page = B_GSM_TASK | page_idx;
-        /* [2026-07-29] La « race » decrite juste au-dessus n'en etait pas une :
-         * a2 affichait data[0x08E2] (jamais ecrit) et le FRAME-IT affichait
-         * api_ram[0x08E2] (ecrit par le miroir ci-dessous) — deux tableaux
-         * distincts, deux valeurs, aucune course. Et 0x08E2 n'etait de toute
-         * facon pas la bonne cellule : d_dsp_page = 0x08D4 (cf calypso_fbsb.h).
-         * On affiche desormais la cellule que la ROM lit reellement, dans le
-         * tableau qu'elle lit reellement (api_ram). */
-        fprintf(stderr, "[c54x-route] a2 dsp_page=0x%04x (from page_idx=%u, "
-                "api_ram[0x%04x]=0x%04x) api_ram=%p\n",
-                dsp_page, (unsigned)page_idx, NDB_D_DSP_PAGE,
-                dsp->api_ram ? dsp->api_ram[NDB_D_DSP_PAGE - C54X_API_BASE]
-                             : dsp->data[NDB_D_DSP_PAGE],
-                (void*)dsp->api_ram);
-        dsp->data[0x0584] = dsp_page;
-        dsp->data[0x0585] = (uint16_t)(g_shunt.d_fn & 0xFFFF);
-        fprintf(stderr, "[c54x-route] a3 data-hdr-ok\n");
-        for (int i = 0; i < 20; i++)
-            dsp->data[0x0586 + i] = shunt_c54x_api_rd(dsp, wbase + (uint32_t)i * 2);
-        fprintf(stderr, "[c54x-route] a4 wp-copy-ok\n");
-        /* [2026-07-29] Miroir d_dsp_page cote DSP. Ecrivait 0x08E2 = d_dsp_state :
-         * la page ecrasait le C_DSP_IDLE3 pose par l'ARM (dsp.c:215), et la ROM,
-         * qui lit 0x08D4 (0xa51c/0xc8ea), ne voyait rien. Corrige a la source —
-         * ce qui remplit la condition de retrait de la bequille FIX_DPAGE_OFF
-         * (calypso_c54x.c), retiree du meme coup. */
-        if (dsp->api_ram)
-            dsp->api_ram[NDB_D_DSP_PAGE - C54X_API_BASE] = dsp_page;
-    }
-    fprintf(stderr, "[c54x-route] a-daram-ok\n");
-}
-
-static void shunt_route_to_c54x_run(void)
-{
-    C54xState *dsp = g_shunt.c54x;
-    if (!dsp)
-        return;
-
-    /* (b) rejoue le dernier burst I/Q (cs16 entrelace I,Q) dans bsp_buf. */
-    if (g_shunt.last_iq_valid && g_shunt.last_iq_n > 0)
-        c54x_bsp_load(dsp, (const uint16_t *)g_shunt.last_iq, g_shunt.last_iq_n);
-
-    fprintf(stderr, "[c54x-route] b-bsp-load-ok n=%d\n", g_shunt.last_iq_n);
-    /* (c) INT3 FRAME + wake : reveille le DSP s'il etait idle/halt. */
-    g_c54x_int3_src = 3;
-    /* [2026-07-22] FRAME_IT_NATIVE : tick propre — livre le scheduler frame
-     * (vec28/bit12) DIRECTEMENT au frame-tick, pas via le remap 19/3. Le
-     * c54x_irq_level_check le prend quand INTM=0 (prise naturelle, pas de force).
-     * = le vrai primitif HW frame-sync. Sinon (legacy) : vec19/bit3 (+remap VEC28). */
-    {
-        /* @BEQUILLE — FRAME_IT_NATIVE  (CALYPSO_FRAME_IT_NATIVE, EXISTS ; :=1 en
-         *              native / native_helped / wire)
-         *   masque  : l'absence de cablage frame-TPU -> vecteur DSP. On appelle
-         *             directement c54x_interrupt_ex(dsp,28,12) au frame-tick au lieu de
-         *             19/3 (le stub vec19 est un RETE).
-         *   retirer : quand le TPU delivre l'IT frame sur le bon vecteur tout seul
-         *             (idem VEC28_REMAP cote calypso_c54x.c).
-         */
-        static int fin = -1;
-        if (fin < 0) fin = calypso_gate("CALYPSO_FRAME_IT_NATIVE", 0);
-        if (fin)
-            c54x_interrupt_ex(dsp, 28, 12);   /* scheduler frame IT, tick propre */
-        else
-            c54x_interrupt_ex(dsp, C54X_INT_FRAME_VEC, C54X_INT_FRAME_BIT);
-        /* [2026-07-23] TINT MASTER CLOCK sync frame : fire TINT au MEME tick TDMA
-         * (pas per-2000-insn). Handler 0x72d3 = driver slots op.
-         * [2026-08-03] CAL000 §5.1 : TINT = bit3/vec19, pas bit4/vec20 (= RINT/SPI
-         * receive). Bascule sous le sas CALYPSO_IT_TABLE_DOC, cf. calypso_c54x.c. */
-        {
-            /* @BEQUILLE — TINT0_MASTER (fire au frame-tick)  (CALYPSO_TINT0_MASTER, EXISTS,
-             *              defaut OFF hors profil WIRE)
-             *   masque  : la configuration/demarrage du TIMER0 par le ROM. Le firmware arrete
-             *             le timer (TSS=1) dans une init non-tournee ; on fabrique TINT
-             *             a la cadence trame.
-             *   retirer : quand la sequence d'init TIMER0 du ROM s'execute (TCR programme).
-             */
-            static int _t0m = -1;
-            if (_t0m < 0) _t0m = calypso_gate("CALYPSO_TINT0_MASTER", 0);
-            if (_t0m) {
-                static int _doc = -1;
-                if (_doc < 0) _doc = calypso_gate("CALYPSO_IT_TABLE_DOC", 0);
-                if (_doc)   /* §5.1 : TINT = IMR bit 3 / vec 19 */
-                    c54x_interrupt_ex(dsp, C54X_IT_TINT_VEC, C54X_IT_TINT_BIT);
-                else        /* legacy SPRU131 : en fait RINT / SPI receive */
-                    c54x_interrupt_ex(dsp, C54X_IT_SPI_RX_VEC, C54X_IT_SPI_RX_BIT);
-            }
-        }
-    }
-    c54x_wake(dsp);
-    /* revive: c54x_run loop gate = (running && !idle). c54x_wake ne clear que
-     * idle ; en mode route_c54x le chemin trx qui posait running=true est gate
-     * off -> forcer running ici sinon la boucle c54x_run est sautee (0 insn). */
-    dsp->running = true;
-
-    fprintf(stderr, "[c54x-route] c-wake-ok running=%d idle=%d\n", dsp->running, dsp->idle);
-    /* (d) execute le budget (1 trame nominale ~256000 insns ; ajustable env). */
-    {
-        static int budget = -1;
-        if (budget < 0) {
-            const char *b = getenv("CALYPSO_DSP_BUDGET");
-            budget = (b && *b) ? atoi(b) : 256000;
-            if (budget <= 0) budget = 256000;
-        }
-        fprintf(stderr, "[c54x-route] d-pre-c54x_run budget=%d\n", budget);
-        c54x_run(dsp, budget);
-        fprintf(stderr, "[c54x-route] d-c54x_run-RETURNED\n");
-    }
-}
 
 /* ---- Service hook : called from calypso_trx frame_irq tick ---- */
 /* [AFC loop-close v2] derniere mesure de frequence BRUTE du FCCH (Hz), pour
@@ -1953,6 +1818,35 @@ static uint16_t shunt_pm_decan_apm(int fallback_target)
         return calypso_trf6151_apm_for_rf(rfi);
     }
     return calypso_trf6151_apm_for_rf(fallback_target);
+}
+
+/* [2026-08-22] MODÈLE INTÉGRATEUR RSSI HW — le vrai pm_meas natif.
+ * Sur vrai Calypso la tâche PM (md=1) ne calcule PAS a_pm depuis les samples : le
+ * DSP zéro-remplit la page résultat (PROM0 0xb446 : `stl *AR1+,A` en rptb 80), puis
+ * un intégrateur lit un REGISTRE HW de puissance (côté ABB/RF) et pose a_pm — jamais
+ * depuis 0x2a00. Ce registre n'est pas dans l'ADC modélisé ; on le MODÉLISE depuis la
+ * vraie magnitude du signal DL : g_shunt.last_pm = MAV(|I|+|Q|) mesurée dans feed_iq
+ * sur les échantillons réellement reçus. a_pm = calib_RF(20·log10(MAV/MAV_REF)+RF_REF).
+ * → a_pm SUIT le signal (aucun 0x7000 canné). L'ancrage MAV_REF→RF_REF est la
+ * calibration du frontend (comme le gain trf6151), pas une valeur décrétée : deux
+ * signaux différents donnent deux a_pm différents. Utilisé par le hook a_pm de
+ * calypso_c54x.c, qui intercepte l'écriture DSP vers data[0x834..836]/[0x848..84A]. */
+uint16_t calypso_dsp_shunt_rssi_apm(void)
+{
+    static double mav_ref = 20929.0, rf_ref = -60.0; static int init = 0;
+    if (!init) {
+        init = 1;
+        const char *mr = getenv("CALYPSO_DECAN_PM_MAV_REF"); if (mr && *mr) mav_ref = atof(mr);
+        const char *rr = getenv("CALYPSO_DECAN_PM_RF_REF");  if (rr && *rr) rf_ref = atof(rr);
+        if (mav_ref < 1.0) mav_ref = 1.0;
+    }
+    double mav = (double)g_shunt.last_pm;
+    if (mav < 1.0) mav = 1.0;
+    double rf = 20.0 * log10(mav / mav_ref) + rf_ref;
+    if (rf < -100.0) rf = -100.0;   /* plancher : suit le signal faible sans rejeter */
+    if (rf >  -30.0) rf =  -30.0;
+    int rfi = (int)(rf >= 0 ? rf + 0.5 : rf - 0.5);
+    return calypso_trf6151_apm_for_rf(rfi);
 }
 
 void calypso_dsp_shunt_on_frame_tick(void)
@@ -2068,15 +1962,21 @@ void calypso_dsp_shunt_on_frame_tick(void)
              * enroule -> le firmware enroule au rail sur une valeur stale. Ici
              * l'erreur effective DECROIT a mesure que le DAC monte -> converge. */
             if (g_rx_raw_valid) {
-                double _eff = g_rx_raw_hz - calypso_twl3025_get_afc_hz();
+                /* [2026-08-25] `raw - get_afc_hz()` codait en dur le signe de la
+                 * rotation. Depuis l inversion de ce signe (twl3025), apply_phase
+                 * AJOUTE +hz au bande de base tandis qu on en retranchait hz :
+                 * rx_afc annonçait une correction opposee a celle appliquee, soit
+                 * un residu faux de 2*hz. get_afc_applied_hz() porte le signe. */
+                double _applied = calypso_twl3025_get_afc_applied_hz();
+                double _eff = g_rx_raw_hz + _applied;
                 double _a = _eff * (65536.0 / 86208.0);
                 if (_a >  32767.0) _a =  32767.0;
                 if (_a < -32768.0) _a = -32768.0;
                 g_shunt.rx_afc = (int16_t)_a;
                 static unsigned _afl = 0;
                 if ((_afl++ % 200) == 0)
-                    fprintf(stderr, "[AFC-LOOP] raw=%.0fHz dac_hz=%.0f eff=%.0fHz -> rx_afc=%d\n",
-                            g_rx_raw_hz, calypso_twl3025_get_afc_hz(), _eff, g_shunt.rx_afc);
+                    fprintf(stderr, "[AFC-LOOP] raw=%.0fHz applique=%.0fHz eff=%.0fHz -> rx_afc=%d\n",
+                            g_rx_raw_hz, _applied, _eff, g_shunt.rx_afc);
             }
             /* [DECAN model-fidelity] garder le VRAI rx_snr (coherence feed_iq)
              * quand DECAN_SNR actif, sinon le de-can SNR est defait ici. */
@@ -3316,6 +3216,9 @@ static void shunt_gsmtap_init(void)
  * SHUNT_CANNED_BSIC. C'est le "DSP qui poste son decode SCH dans le NDB". */
 static int g_sch_fd = -1;
 
+/* [2026-08-22] auto-recalage FN sur SCH (calypso_trx.c) — decl scope FICHIER. */
+extern void calypso_trx_autosync_fn(uint32_t sch_fn);
+
 static void shunt_sch_read(void *opaque)
 {
     uint8_t buf[64];
@@ -3369,6 +3272,28 @@ static void shunt_sch_read(void *opaque)
                         "delta=%d sch%%51=%u toa=%d\n",
                         (unsigned)fn, trx_fn, d, (unsigned)((uint32_t)fn % 51),
                         (int)g_shunt.sb_toa);
+            /* [2026-08-22] Recale l'horloge FN sur ce SCH (1er SCH -> offset auto
+             * fige). Remplace la bequille codee en dur CALYPSO_DL_FN_OFFSET.
+             *
+             * ⚠️ [2026-08-22 soir] GATE. En mode NATIF c'est une BEQUILLE : la FN
+             * vient du SCH decode par **gr-gsm**, pas du correlateur du DSP. Le
+             * natif est alors juge avec l'horloge deja calee pour lui, et la ligne
+             * FN-ALIGN affiche `toa=23` qui est la valeur du MODELE gr-gsm — a ne
+             * PAS lire comme un succes natif (piege vecu le 22/08).
+             * CALYPSO_GRGSM_FN_AUTOSYNC=0 -> le natif doit se caler tout seul.
+             * Defaut 1 : ne change RIEN au comportement existant. */
+            {
+                static int _gsync = -1;
+                if (_gsync < 0) {
+                    _gsync = calypso_gate("CALYPSO_GRGSM_FN_AUTOSYNC", 1);
+                    fprintf(stderr, "[feed-daram-dsp] GRGSM-FN-AUTOSYNC %s : "
+                            "recalage de l'horloge FN sur le SCH decode par gr-gsm\n",
+                            _gsync ? "ACTIF (=1 ; BEQUILLE si mode natif)"
+                                   : "INACTIF (=0 ; le natif doit se caler seul)");
+                }
+                if (_gsync)
+                    calypso_trx_autosync_fn((uint32_t)fn);
+            }
         }
     }
 }
@@ -3701,7 +3626,19 @@ void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
         int _p = (int)(fn % 51);
         /* [2026-07-26] FCCH positions {1,11,21,31,41} (offset +1 vs canon 0/10/20/30/40,
          * confirme par FN-ALIGN sch%51=1,21,31,41). */
-        int _is_fcch = (_p % 10 == 1) && (_p <= 41);
+        /* [2026-08-22] CORRIGE — la fenetre etait decalee de +1 et feedait le SCH.
+         * L'ancien commentaire disait « FCCH = {1,11,21,31,41}, offset +1 vs canon,
+         * confirme par FN-ALIGN sch%51=1,21,31,41 » : il lisait la sonde **SCH**
+         * (`sch_fn`) et en concluait FCCH. `sch%51 ∈ {1,11,21,31,41}` prouve au
+         * contraire que le SCH est aux positions CANONIQUES (GSM 05.02), donc que
+         * la FCCH est en {0,10,20,30,40}.
+         * MESURE : avec l'ancienne fenetre, `FB-IQ-DARAM ... s0=0x0000 s1=0x0000
+         * s2=0x0000` — le feed ecrivait des ZEROS depuis le debut. Confirme
+         * independamment par tools_/corr_iq.py : bursts non nuls a fn%51 ∈
+         * {0,10,20,30,40}. Gate CALYPSO_FEED_FN_CANON=0 pour restaurer le +1. */
+        int _is_fcch = feed_fn_canon()
+                       ? gsm0502_p51_is_fcch((unsigned)_p)
+                       : gsm0502_p51_is_fcch_legacy_plus1((unsigned)_p);
         /* @BEQUILLE — FB_IQ_MARKER  (CALYPSO_FB_IQ_MARKER, atoi>0, defaut OFF)
          *   masque  : rien de reel — remplace l'IQ par une RAMPE 0x1000+woff pour tester
          *             la reachabilite de la vue DARAM du noyau. Court-circuite la branche
@@ -3724,17 +3661,117 @@ void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
                         g_shunt.c54x->data[base], g_shunt.c54x->data[base+1], g_shunt.c54x->data[base+2]);
         } else if (_fid && g_shunt.c54x && g_shunt.c54x->data && (!_fcch || _is_fcch)) {
             uint16_t base = _iqbase; int dl = 0x128; int woff = 0;
-            for (int k = 0; 2*(k*_decim)+1 < n && woff < dl; k++) {
-                g_shunt.c54x->data[base + woff++] = (uint16_t)iq[2*(k*_decim)];
+            /* [2026-08-22] decimation EFFECTIVE : l'entree est deja a 1 SPS ici
+             * (n=320 = 160 paires IQ) ; decimer encore par 4 aliase la tonalite
+             * FCCH (dphi=+pi/2 par echantillon -> 4*pi/2 = 2*pi = DC). */
+            int _de = feed_decim_eff(_decim, n);
+            for (int k = 0; 2*(k*_de)+1 < n && woff < dl; k++) {
+                g_shunt.c54x->data[base + woff++] = (uint16_t)iq[2*(k*_de)];
                 if (woff < dl)
-                    g_shunt.c54x->data[base + woff++] = (uint16_t)iq[2*(k*_decim)+1];
+                    g_shunt.c54x->data[base + woff++] = (uint16_t)iq[2*(k*_de)+1];
             }
-            static unsigned _l = 0;
-            if (_l++ < 16)
-                fprintf(stderr, "[feed-daram-dsp] FB-IQ-DARAM fn=%u p=%d wrote=%d decim=%d "
-                        "s0=0x%04x s1=0x%04x s2=0x%04x\n", fn, _p, woff, _decim,
-                        g_shunt.c54x->data[base], g_shunt.c54x->data[base+1],
-                        g_shunt.c54x->data[base+2]);
+            {
+                unsigned _nz, _mi, _mq; unsigned long long _e;
+                feed_stats(&g_shunt.c54x->data[base], woff, &_nz, &_mi, &_mq, &_e);
+                static unsigned _l2 = 0;
+                if (_l2++ < 16)
+                    fprintf(stderr, "[feed-daram-dsp] FB-IQ-DARAM fn=%u p=%d wrote=%d "
+                            "decim=%d (demande %d, n=%d) NONZERO=%u/%d max|I|=%u "
+                            "max|Q|=%u energie=%llu mid=0x%04x,0x%04x\n",
+                            fn, _p, woff, _de, _decim, n, _nz, woff, _mi, _mq, _e,
+                            woff > 152 ? g_shunt.c54x->data[base+150] : 0,
+                            woff > 152 ? g_shunt.c54x->data[base+151] : 0);
+            }
+        }
+    }
+
+    /* [2026-08-22] SB-IQ-DARAM — le pendant SB de FB_IQ_DARAM.
+     *
+     * CONSTAT. La chaine FB0 -> FB1 -> SB tourne bien (osmocon de ce run :
+     * FB0=19, FB1=20, SB=8 ; le `fb1_att=0` de la sonde fbsb est un ARTEFACT,
+     * `fb1_attempt` n'est incremente NULLE PART, cf. calypso_fbsb.c:54).
+     * Mais le SB rend invariablement ZERO : `TOA=0 Power=-138dBm`,
+     * `=> SB 0x00000000 BSIC=0`, et a_sch reste 0x0000.
+     *
+     * RAISON. FB_IQ_DARAM ci-dessus n'ecrit que **0x2a00** (buffer FB) et
+     * seulement sur les trames FCCH ({1,11,21,31,41} mod 51). Le correlateur SB
+     * lit un AUTRE buffer : **0x0e4e**, destination du DMA SB (AAD=0xc9c,
+     * cf. [rhea-dma] DMA2_AAD). Personne ne l'alimente -> le SB correle du vide.
+     *
+     * CE BLOC. Meme methode exactement que FB_IQ_DARAM (296 mots = 148 IQ a
+     * 1 SPS, decimation _decim, I puis Q, ecriture directe dans data[]), mais
+     * base 0x0e4e et fenetre SCH = FCCH+1 = {2,12,22,32,42} mod 51.
+     *
+     * @BEQUILLE — SB_IQ_DARAM (+ _BASE)  (CALYPSO_SB_IQ_DARAM, atoi>0, defaut OFF)
+     *   masque  : le DMA on-chip RX -> 0x0e4e. L'ecriture se fait hors data_write,
+     *             donc invisible des sondes WATCH_*.
+     *   retirer : quand la chaine BSP -> RHEA DMA -> 0x0e4e alimente le buffer SB
+     *             toute seule sur les trames SCH. C'est un instrument de DIAGNOSTIC
+     *             (repondre « le SB sait-il correler quand on le nourrit ? »),
+     *             PAS un correctif : tant qu'il est actif, le verdict natif est
+     *             fausse au meme titre que CALYPSO_GRGSM_FN_AUTOSYNC.
+     */
+    {
+        static int _sid = -1, _sdecim = 4;
+        static uint16_t _sbbase = 0;
+        if (_sid < 0) {
+            const char *e = getenv("CALYPSO_SB_IQ_DARAM"); _sid = (e && atoi(e) > 0) ? 1 : 0;
+            const char *d = getenv("CALYPSO_BSP_IQ_DECIM"); if (d && *d) _sdecim = atoi(d);
+            if (_sdecim < 1) _sdecim = 1;
+            const char *b = getenv("CALYPSO_SB_IQ_BASE");
+            _sbbase = (b && *b) ? (uint16_t)strtol(b, NULL, 0) : 0x0e4e;
+            fprintf(stderr, "[feed-daram-dsp] SB-IQ-DARAM %s : base=0x%04x decim=%d "
+                    "(nourrit le correlateur SB sur les trames SCH)\n",
+                    _sid ? "ACTIF (BEQUILLE de diagnostic)" : "INACTIF (defaut)",
+                    _sbbase, _sdecim);
+        }
+        if (_sid && g_shunt.c54x && g_shunt.c54x->data) {
+            int _sp = (int)(fn % 51);
+            /* SCH = FCCH+1 : FCCH est en {1,11,21,31,41} (offset +1 vs canon,
+             * confirme par FN-ALIGN sch%51=1,21,31,41) -> SCH en {2,12,22,32,42}. */
+            /* [2026-08-22] CORRIGE : le SCH est en {1,11,21,31,41} (canonique
+             * GSM 05.02, prouve par FN-ALIGN sch%51). J'avais herite de la fausse
+             * premisse « FCCH=+1 » du bloc FB et vise {2,12,22,32,42} -> zeros. */
+            int _is_sch = feed_fn_canon()
+                          ? gsm0502_p51_is_sch((unsigned)_sp)
+                          : gsm0502_p51_is_sch_legacy_plus1((unsigned)_sp);
+            if (_is_sch) {
+                uint16_t base = _sbbase; int dl = 0x128; int woff = 0;
+                /* /!\ 0x0e4e est DANS la fenetre API (0x0800..0x27FF) : c'est
+                 * api_ram[addr-0x0800] que le DSP LIT, pas data[] (calypso_c54x.c,
+                 * data_read : « API RAM (shared with ARM) » ; cf. aussi le
+                 * commentaire « AAD=0x99c -> api_ram[0x4ce] »). Ecrire data[] seul
+                 * serait INVISIBLE du DSP — c'est le bug deja paye le 2026-08-03
+                 * sur data[0x098c]/api_ram[0x098c]. On ecrit donc LES DEUX : data[]
+                 * pour les sondes, api_ram[] pour le DSP.
+                 * (0x2a00 du feed FB est HORS fenetre -> data[] y est correct.) */
+                int _sde = feed_decim_eff(_sdecim, n);
+                for (int k = 0; 2*(k*_sde)+1 < n && woff < dl; k++) {
+                    uint16_t a0 = (uint16_t)(base + woff);
+                    g_shunt.c54x->data[a0] = (uint16_t)iq[2*(k*_sde)];
+                    if (a0 >= 0x0800 && a0 < 0x2800 && g_shunt.c54x->api_ram)
+                        g_shunt.c54x->api_ram[a0 - 0x0800] = (uint16_t)iq[2*(k*_sde)];
+                    woff++;
+                    if (woff < dl) {
+                        uint16_t a1 = (uint16_t)(base + woff);
+                        g_shunt.c54x->data[a1] = (uint16_t)iq[2*(k*_sde)+1];
+                        if (a1 >= 0x0800 && a1 < 0x2800 && g_shunt.c54x->api_ram)
+                            g_shunt.c54x->api_ram[a1 - 0x0800] = (uint16_t)iq[2*(k*_sde)+1];
+                        woff++;
+                    }
+                }
+                static unsigned _sl = 0;
+                if (_sl++ < 16)
+                    {
+                        unsigned _nz, _mi, _mq; unsigned long long _e;
+                        feed_stats(&g_shunt.c54x->data[base], woff, &_nz, &_mi, &_mq, &_e);
+                        fprintf(stderr, "[feed-daram-dsp] SB-IQ-DARAM fn=%u p=%d wrote=%d "
+                                "decim=%d n=%d api_ram=%d NONZERO=%u/%d max|I|=%u "
+                                "max|Q|=%u energie=%llu\n",
+                                fn, _sp, woff, _sde, n,
+                                g_shunt.c54x->api_ram ? 1 : 0, _nz, woff, _mi, _mq, _e);
+                    }
+            }
         }
     }
 
@@ -3821,7 +3858,9 @@ void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
                      * -> 0 => convergence (gain~1, init -700). fs=1083333 (4 SPS). */
                     double raw_hz = resid * (1083333.0 / (2.0 * M_PI));
                     g_rx_raw_hz = raw_hz; g_rx_raw_valid = 1; /* memo pour recompute per-tick */
-                    double eff_hz = raw_hz - calypso_twl3025_get_afc_hz();
+                    /* [2026-08-25] cf. AFC-LOOP : residu = brut + ce qui a ete
+                     * REELLEMENT applique aux echantillons (signe compris). */
+                    double eff_hz = raw_hz + calypso_twl3025_get_afc_applied_hz();
                     double a = eff_hz * (65536.0 / 86208.0);
                     if (a >  32767.0) a =  32767.0;
                     if (a < -32768.0) a = -32768.0;
@@ -4379,6 +4418,40 @@ bool calypso_dsp_shunt_fb_stream_next(uint16_t *outI, uint16_t *outQ)
         }
     }
     return true;
+}
+
+/* [2026-08-22] Gates des deux correctifs de feed (voir en-tete des blocs
+ * FB-IQ-DARAM / SB-IQ-DARAM). Separes pour permettre la bisection. */
+static int feed_fn_canon(void)
+{
+    static int g = -1;
+    if (g < 0) {
+        g = calypso_gate("CALYPSO_FEED_FN_CANON", 1);
+        fprintf(stderr, "[feed-daram-dsp] FEED-FN-CANON %s : FCCH={0,10,20,30,40} "
+                "SCH={1,11,21,31,41} (GSM 05.02)\n",
+                g ? "ACTIF (positions canoniques)"
+                  : "INACTIF (ancien decalage +1, feedait les trames SCH)");
+    }
+    return g;
+}
+
+static int feed_decim_auto(void)
+{
+    static int g = -1;
+    if (g < 0) {
+        g = calypso_gate("CALYPSO_FEED_DECIM_AUTO", 1);
+        fprintf(stderr, "[feed-daram-dsp] FEED-DECIM-AUTO %s : ne decime que si "
+                "l'entree est a 4 SPS (n > 2*296), comme c54x_bsp_load\n",
+                g ? "ACTIF (garde 4 SPS)" : "INACTIF (decimation inconditionnelle)");
+    }
+    return g;
+}
+
+/* Decimation effective : 1 si l'entree est deja a 1 SPS. */
+static int feed_decim_eff(int decim, int n)
+{
+    if (!feed_decim_auto()) return decim;
+    return (decim > 1 && n > 2 * 296) ? decim : 1;
 }
 
 /* [2026-07-27] Reset L1 (Ctrl-C mobile / L1CTL_RESET_REQ FULL) : clear l'etat
