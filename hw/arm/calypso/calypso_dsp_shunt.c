@@ -1067,21 +1067,68 @@ static bool shunt_tch_fresh(bool valid, uint32_t tick);
  *   retirer : quand a_cd est alimente par la demodulation native -- chaque bloc
  *             arrive alors a SA place dans la multitrame (TODO shunt_dispatch_nb).
  */
+/* Base fn%102 de la SACCH du sous-canal dedie courant -- MEME table que
+ * shunt_dcch_sacch_present(), factorisee pour que les deux ne divergent pas.
+ * GSM 05.02 : SACCH/C4 SS0..3 -> 42, 46, 93, 97 ; SACCH/C8 SS0..7 -> 32, 36,
+ * 40, 44, 83, 87, 91, 95. */
+static uint32_t shunt_dcch_sacch_base(void)
+{
+    static const uint8_t base4[4] = { 42, 46, 93, 97 };
+    static const uint8_t base8[8] = { 32, 36, 40, 44, 83, 87, 91, 95 };
+    if (g_shunt.sdcch_ch8)
+        return base8[(g_shunt.sdcch_ss / 4u) & 7u];
+    switch (g_shunt.sdcch_ss) {
+    case 26: return base4[1];
+    case 32: return base4[2];
+    case 36: return base4[3];
+    default: return base4[0];            /* 22 = SS0 */
+    }
+}
+
 static bool shunt_dcch_si_window(void)
 {
     static int on = -1, ofs = 0;
     if (on < 0) {
-        const char *e = getenv("CALYPSO_DCCH_SI_WINDOW_MUTE"); on  = (e && *e == '1');
+        /* [2026-08-27] DEFAUT PASSE A 1. La premiere version etait a 0, faute de
+         * mesure. La mesure existe : sur un run de 4576 lignes de mobile.log,
+         * 425 « unsupported SAPI » (6 x181, 4 x79, 2 x78, 5 x72, 1 x15), 39
+         * « Short header 0x07 », 49 « Unnumbered frame not allowed » (-> 50
+         * MDL-ERROR cause 12) et 3 « multi-octet length ». Sur le seul lien
+         * SACCH : 46 trames recues, 9 acceptees, 37 rejetees -- QUATRE BLOCS SUR
+         * CINQ jetes. Poser 0 revenait a garder ce taux.
+         * CALYPSO_DCCH_SI_WINDOW_MUTE=0 retablit l ancien comportement. */
+        const char *e = getenv("CALYPSO_DCCH_SI_WINDOW_MUTE"); on  = (!e || *e != '0');
         const char *o = getenv("CALYPSO_SHUNT_SDCCH_OFS");     ofs = o ? atoi(o) : 0;
     }
     if (!on) return false;
-    /* Memes bornes que l anneau : arme -> [0,31] en /8, [22,39] en /4 ; pas
-     * encore arme -> union [0,39], le type n etant pas positivement connu. */
-    int armed = g_shunt.sdcch_ss_set;
-    int lo = armed ? (g_shunt.sdcch_ch8 ? 0  : 22) : 0;
-    int hi = armed ? (g_shunt.sdcch_ch8 ? 31 : 39) : 39;
-    int tc = (int)((((long)shunt_l1s_fn() + ofs) % 51 + 51) % 51);
-    return tc >= lo && tc <= hi;
+
+    /* 1. Fenetre du canal PRINCIPAL -- memes bornes que l anneau SDCCH de
+     *    calypso_dsp_helper.c : arme -> [0,31] en /8, [22,39] en /4 ; pas encore
+     *    arme -> union [0,39], le type n etant pas positivement connu.
+     *    C est de la que sortent les SAPI 5/6/2/4 (l2h[0] = pseudo-longueur du
+     *    bloc BCCH lue comme octet d adresse LAPDm). */
+    {
+        int armed = g_shunt.sdcch_ss_set;
+        int lo = armed ? (g_shunt.sdcch_ch8 ? 0  : 22) : 0;
+        int hi = armed ? (g_shunt.sdcch_ch8 ? 31 : 39) : 39;
+        int tc = (int)((((long)shunt_l1s_fn() + ofs) % 51 + 51) % 51);
+        if (tc >= lo && tc <= hi) return true;
+    }
+
+    /* 2. Fenetre SACCH du canal dedie -- fn%102, cadence DIFFERENTE de la
+     *    precedente, donc non couverte par elle. C est de la que sortent le
+     *    « Short header 0x07 » (SI4 : l2h[2] = 0x1c, & 3 == 0 -> Bter ->
+     *    msg_type 0x07), les SAPI 6 issus de SI1/SI2/SI3 (l2h[2] = 0x19/1a/1b)
+     *    et les « Unnumbered frame not allowed » du lien SACCH.
+     *    Inutile sur TCH : la fenetre fn%102 heritee du SDCCH y est hors phase
+     *    (multitrame de 26) -- meme raison qu au point 22 de
+     *    calypso_dsp_shunt_set_dcch_tch. */
+    if (g_shunt.sdcch_ss_set && !g_shunt.dcch_is_tch) {
+        uint32_t b = shunt_dcch_sacch_base();
+        uint32_t f102 = (uint32_t)calypso_trx_get_fn() % 102u;
+        if (f102 >= b && f102 <= b + 3u) return true;
+    }
+    return false;
 }
 
 static bool shunt_dcch_si_guard(void)

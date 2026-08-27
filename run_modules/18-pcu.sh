@@ -53,7 +53,23 @@ mod_pcu_start() {
 }
 
 # BARRIÈRE — un PCU qui meurt sur une conf invalide est relancé toutes les 2 s
-# par systemd ; c'est ce que détecte core_restarted_since.
+# par systemd ; c'est ce que détecte core_restart_looping.
+#
+# PAS core_restarted_since : osmo-pcu se termine par exit(0) de lui-même quand la
+# socket PCU de la BTS disparaît (pcuif_sock.c, pcu_sock_close), en comptant sur
+# le superviseur pour le relancer. Comme ce module tourne AVANT la BTS, ce cas
+# est la normale, pas l'exception — mesure du 2026-08-27 :
+#   14:33:11  PCU socket has LOST connection      (la BTS du run précédent s'arrête)
+#   14:33:11  osmo-pcu.service: Deactivated successfully
+#   14:33:14  Scheduled restart job, restart counter is at 1
+#   -> core_restarted_since : 1 > 0 -> « redémarre en boucle » -> séquence abandonnée
+# alors que le PCU se rattachait tout seul 45 s plus tard :
+#   14:33:57  osmo-bts PCU socket /tmp/pcu_bts has been connected
+#   14:33:57  NS-NSE 10 became available / BVCI=12 BVC_UNBLOCK_ACK
+# Le diagnostic désignait le mauvais coupable, exactement comme la « course
+# No clock » du BTS#1. On juge donc sur une FENÊTRE : le compteur monte-t-il
+# ENCORE ? Un PCU sur conf invalide y remonte (relance toutes les 2 s) ; un PCU
+# qui a simplement suivi sa BTS n'y bouge plus.
 mod_pcu_wait() {
     if ! core_alive "$PCU_UNIT"; then
         mod_hint "journalctl -u $PCU_UNIT -n 30"
@@ -63,7 +79,7 @@ mod_pcu_wait() {
     if ! wait_until "${MOD_TIMEOUT[pcu]}" "VTY OsmoPCU ($PCU_VTY_PORT)" core_vty_listen "$PCU_VTY_PORT"; then
         mod_say "VTY $PCU_VTY_PORT non observé — port non déclaré dans $(_pcu_cfg), repli sur la sonde de vie"
     fi
-    if core_restarted_since "$PCU_UNIT"; then
+    if core_restart_looping "$PCU_UNIT"; then
         mod_hint "journalctl -u $PCU_UNIT -n 50 : conf invalide ou socket PCU inaccessible"
         mod_fail "OsmoPCU redémarre en boucle"
         return $MOD_RC_FAIL

@@ -119,6 +119,34 @@ core_restarted_since() {
     [ "${now:-0}" -gt "${before:-0}" ] 2>/dev/null
 }
 
+# core_restart_looping <unité> [fenêtre_s] : VRAI seulement si le compteur de
+# redémarrages CONTINUE de monter pendant la fenêtre d'observation.
+#
+# core_restarted_since répond à une AUTRE question — « y a-t-il eu au moins un
+# redémarrage depuis le lancement ». Pour la plupart des services du cœur c'est
+# le bon juge : ils ne meurent que sur une configuration invalide, donc un seul
+# redémarrage est déjà un aveu. Pas pour osmo-pcu.
+#
+# osmo-pcu appelle exit(0) DE LUI-MÊME dès que la socket PCU de la BTS tombe —
+# osmo-pcu/src/pcuif_sock.c, fin de pcu_sock_close() — et confie sa relance au
+# superviseur. C'est un choix amont, pas un défaut. Or ce module démarre le PCU
+# AVANT la BTS (MOD_DEPS[pcu]="sgsn", et la BTS est au module 60) : la socket
+# apparaît ou disparaît forcément sous ses pieds, et chaque va-et-vient de la
+# BTS — teardown du run précédent, redémarrage de la BTS, deux run.sh qui se
+# partagent les mêmes unités systemd — produit UN redémarrage parfaitement
+# normal. core_restarted_since le rapportait en « OsmoPCU redémarre en boucle »
+# et arrêtait toute la séquence sur un service sain.
+#
+# Une boucle, c'est un compteur qui monte ENCORE — pas un compteur qui a bougé.
+core_restart_looping() {
+    local unit="$1" fenetre="${2:-6}" avant apres
+    core_alive "$unit" || return 0        # mort tout court : pire qu'une boucle
+    avant="$(core_nrestarts "$unit")"
+    sleep "$fenetre"
+    apres="$(core_nrestarts "$unit")"
+    [ "${apres:-0}" -gt "${avant:-0}" ] 2>/dev/null
+}
+
 # core_healthy <unité> : vivant ET pas en boucle de redémarrage.
 core_healthy() { core_alive "$1" && ! core_restarted_since "$1"; }
 
