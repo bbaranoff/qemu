@@ -478,6 +478,28 @@ for m in "${selected[@]}"; do
     STATE[$m]=ok; nb_ok=$((nb_ok+1))
 done
 
+# --- ARRET : BALAYAGE FINAL DES PYTHON DE LA MAQUETTE -------------------------
+# Les modules arretent ce qu'ils ont ENREGISTRE. Or la chaine compte plusieurs
+# scripts Python qui survivent a un run interrompu ou qui n'ont jamais ete
+# enregistres : pont.py, fake_trx.py, trxcon, si_bridge.py, gsm_sniff.py,
+# qemu_bcch_grgsm.py, record_drain.py. Il suffit qu'UN SEUL garde son port pour
+# que le run suivant echoue -- mesure du 2026-08-27 :
+#     [FAIL] BTS#1 simulated transceiver (port UDP 5720 deja pris par un autre
+#            processus)
+# et c'etait un fake_trx.py orphelin, invisible du registre.
+#
+# PORTEE, A SAVOIR AVANT DE LANCER CECI AILLEURS : killall python3 tue TOUS les
+# python3 de la machine, pas seulement ceux de la maquette. C'est assume sur un
+# banc dedie, et c'est exactement ce qui a ete demande. Sur une machine partagee,
+# poser CALYPSO_STOP_KILL_PYTHON=0.
+if [ "$ACTION" = stop ] && [ "${CALYPSO_STOP_KILL_PYTHON:-1}" != 0 ]; then
+    if killall python3 2>/dev/null; then
+        printf '  %spython3 restants termines (killall)%s\n' "${C_DIM:-}" "${C_Z:-}"
+    else
+        printf '  %saucun python3 restant%s\n' "${C_DIM:-}" "${C_Z:-}"
+    fi
+fi
+
 printf '\n%s\n' "$(t bilan "$nb_ok" "$nb_skip" "$nb_fail")"
 
 # --- épilogue : où est passée la pile, et comment la reprendre en main ---------
