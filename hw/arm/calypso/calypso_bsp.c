@@ -34,6 +34,7 @@
 #include "hw/arm/calypso/calypso_invariants.h"
 #include "hw/arm/calypso/calypso_twl3025.h"
 #include "hw/arm/calypso/calypso_trx.h"
+#include "hw/arm/calypso/calypso_gsm0502.h"  /* positions FCCH/SCH, definition unique */
 #include "calypso_tint0.h"  /* GSM_HYPERFRAME */
 #include "calypso_full_pcb.h"  /* DARAM lock helpers — voir pcb.h gap #3 */
 #include "calypso_dsp_shunt.h"
@@ -1592,8 +1593,58 @@ void calypso_bsp_rx_burst(uint8_t tn, uint32_t fn,
         const char *e = getenv("CALYPSO_FB_IQ_OWNS");
         _fbiq_owns = (e && atoi(e) > 0) ? 1 : 0;
     }
+    /* [2026-08-22] @BEQUILLE — BSP_DARAM_FCCH_ONLY (CALYPSO_BSP_DARAM_FCCH_ONLY,
+     *              atoi>0, defaut OFF)
+     *   masque  : le sequencement TPU. Le silicium livre TOUS les bursts a la
+     *             DARAM et c'est le DSP qui sait QUAND lire ; ici on fige la
+     *             derniere FCCH dans le tampon pour que la lecture ne puisse pas
+     *             tomber sur un burst non-FCCH.
+     *   retirer : des que la fenetre de lecture du DSP est calee (TPU/RIF). Tant
+     *             qu'il est actif, le verdict natif est fausse, au meme titre que
+     *             CALYPSO_GRGSM_FN_AUTOSYNC.
+     *   pourquoi : DARAM-WR-JUDGE v2 a prouve l'ecriture FIDELE (SRC == DST,
+     *             coh=0.998 dphi=+1.567 sur fn=224/234) -> l'entree est hors de
+     *             cause. Mais rx_burst ecrit a CHAQUE trame : 9 bursts non-FCCH
+     *             ecrasent le tampon entre deux FCCH. Ce gate tranche « timing »
+     *             contre « traitement DSP ».
+     *   FCCH = fn%51 dans {0,10,20,30,40} (canonique GSM 05.02 ; confirme par
+     *          DARAM-WR-JUDGE : fn=224 -> p51=20, fn=234 -> p51=30). */
+    int _skip_nonfcch = 0;
+    {
+        static int _dfo = -1;
+        if (_dfo < 0) {
+            const char *e = getenv("CALYPSO_BSP_DARAM_FCCH_ONLY");
+            _dfo = (e && atoi(e) > 0) ? atoi(e) : 0;   /* 1 = FCCH+SCH, 2 = FCCH seule */
+            fprintf(stderr, "[BSP] DARAM-FCCH-ONLY %s : %s\n",
+                    _dfo ? "ACTIF (BEQUILLE de diagnostic)" : "INACTIF (defaut)",
+                    (_dfo >= 2) ? "FCCH SEULE (affame le SB !)"
+                    : _dfo ? "trames FCCH + SCH (acquisition) ; les autres sont sautees"
+                         : "toutes les trames ecrivent la DARAM (comportement silicium)");
+        }
+        if (_dfo) {
+            int _p51 = (int)(fn % 51);
+            /* [2026-08-22] FCCH **ET** SCH. Avec la FCCH seule, la tache SB
+             * correlait la derniere FCCH au lieu du SCH : le mot SB sortait
+             * invalide (BSIC=54 T1=497 mais T2=30>25, T3p=5>4) et le DSP posait
+             * a juste titre B_SCH_CRC -> le firmware abandonnait avant
+             * d'assembler le SB. Meme piege que CALYPSO_RIF_FCCH_ONLY, deja
+             * documente : « nettoie le FB MAIS affame le SB ».
+             *   FCCH = {0,10,20,30,40} mod 51   (tache FB)
+             *   SCH  = {1,11,21,31,41} mod 51   (tache SB, canonique GSM 05.02)
+             * Mettre 2 pour restreindre a la FCCH seule (ancien comportement). */
+            bool _is_fcch = gsm0502_p51_is_fcch((unsigned)_p51);
+            bool _is_sch  = gsm0502_p51_is_sch((unsigned)_p51);
+            _skip_nonfcch = (_dfo >= 2) ? !_is_fcch : !(_is_fcch || _is_sch);
+            if (_skip_nonfcch) {
+                static unsigned _sk2 = 0;
+                if (_sk2++ < 6)
+                    fprintf(stderr, "[BSP] DARAM-FCCH-ONLY skip fn=%u (p51=%d, non-FCCH) "
+                            "-> la derniere FCCH reste en place\n", (unsigned)fn, _p51);
+            }
+        }
+    }
     calypso_pcb_daram_lock_acquire();
-    if (_fbiq_owns) {
+    if (_fbiq_owns || _skip_nonfcch) {
         static unsigned _sk = 0;
         if (_sk++ < 8)
             fprintf(stderr, "[BSP] FB-IQ-DARAM owns 0x2a00 : rx_burst DARAM write SKIP "
@@ -1885,22 +1936,39 @@ void calypso_bsp_deliver_buffered(uint32_t current_fn)
                         dlv_n, (unsigned)sl->fn, (unsigned)tn, n);
             dlv_n++;
         }
-        calypso_twl3025_apply_phase(sl->iq, sl->n / 2, sl->fn, (uint8_t)tn);
-
+        /* [2026-08-22] apply_phase DÉPLACÉ vers c54x_bsp_load (point de convergence
+         * de TOUS les feeds -> RIF). Ce chemin (deliver_buffered) n'est pas le
+         * chemin natif vivant, et l'appliquer ici seul laissait la boucle AFC
+         * ouverte sur le natif. Le laisser ici EN PLUS ferait une double rotation
+         * (deliver_buffered passe aussi par c54x_bsp_load). Retiré donc.
+         *
+         * [2026-08-25] MAIS il fallait aller au bout du déplacement. c54x_bsp_load
+         * tourne SA PROPRE COPIE (bsp.dsp->bsp_buf) ; il ne touche pas sl->iq. La
+         * boucle DARAM ci-dessous recopiait donc sl->iq — c'est-à-dire de l'I/Q
+         * NON TOURNÉ — alors qu'avant le déplacement elle voyait les échantillons
+         * tournés (apply_phase modifiait sl->iq sur place). Le tampon que le
+         * corrélateur FB lit en DARAM était le seul consommateur à avoir PERDU
+         * l'AFC. On écrit maintenant depuis bsp_buf, la copie tournée : une seule
+         * rotation, et les deux consommateurs voient la même chose. */
+        int nload = (n > 296) ? 296 : n;
         uint16_t samples[296];
-        for (int i = 0; i < n && i < 296; i++)
+        for (int i = 0; i < nload; i++)
             samples[i] = (uint16_t)sl->iq[i];
-        c54x_bsp_load(bsp.dsp, samples, n > 296 ? 296 : n);
+        c54x_bsp_load(bsp.dsp, samples, nload);
+        /* c54x_bsp_load a pu décimer (entrée 4 SPS) : bsp_len est la longueur
+         * qui fait foi après rotation, jamais `n`. */
+        const uint16_t *rot = bsp.dsp->bsp_buf;
+        int nrot = (bsp.dsp->bsp_len < nload) ? bsp.dsp->bsp_len : nload;
 
         /* ⚠️ TESTING : woff LOCAL (était static rolling cross-burst). */
         unsigned woff = 0;
         calypso_pcb_daram_lock_acquire();
-        for (int i = 0; i < n; i++) {
+        for (int i = 0; i < nrot; i++) {
             uint16_t a = (uint16_t)(bsp.daram_addr + woff);
             /* HACK CALYPSO_BSP_INJECT_CANARY : overwrite avec marker 0xCAFE
              * pour identifier le vrai buffer cible cote DSP via le hook
              * canary-read en c54x. Voir doc/TODO.md. */
-            uint16_t v = bsp.inject_canary ? 0xCAFE : (uint16_t)sl->iq[i];
+            uint16_t v = bsp.inject_canary ? 0xCAFE : rot[i];
             bsp.dsp->data[a] = v;
             bsp_daram_wr_bucket(a);
             woff++;
