@@ -255,7 +255,7 @@ calypso-ipc-device fake_trx trxcon grgsm_decode si_bridge.py qemu_bcch_grgsm"
     # C'est exactement la course que documente 09-teardown.sh l.60-65.
     # On repasse donc un coup a la toute fin, quand plus rien ne doit tourner.
     if [ "${CALYPSO_STOP_KILL_PYTHON:-1}" != 0 ]; then
-        if killall python3 2>/dev/null; then
+        if killall -9 python3 2>/dev/null; then
             printf '  python3 rescapes terminés (killall de fin)\n' >&2
         fi
     fi
@@ -309,6 +309,28 @@ if [ "$ACTION" = reset ]; then _reset; exit 0; fi
 # (ça relirait load.env dans un environnement déjà pollué) : on enchaîne dans
 # le même processus, dont l'environnement est exactement la ligne de commande.
 if [ "$ACTION" = restart ]; then _reset; ACTION=start; fi
+
+# ── BALAYAGE AU DEMARRAGE ─────────────────────────────────────────────────────
+# [2026-08-27] Le balayage n'existait que sur --stop et en fin de _reset. Or un
+# `./run.sh` simple ne passe par NI l'un NI l'autre : le module d'arret se declare
+# « already running » et rend la main, si bien qu'aucun python3 de la generation
+# precedente n'est touche. Il suffit alors d'UN orphelin pour tuer le run :
+#     [SKIP] Shutting down recorded processes (already running)
+#     [FAIL] BTS#1 simulated transceiver (port UDP 5720 deja pris)
+# -- et c'etait un fake_trx.py rescape, invisible du registre des modules.
+#
+# On balaie donc aussi a l'entree du demarrage. -9 et pas -15 : un python3 bloque
+# dans un recvfrom ignore SIGTERM et garde son port, ce qui est exactement le cas
+# qu'on veut eliminer.
+#
+# PORTEE : tue TOUS les python3 de la machine, pas seulement ceux de la maquette.
+# Assume sur un banc dedie. CALYPSO_STOP_KILL_PYTHON=0 le desactive.
+if [ "$ACTION" = start ] && [ "${CALYPSO_STOP_KILL_PYTHON:-1}" != 0 ]; then
+    if killall -9 python3 2>/dev/null; then
+        printf '  python3 de la generation precedente termines (killall -9)\n' >&2
+        sleep 1     # laisse le noyau rendre les ports UDP avant le premier bind
+    fi
+fi
 
 LOGDIR="${LOG_DIR:-/root/calypso/logs}"
 mkdir -p "$LOGDIR/mod" 2>/dev/null || true
@@ -508,7 +530,7 @@ done
 # banc dedie, et c'est exactement ce qui a ete demande. Sur une machine partagee,
 # poser CALYPSO_STOP_KILL_PYTHON=0.
 if [ "$ACTION" = stop ] && [ "${CALYPSO_STOP_KILL_PYTHON:-1}" != 0 ]; then
-    if killall python3 2>/dev/null; then
+    if killall -9 python3 2>/dev/null; then
         printf '  %spython3 restants termines (killall)%s\n' "${C_DIM:-}" "${C_Z:-}"
     else
         printf '  %saucun python3 restant%s\n' "${C_DIM:-}" "${C_Z:-}"
