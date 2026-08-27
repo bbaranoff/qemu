@@ -49,7 +49,6 @@
 #include "calypso_dsp_shunt.h"
 #include "hw/arm/calypso/calypso_trf6151.h"
 #include "hw/arm/calypso/calypso_twl3025.h"
-#include "hw/arm/calypso/calypso_gsm0502.h"  /* positions FCCH/SCH, definition unique */
 #include "calypso_c54x.h"   /* C54xState + c54x_bsp_load/run/interrupt_ex/wake (CALYPSO_DSP=c54x route) */
 #include "calypso_layer1.h" /* calypso_l1_c_active() : ungate SB/SI (+FB) sous CALYPSO_L1=c */
 #include "hw/arm/calypso/calypso_dsp_internal.h" /* shared state + NDB-write primitives (split) */
@@ -1015,17 +1014,9 @@ void calypso_dsp_shunt_set_dcch_active(int on)
  * (TCH compris, c'est ce qui avait tue le 0x07 en signalisation), la
  * presentation continuait de tirer pendant tout l'appel voix sur une fenetre
  * fn%51 qui ne veut rien dire dans une multitrame de 26 -> le firmware relisait
- * un bloc de SI pose hors phase dans a_cd et rendait « Short header message type
+ * du SI5/SI6 pose hors phase dans a_cd et rendait « Short header message type
  * 0x07 unsupported » EN RAFALE PENDANT LA COMMUNICATION (mesure du 10/08 :
  * 5 occurrences entre 09:12:05 et 09:12:29, sur un run ou le LU passait).
- *
- * [2026-08-27] ATTRIBUTION CORRIGEE : ce n'est pas SI5/SI6, c'est SI4 -- et le
- * « 0x07 » n'est pas l'octet lu. Sur un lien SACCH, lapdm.c saute l'en-tete L1
- * de deux octets et lit l2h[2] ; pour le bloc SI4 (« 31 06 1c ») c'est 0x1c, le
- * TYPE DE MESSAGE de SI4. Or 0x1c & 0x3 == 0 -> LAPDm_ADDR_SHORT_L2 nul ->
- * format Bter -> gsm48_rr_rx_acch lit msg_type = (0x1c >> 2) & 0x1F = 0x07.
- * SI5 (0x1d) et SI6 (0x1e) donneraient « unsupported SAPI 7 », qu'aucun run
- * ne montre : 0 occurrence sur le run 14:06 pour 51 « 0x07 ».
  * On coupe donc la presentation sur TCH : le SACCH de l'appel arrive par le
  * decodeur TCH (si_bridge, is_sacch = fn%26), pas par cette fenetre-ci. */
 void calypso_dsp_shunt_set_dcch_tch(int on);   /* -Werror=missing-prototypes */
@@ -1043,94 +1034,6 @@ void calypso_dsp_shunt_set_dcch_tch(int on)
 /* Declaration anticipee : la garde interroge la fraicheur du SACCH dedie,
  * defini plus bas. Idiome du fichier, il n y a pas d en-tete. */
 static bool shunt_tch_fresh(bool valid, uint32_t tick);
-/* [2026-08-27] FENETRE DU CANAL DEDIE -- LA MEME QUE CELLE DE L ANNEAU SDCCH.
- *
- * a_cd a TROIS ecrivains : le SI du camp, la presentation SACCH dediee, et
- * l anneau SDCCH de calypso_dsp_helper.c. Seul le troisieme se donne une
- * fenetre : il ne pose son bloc que si (shunt_l1s_fn() + ofs) % 51 tombe dans la
- * region SDCCH du type de canal (« fenetre-UNION », calypso_dsp_helper.c). Le
- * camp, lui, ecrit a CHAQUE tick des que la garde est basse -- y compris dans
- * cette fenetre, ou le bloc n a pour lecteur que le canal dedie. C est de la que
- * sortent les « unsupported SAPI » chiffres dans la garde ci-dessous.
- *
- * Cette fonction REJOUE la fenetre de l anneau pour pouvoir en exclure le camp.
- * Les deux doivent rester en phase : si la fenetre-union bouge dans
- * calypso_dsp_helper.c, elle bouge ici.
- *
- * @BEQUILLE INVERSE -- DCCH_SI_WINDOW_MUTE (CALYPSO_DCCH_SI_WINDOW_MUTE, def. 0)
- *   L etat OFF est le comportement historique : le camp ecrit dans la fenetre et
- *   on ravale les rejets. ON = le camp se tait dans la fenetre, l anneau SDCCH et
- *   la presentation SACCH y restant seuls maitres. Le defaut est 0 parce que ce
- *   chemin n a PAS ete valide en run : la garde voisine documente quatre
- *   corrections successives dont trois se sont revelees fausses, on n ajoute pas
- *   la cinquieme sans mesure.
- *   retirer : quand a_cd est alimente par la demodulation native -- chaque bloc
- *             arrive alors a SA place dans la multitrame (TODO shunt_dispatch_nb).
- */
-/* Base fn%102 de la SACCH du sous-canal dedie courant -- MEME table que
- * shunt_dcch_sacch_present(), factorisee pour que les deux ne divergent pas.
- * GSM 05.02 : SACCH/C4 SS0..3 -> 42, 46, 93, 97 ; SACCH/C8 SS0..7 -> 32, 36,
- * 40, 44, 83, 87, 91, 95. */
-static uint32_t shunt_dcch_sacch_base(void)
-{
-    static const uint8_t base4[4] = { 42, 46, 93, 97 };
-    static const uint8_t base8[8] = { 32, 36, 40, 44, 83, 87, 91, 95 };
-    if (g_shunt.sdcch_ch8)
-        return base8[(g_shunt.sdcch_ss / 4u) & 7u];
-    switch (g_shunt.sdcch_ss) {
-    case 26: return base4[1];
-    case 32: return base4[2];
-    case 36: return base4[3];
-    default: return base4[0];            /* 22 = SS0 */
-    }
-}
-
-static bool shunt_dcch_si_window(void)
-{
-    static int on = -1, ofs = 0;
-    if (on < 0) {
-        /* [2026-08-27] DEFAUT PASSE A 1. La premiere version etait a 0, faute de
-         * mesure. La mesure existe : sur un run de 4576 lignes de mobile.log,
-         * 425 « unsupported SAPI » (6 x181, 4 x79, 2 x78, 5 x72, 1 x15), 39
-         * « Short header 0x07 », 49 « Unnumbered frame not allowed » (-> 50
-         * MDL-ERROR cause 12) et 3 « multi-octet length ». Sur le seul lien
-         * SACCH : 46 trames recues, 9 acceptees, 37 rejetees -- QUATRE BLOCS SUR
-         * CINQ jetes. Poser 0 revenait a garder ce taux.
-         * CALYPSO_DCCH_SI_WINDOW_MUTE=0 retablit l ancien comportement. */
-        const char *e = getenv("CALYPSO_DCCH_SI_WINDOW_MUTE"); on  = (!e || *e != '0');
-        const char *o = getenv("CALYPSO_SHUNT_SDCCH_OFS");     ofs = o ? atoi(o) : 0;
-    }
-    if (!on) return false;
-
-    /* 1. Fenetre du canal PRINCIPAL -- memes bornes que l anneau SDCCH de
-     *    calypso_dsp_helper.c : arme -> [0,31] en /8, [22,39] en /4 ; pas encore
-     *    arme -> union [0,39], le type n etant pas positivement connu.
-     *    C est de la que sortent les SAPI 5/6/2/4 (l2h[0] = pseudo-longueur du
-     *    bloc BCCH lue comme octet d adresse LAPDm). */
-    {
-        int armed = g_shunt.sdcch_ss_set;
-        int lo = armed ? (g_shunt.sdcch_ch8 ? 0  : 22) : 0;
-        int hi = armed ? (g_shunt.sdcch_ch8 ? 31 : 39) : 39;
-        int tc = (int)((((long)shunt_l1s_fn() + ofs) % 51 + 51) % 51);
-        if (tc >= lo && tc <= hi) return true;
-    }
-
-    /* 2. Fenetre SACCH du canal dedie -- fn%102, cadence DIFFERENTE de la
-     *    precedente, donc non couverte par elle. C est de la que sortent le
-     *    « Short header 0x07 » (SI4 : l2h[2] = 0x1c, & 3 == 0 -> Bter ->
-     *    msg_type 0x07), les SAPI 6 issus de SI1/SI2/SI3 (l2h[2] = 0x19/1a/1b)
-     *    et les « Unnumbered frame not allowed » du lien SACCH.
-     *    Inutile sur TCH : la fenetre fn%102 heritee du SDCCH y est hors phase
-     *    (multitrame de 26) -- meme raison qu au point 22 de
-     *    calypso_dsp_shunt_set_dcch_tch. */
-    if (g_shunt.sdcch_ss_set && !g_shunt.dcch_is_tch) {
-        uint32_t b = shunt_dcch_sacch_base();
-        uint32_t f102 = (uint32_t)calypso_trx_get_fn() % 102u;
-        if (f102 >= b && f102 <= b + 3u) return true;
-    }
-    return false;
-}
-
 static bool shunt_dcch_si_guard(void)
 {
     static int ttl = -1;
@@ -1149,34 +1052,14 @@ static bool shunt_dcch_si_guard(void)
      * precis ou le mobile doit monter son LAPDm.
      *
      * L ARBITRAGE. Un SI du camp presente sur un canal dedie est un contenu FAUX :
-     * la couche 3 le rejette avec un simple NOTICE, le canal survit. Un SACCH
-     * absent est une FAMINE : le compteur de lien radio descend et
-     * l etablissement echoue. Entre les deux,
+     * la couche 3 le rejette avec un simple NOTICE (« Short header message type
+     * 0x07 unsupported »), le canal survit. Un SACCH absent est une FAMINE : le
+     * compteur de lien radio descend et l etablissement echoue. Entre les deux,
      * le bruit vaut mieux que le silence -- d ou les REJ puis DISC observes sur
      * a_fu, et l ASSIGNMENT COMPLETE qui ne trouvait aucun lien pour partir.
      *
      * On ne supprime donc que si un SACCH dedie alimente REELLEMENT a_cd. Sinon
      * on laisse passer le camp, on ravale les 0x07, et le canal vit. */
-    /* [2026-08-27] CE QUE COUTE EXACTEMENT LE BRUIT -- MESURE, ET PAS CELUI QUE
-     * L ARBITRAGE CI-DESSUS NOMME. Le rejet dominant n est pas
-     * « Short header 0x07 » mais lapdm.c:909
-     * « Received frame for unsupported SAPI N! ». LAPDm lit le PREMIER octet du
-     * bloc comme octet d adresse -- sapi = (octet >> 2) & 7 -- alors qu un bloc
-     * BCCH commence par la PSEUDO-LONGUEUR L3, jamais par une adresse. Pose sur
-     * le canal PRINCIPAL (lien DCCH, l2h[0]) :
-     *     SI1 « 55 06 19 » -> sapi 5      SI2 « 59 06 1a » -> sapi 6
-     *     SI3 « 49 06 1b » -> sapi 2      SI4 « 31 06 1c » -> sapi 4
-     * Pose sur le lien SACCH (l2h[2], apres saut de l en-tete L1) :
-     *     SI1/SI2/SI3 (0x19/0x1a/0x1b) -> sapi 6 ; SI4 (0x1c) -> Bter, d ou le
-     *     « Short header 0x07 » (cf. calypso_dsp_shunt_set_dcch_tch).
-     * Et un bloc SACCH pose sur le canal principal donne l2h[0] = 0x07 --
-     * l octet tx_power de l en-tete L1 -- donc sapi 1.
-     *
-     * RELEVE DU RUN 14:06 (mobile.log) : SAPI 6 x95, 4 x38, 2 x37, 5 x33, 1 x6,
-     * plus 51 « Short header 0x07 ». 209 blocs descendants jetes sur le canal
-     * dedie, donc autant de retransmissions LAPDm. Le canal survit -- l arbitrage
-     * tient -- mais ce n est pas gratuit, et la part la plus grosse est evitable
-     * sans y toucher : cf. shunt_dcch_si_window() juste au-dessus. */
     /* [2026-08-09] LE REMPLACANT EXISTE MAINTENANT — cf. shunt_dcch_sacch_fill().
      * La revision precedente renoncait a supprimer quand aucun SACCH dedie
      * n alimentait a_cd (mesure : elle renoncait 3 fois sur 4, faute de source
@@ -1676,53 +1559,12 @@ static void shunt_dcch_sacch_present(uint16_t *d)
     }
 
     if (!g_shunt.sacch_have) {
-        /* [2026-08-27] « le mobile le refuserait » ETAIT FAUX, ET C EST DE LA QUE
-         * VENAIENT LES 0x07.
-         *
-         * L ancien texte disait : « Rien de valide a presenter : on ne met PAS de
-         * bourrage (le mobile le refuserait), on laisse le camp reprendre la main
-         * -- ses 0x07 sont un NOTICE, alors qu une trame invalide leve une
-         * MDL-Error. » Les deux moities de l arbitrage sont fausses.
-         *
-         * 1. Le mobile ne refuse PAS une trame de bourrage. mobile.log le montre
-         *    87 fois sur le canal principal : « lapd_core.c:1131 length=0
-         *    (discarding) » -- UI recue, L3 vide, jetee EN SILENCE, zero erreur.
-         *    C est le comportement normal d une trame de remplissage LAPDm.
-         *
-         * 2. Laisser le camp reprendre la main n est pas neutre. Le bloc du camp
-         *    est du BCCH (format Bbis : pseudo-longueur en tete, PAS d en-tete
-         *    LAPDm). Lu sur un lien SACCH, lapdm.c saute l en-tete L1 de 2 octets
-         *    et prend l2h[2] pour l octet d adresse. Pour SI4 (« 31 06 1c ») c est
-         *    0x1c, le type de message : 0x1c & 3 == 0 -> LAPDm_ADDR_SHORT_L2 nul
-         *    -> format Bter -> gsm48_rr_rx_acch lit msg_type = (0x1c >> 2) & 0x1F
-         *    = 0x07 -> « Short header message type 0x07 unsupported ». Pour
-         *    SI1/SI2/SI3 (0x19/0x1a/0x1b) c est sapi 6 -> « unsupported SAPI ».
-         *    Et quand l octet de controle tombe sur un type U inconnu, c est
-         *    lapd_core.c:1345 -> MDL-ERROR-IND cause 12, precisement l erreur que
-         *    l arbitrage disait vouloir eviter.
-         *
-         * MESURE (run du 27/08, 10920 lignes de mobile.log) : 68 « 0x07 », 95
-         * « Unnumbered frame not allowed », 220 MDL-ERROR-IND, et sur le seul lien
-         * SACCH 106 trames recues pour 11 acceptees. Le « NOTICE inoffensif » etait
-         * en fait 90 % du SACCH descendant a la poubelle.
-         *
-         * On presente donc une trame B4 de bourrage, batie comme le seed de
-         * calypso_dsp_shunt_feed_si : en-tete L1 SACCH (2 o) + adresse + controle
-         * UI + pseudo-longueur L3 nulle + 0x2B. Le mobile la range en B4 (0x03 & 3
-         * == 3, donc pas de Bter), lit L3 = 0 et la jette sans un mot. */
-        uint8_t fill[23];
-        memset(fill, 0x2b, sizeof(fill));
-        fill[0] = 0x00;                     /* en-tete L1 SACCH : tx_power       */
-        fill[1] = 0x00;                     /* en-tete L1 SACCH : timing advance */
-        fill[2] = 0x03;                     /* LAPDm adresse : SAPI 0, EA=1      */
-        fill[3] = 0x03;                     /* LAPDm controle : UI -> format B4  */
-        fill[4] = (uint8_t)((0 << 2) | 0x01);   /* pseudo-longueur L3 = 0        */
-        shunt_ndb_hdr(d, ndb_w(g_ndb.a_cd), true);
-        shunt_ndb_put_l2(d, ndb_w(g_ndb.a_cd), fill);
+        /* Rien de valide a presenter : on ne met PAS de bourrage (le mobile le
+         * refuserait), on laisse le camp reprendre la main -- ses 0x07 sont un
+         * NOTICE, alors qu une trame invalide leve une MDL-Error. */
         static unsigned long long muet;
         if (++muet % 5000 == 1)
-            SHUNT_LOG("DCCH-SACCH : aucun SI5/SI6 disponible (#%llu) -- bourrage "
-                      "LAPDm B4 presente (le camp ne reprend plus la main)\n", muet);
+            SHUNT_LOG("DCCH-SACCH : aucun SI6 disponible (#%llu) -- le camp reprend\n", muet);
         return;
     }
 
@@ -1927,6 +1769,164 @@ static void shunt_dispatch_tch_sacch(uint8_t page_idx)
  * helper wp_base() existant. Replique la DMA de trx calypso_dsp_done(@711) :
  * data[0x0584]=page, data[0x0585]=fn, data[0x0586+i]=wp[i] (i<20), et le mirror
  * api_ram[0x08E2 - C54X_API_BASE]=page (d_dsp_page cote DSP, lu par le firmware). */
+/* Lecture DIRECTE de l'espace data[] du c54x pour une adresse API ARM,
+ * SANS round-trip MMIO calypso_dsp_read (qui prend calypso_pcb_daram_lock,
+ * mutex non-recursif -> re-lock/abort quand on est deja dans le contexte
+ * frame-tick). Meme mapping que calypso_dsp_read : ARM off O -> data[O/2+0x800]. */
+static inline uint16_t shunt_c54x_api_rd(C54xState *dsp, uint32_t arm_addr)
+{
+    return dsp->data[((arm_addr - 0xFFD00000UL) >> 1) + 0x0800];
+}
+
+/* [2026-07-24] CADENCE SPLIT : shunt_route_to_c54x() etait appelee UNIQUEMENT
+ * quand g_shunt.pending (= l'ARM vient de poster un NOUVEAU d_dsp_page), soit
+ * ~1 fois toutes les ~12 trames reelles en pratique (mesure runtime : 708 insn
+ * DSP/tour mais ~57ms reels/tour -- le go-live retry loop du DSP n'a donc
+ * qu'une fraction de son temps reel pour attraper la fenetre de survie de
+ * data[0x0810]/d_ctrl_system, contrairement au natif ou c54x_run tourne a
+ * chaque trame SANS gate sur un dispatch ARM frais). Le natif ne connait pas
+ * ce probleme : calypso_tdma_tick() appelle c54x_run() inconditionnellement
+ * (gate uniquement sur running/idle/shunt_active), jamais sur "tache neuve".
+ *
+ * Fix : separer le header (partie A, a besoin de page_idx/d_fn FRAIS, donc
+ * reste gate sur pending -- cf le fix staleness du meme jour juste au-dessus)
+ * du wake+run (partie B, ne depend pas d'un dispatch frais : rejoue le
+ * dernier IQ connu, tire l'IT frame, tourne le budget DSP -- exactement ce
+ * que native fait a chaque trame). Partie B devient appelable a CHAQUE trame,
+ * pending ou pas, pour retrouver une cadence proche du natif (~217Hz au lieu
+ * de ~17Hz). */
+static void shunt_route_to_c54x_header(uint8_t page_idx)
+{
+    C54xState *dsp = g_shunt.c54x;
+    if (!dsp)
+        return;
+    fprintf(stderr, "[c54x-route] enter page=%u dsp=%p\n", (unsigned)page_idx, (void*)dsp);
+
+    /* (a) API write-page -> DARAM 0x0586 (replique de la DMA trx gatee a :711).
+     * wp_base(page_idx) = adresse MMIO absolue de la write-page (== dsp_ram).
+     * Le mot d_dsp_page (NDB+0 = 0xFFD001A8) est lu live (= s->dsp_ram[0x01A8/2]
+     * cote trx) pour data[0x0584] et le mirror 0x08E2. */
+    {
+        uint32_t wbase    = wp_base(page_idx);
+        fprintf(stderr, "[c54x-route] a1 wbase=0x%08x\n", wbase);
+        /* [2026-07-24] FIX RACE : l'ancien lisait dsp->data[NDB_D_DSP_PAGE]=data[0x08E2]
+         * ICI-MEME (mid-frame), une cellule que data[0x08E2] toggle entre ce
+         * moment et le FRAME-IT qui suit dans CETTE MEME invocation (confirme
+         * runtime : a2 voit 186/186 fois 0x0000, FRAME-IT# voit 559/559 fois
+         * 0x0003, sur la MEME cellule -- pas un bug d'adresse, un bug de
+         * timing/staleness). page_idx (parametre) est DEJA la valeur fraiche,
+         * capturee au moment de l'ecriture ARM (cf ligne ~135 :
+         * page_idx = (new_d_dsp_page & B_GSM_PAGE) ? 1 : 0). On reconstruit
+         * dsp_page depuis cette valeur connue-fraiche au lieu de relire une
+         * cellule sujette a race, evitant de repropager du perime dans
+         * data[0x0584]/api_ram[0x08E2] ci-dessous. */
+        uint16_t dsp_page = B_GSM_TASK | page_idx;
+        /* [2026-07-29] La « race » decrite juste au-dessus n'en etait pas une :
+         * a2 affichait data[0x08E2] (jamais ecrit) et le FRAME-IT affichait
+         * api_ram[0x08E2] (ecrit par le miroir ci-dessous) — deux tableaux
+         * distincts, deux valeurs, aucune course. Et 0x08E2 n'etait de toute
+         * facon pas la bonne cellule : d_dsp_page = 0x08D4 (cf calypso_fbsb.h).
+         * On affiche desormais la cellule que la ROM lit reellement, dans le
+         * tableau qu'elle lit reellement (api_ram). */
+        fprintf(stderr, "[c54x-route] a2 dsp_page=0x%04x (from page_idx=%u, "
+                "api_ram[0x%04x]=0x%04x) api_ram=%p\n",
+                dsp_page, (unsigned)page_idx, NDB_D_DSP_PAGE,
+                dsp->api_ram ? dsp->api_ram[NDB_D_DSP_PAGE - C54X_API_BASE]
+                             : dsp->data[NDB_D_DSP_PAGE],
+                (void*)dsp->api_ram);
+        dsp->data[0x0584] = dsp_page;
+        dsp->data[0x0585] = (uint16_t)(g_shunt.d_fn & 0xFFFF);
+        fprintf(stderr, "[c54x-route] a3 data-hdr-ok\n");
+        for (int i = 0; i < 20; i++)
+            dsp->data[0x0586 + i] = shunt_c54x_api_rd(dsp, wbase + (uint32_t)i * 2);
+        fprintf(stderr, "[c54x-route] a4 wp-copy-ok\n");
+        /* [2026-07-29] Miroir d_dsp_page cote DSP. Ecrivait 0x08E2 = d_dsp_state :
+         * la page ecrasait le C_DSP_IDLE3 pose par l'ARM (dsp.c:215), et la ROM,
+         * qui lit 0x08D4 (0xa51c/0xc8ea), ne voyait rien. Corrige a la source —
+         * ce qui remplit la condition de retrait de la bequille FIX_DPAGE_OFF
+         * (calypso_c54x.c), retiree du meme coup. */
+        if (dsp->api_ram)
+            dsp->api_ram[NDB_D_DSP_PAGE - C54X_API_BASE] = dsp_page;
+    }
+    fprintf(stderr, "[c54x-route] a-daram-ok\n");
+}
+
+static void shunt_route_to_c54x_run(void)
+{
+    C54xState *dsp = g_shunt.c54x;
+    if (!dsp)
+        return;
+
+    /* (b) rejoue le dernier burst I/Q (cs16 entrelace I,Q) dans bsp_buf. */
+    if (g_shunt.last_iq_valid && g_shunt.last_iq_n > 0)
+        c54x_bsp_load(dsp, (const uint16_t *)g_shunt.last_iq, g_shunt.last_iq_n);
+
+    fprintf(stderr, "[c54x-route] b-bsp-load-ok n=%d\n", g_shunt.last_iq_n);
+    /* (c) INT3 FRAME + wake : reveille le DSP s'il etait idle/halt. */
+    g_c54x_int3_src = 3;
+    /* [2026-07-22] FRAME_IT_NATIVE : tick propre — livre le scheduler frame
+     * (vec28/bit12) DIRECTEMENT au frame-tick, pas via le remap 19/3. Le
+     * c54x_irq_level_check le prend quand INTM=0 (prise naturelle, pas de force).
+     * = le vrai primitif HW frame-sync. Sinon (legacy) : vec19/bit3 (+remap VEC28). */
+    {
+        /* @BEQUILLE — FRAME_IT_NATIVE  (CALYPSO_FRAME_IT_NATIVE, EXISTS ; :=1 en
+         *              native / native_helped / wire)
+         *   masque  : l'absence de cablage frame-TPU -> vecteur DSP. On appelle
+         *             directement c54x_interrupt_ex(dsp,28,12) au frame-tick au lieu de
+         *             19/3 (le stub vec19 est un RETE).
+         *   retirer : quand le TPU delivre l'IT frame sur le bon vecteur tout seul
+         *             (idem VEC28_REMAP cote calypso_c54x.c).
+         */
+        static int fin = -1;
+        if (fin < 0) fin = calypso_gate("CALYPSO_FRAME_IT_NATIVE", 0);
+        if (fin)
+            c54x_interrupt_ex(dsp, 28, 12);   /* scheduler frame IT, tick propre */
+        else
+            c54x_interrupt_ex(dsp, C54X_INT_FRAME_VEC, C54X_INT_FRAME_BIT);
+        /* [2026-07-23] TINT MASTER CLOCK sync frame : fire TINT au MEME tick TDMA
+         * (pas per-2000-insn). Handler 0x72d3 = driver slots op.
+         * [2026-08-03] CAL000 §5.1 : TINT = bit3/vec19, pas bit4/vec20 (= RINT/SPI
+         * receive). Bascule sous le sas CALYPSO_IT_TABLE_DOC, cf. calypso_c54x.c. */
+        {
+            /* @BEQUILLE — TINT0_MASTER (fire au frame-tick)  (CALYPSO_TINT0_MASTER, EXISTS,
+             *              defaut OFF hors profil WIRE)
+             *   masque  : la configuration/demarrage du TIMER0 par le ROM. Le firmware arrete
+             *             le timer (TSS=1) dans une init non-tournee ; on fabrique TINT
+             *             a la cadence trame.
+             *   retirer : quand la sequence d'init TIMER0 du ROM s'execute (TCR programme).
+             */
+            static int _t0m = -1;
+            if (_t0m < 0) _t0m = calypso_gate("CALYPSO_TINT0_MASTER", 0);
+            if (_t0m) {
+                static int _doc = -1;
+                if (_doc < 0) _doc = calypso_gate("CALYPSO_IT_TABLE_DOC", 0);
+                if (_doc)   /* §5.1 : TINT = IMR bit 3 / vec 19 */
+                    c54x_interrupt_ex(dsp, C54X_IT_TINT_VEC, C54X_IT_TINT_BIT);
+                else        /* legacy SPRU131 : en fait RINT / SPI receive */
+                    c54x_interrupt_ex(dsp, C54X_IT_SPI_RX_VEC, C54X_IT_SPI_RX_BIT);
+            }
+        }
+    }
+    c54x_wake(dsp);
+    /* revive: c54x_run loop gate = (running && !idle). c54x_wake ne clear que
+     * idle ; en mode route_c54x le chemin trx qui posait running=true est gate
+     * off -> forcer running ici sinon la boucle c54x_run est sautee (0 insn). */
+    dsp->running = true;
+
+    fprintf(stderr, "[c54x-route] c-wake-ok running=%d idle=%d\n", dsp->running, dsp->idle);
+    /* (d) execute le budget (1 trame nominale ~256000 insns ; ajustable env). */
+    {
+        static int budget = -1;
+        if (budget < 0) {
+            const char *b = getenv("CALYPSO_DSP_BUDGET");
+            budget = (b && *b) ? atoi(b) : 256000;
+            if (budget <= 0) budget = 256000;
+        }
+        fprintf(stderr, "[c54x-route] d-pre-c54x_run budget=%d\n", budget);
+        c54x_run(dsp, budget);
+        fprintf(stderr, "[c54x-route] d-c54x_run-RETURNED\n");
+    }
+}
 
 /* ---- Service hook : called from calypso_trx frame_irq tick ---- */
 /* [AFC loop-close v2] derniere mesure de frequence BRUTE du FCCH (Hz), pour
@@ -2119,21 +2119,15 @@ void calypso_dsp_shunt_on_frame_tick(void)
              * enroule -> le firmware enroule au rail sur une valeur stale. Ici
              * l'erreur effective DECROIT a mesure que le DAC monte -> converge. */
             if (g_rx_raw_valid) {
-                /* [2026-08-25] `raw - get_afc_hz()` codait en dur le signe de la
-                 * rotation. Depuis l inversion de ce signe (twl3025), apply_phase
-                 * AJOUTE +hz au bande de base tandis qu on en retranchait hz :
-                 * rx_afc annonçait une correction opposee a celle appliquee, soit
-                 * un residu faux de 2*hz. get_afc_applied_hz() porte le signe. */
-                double _applied = calypso_twl3025_get_afc_applied_hz();
-                double _eff = g_rx_raw_hz + _applied;
+                double _eff = g_rx_raw_hz - calypso_twl3025_get_afc_hz();
                 double _a = _eff * (65536.0 / 86208.0);
                 if (_a >  32767.0) _a =  32767.0;
                 if (_a < -32768.0) _a = -32768.0;
                 g_shunt.rx_afc = (int16_t)_a;
                 static unsigned _afl = 0;
                 if ((_afl++ % 200) == 0)
-                    fprintf(stderr, "[AFC-LOOP] raw=%.0fHz applique=%.0fHz eff=%.0fHz -> rx_afc=%d\n",
-                            g_rx_raw_hz, _applied, _eff, g_shunt.rx_afc);
+                    fprintf(stderr, "[AFC-LOOP] raw=%.0fHz dac_hz=%.0f eff=%.0fHz -> rx_afc=%d\n",
+                            g_rx_raw_hz, calypso_twl3025_get_afc_hz(), _eff, g_shunt.rx_afc);
             }
             /* [DECAN model-fidelity] garder le VRAI rx_snr (coherence feed_iq)
              * quand DECAN_SNR actif, sinon le de-can SNR est defait ici. */
@@ -2420,7 +2414,6 @@ void calypso_dsp_shunt_on_frame_tick(void)
              * garde-fou sdcch_valid juste a cote. En dedie le mobile ne lit pas le
              * BCCH : aucun SI n'est perdu. */
             if (g_shunt.si_valid && !g_shunt.sdcch_valid && !shunt_dcch_si_guard()
-                && !shunt_dcch_si_window()
                 && !g_shunt.tch_cfg_valid
                 && !(g_shunt.agch_valid && (g_shunt.agch_buf[2] == 0x3f
                      || g_shunt.agch_buf[2] == 0x3a || g_shunt.agch_buf[2] == 0x3b))
@@ -3794,9 +3787,8 @@ void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
          * s2=0x0000` — le feed ecrivait des ZEROS depuis le debut. Confirme
          * independamment par tools_/corr_iq.py : bursts non nuls a fn%51 ∈
          * {0,10,20,30,40}. Gate CALYPSO_FEED_FN_CANON=0 pour restaurer le +1. */
-        int _is_fcch = feed_fn_canon()
-                       ? gsm0502_p51_is_fcch((unsigned)_p)
-                       : gsm0502_p51_is_fcch_legacy_plus1((unsigned)_p);
+        int _is_fcch = feed_fn_canon() ? ((_p % 10 == 0) && (_p <= 40))
+                                       : ((_p % 10 == 1) && (_p <= 41));
         /* @BEQUILLE — FB_IQ_MARKER  (CALYPSO_FB_IQ_MARKER, atoi>0, defaut OFF)
          *   masque  : rien de reel — remplace l'IQ par une RAMPE 0x1000+woff pour tester
          *             la reachabilite de la vue DARAM du noyau. Court-circuite la branche
@@ -3890,9 +3882,8 @@ void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
             /* [2026-08-22] CORRIGE : le SCH est en {1,11,21,31,41} (canonique
              * GSM 05.02, prouve par FN-ALIGN sch%51). J'avais herite de la fausse
              * premisse « FCCH=+1 » du bloc FB et vise {2,12,22,32,42} -> zeros. */
-            int _is_sch = feed_fn_canon()
-                          ? gsm0502_p51_is_sch((unsigned)_sp)
-                          : gsm0502_p51_is_sch_legacy_plus1((unsigned)_sp);
+            int _is_sch = feed_fn_canon() ? ((_sp % 10 == 1) && (_sp <= 41))
+                                          : ((_sp % 10 == 2) && (_sp <= 42));
             if (_is_sch) {
                 uint16_t base = _sbbase; int dl = 0x128; int woff = 0;
                 /* /!\ 0x0e4e est DANS la fenetre API (0x0800..0x27FF) : c'est
@@ -4016,9 +4007,7 @@ void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
                      * -> 0 => convergence (gain~1, init -700). fs=1083333 (4 SPS). */
                     double raw_hz = resid * (1083333.0 / (2.0 * M_PI));
                     g_rx_raw_hz = raw_hz; g_rx_raw_valid = 1; /* memo pour recompute per-tick */
-                    /* [2026-08-25] cf. AFC-LOOP : residu = brut + ce qui a ete
-                     * REELLEMENT applique aux echantillons (signe compris). */
-                    double eff_hz = raw_hz + calypso_twl3025_get_afc_applied_hz();
+                    double eff_hz = raw_hz - calypso_twl3025_get_afc_hz();
                     double a = eff_hz * (65536.0 / 86208.0);
                     if (a >  32767.0) a =  32767.0;
                     if (a < -32768.0) a = -32768.0;
