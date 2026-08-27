@@ -245,6 +245,21 @@ calypso-ipc-device fake_trx trxcon grgsm_decode si_bridge.py qemu_bcch_grgsm"
         [ -e "$art" ] && rm -f "$art" 2>/dev/null && printf '  supprimé              %s\n' "$art" >&2
     done
 
+    # ── BALAYAGE FINAL DE _reset ────────────────────────────────────────────
+    # Le `"$0" --stop` du debut fait deja un killall python3. Mais il tourne
+    # AVANT l'archivage des journaux, qui peut durer des dizaines de secondes
+    # (mesure du 30/07 : 62 Mo -> ~40 s). Pendant cette fenetre, le lanceur
+    # differe du pont arme par start-direct.sh peut se reveiller et re-binder
+    # 5700-5702 : on repart alors avec un pont de la generation PRECEDENTE,
+    # desynchronise du BTS qui vient de redemarrer -- SABM sans UA, LU en echec.
+    # C'est exactement la course que documente 09-teardown.sh l.60-65.
+    # On repasse donc un coup a la toute fin, quand plus rien ne doit tourner.
+    if [ "${CALYPSO_STOP_KILL_PYTHON:-1}" != 0 ]; then
+        if killall python3 2>/dev/null; then
+            printf '  python3 rescapes terminés (killall de fin)\n' >&2
+        fi
+    fi
+
     printf '\nÉtat propre. Relancez, la ligne de commande fera foi :\n' >&2
     printf '   CALYPSO_MODE=native ./run.sh\n\n' >&2
 }
