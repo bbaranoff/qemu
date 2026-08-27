@@ -96,6 +96,15 @@
 #define NDB_A_DU_0          0x2A0  /* UL traffic FR sub1 (cf PIEGE #1 : sub0 = a_du_1) */
 #define NDB_A_DD_1          0x108  /* DL traffic FR sub1 */
 #define NDB_A_DU_1          0x134  /* PIEGE #1 : UL sub0 = a_du_1 (PAS a_du_0=0x2A0) cf prim_tch.c:485. JALON 3. */
+/* -- Kc : LA SOURCE EST LE NDB, PAS UN MESSAGE INTERCEPTE ------------------
+ * d_a5mode et a_kc[4] sont ce que le FIRMWARE charge dans le DSP par
+ * dsp_load_ciph_param(mode, key) (firmware/calypso/dsp.c:563). C est l etat de
+ * chiffrement REEL de la couche 1 -- pas la copie d un L1CTL_CRYPTO_REQ capte
+ * au vol par un tiers, qui peut le rater, le doubler ou l effacer.
+ * a_kc est charge A L ENVERS (key[7] en premier), cf. le commentaire
+ * << load the bytes backward in A5 unit >> du meme fichier. */
+#define NDB_D_A5MODE        0x1CE  /* Encryption Mode : 0 = clair, 1 = A5/1, 2 = A5/2 */
+#define NDB_A_KC            0x2CE  /* Encryption Key Code : 4 mots, octets INVERSES */
 #define NDB_D_TCH_MODE      0x006
 
 /* Adresse MOT dans c54x->data[] d'un offset NDB. Le firmware lit data[] via

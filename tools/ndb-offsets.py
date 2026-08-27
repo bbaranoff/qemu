@@ -25,7 +25,8 @@ TYPEDEF = os.environ.get("CALYPSO_NDB_TYPEDEF", "T_NDB_MCU_DSP")
 # Champs qui interessent le shunt. On sort tout ce qu'on trouve parmi ceux-la ;
 # un champ absent est signale par l'appelant, pas invente ici.
 WANTED = ["a_cd", "a_fd", "a_dd_0", "a_dd_1", "a_cu", "a_fu", "a_du_0", "a_du_1",
-          "d_fb_det", "a_sync_demod", "d_tch_mode"]
+          "d_fb_det", "a_sync_demod", "d_tch_mode",
+          "d_a5mode", "a_kc"]
 
 # ' <1><dcc8>: Abbrev Number: 22 (DW_TAG_typedef)'
 RE_DIE = re.compile(r"^\s*<(\d+)><([0-9a-f]+)>:\s+Abbrev Number:\s+\d+\s+\(([A-Za-z_]+)\)")
