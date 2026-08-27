@@ -85,7 +85,7 @@ MOD_ENABLED_IF[gabarits]='[ "${NO_OSMO_START:-0}" != 1 ] && [ "${NO_GABARITS:-0}
 # Le defaut reste donc « a5 0 », et il est maintenant EXPORTE pour que ce soit
 # vrai jusqu'au fichier pose. ENCRYPTION="a5 1" reste possible a la main, pour le
 # jour ou le dechiffrement du modele sera en place.
-: "${ENCRYPTION:=a5 0}"
+: "${ENCRYPTION:=a5 1}"
 export ENCRYPTION
 
 # Fichiers dont on relit le résultat. osmo-bsc porte __ENCRYPTION__ et le plan
