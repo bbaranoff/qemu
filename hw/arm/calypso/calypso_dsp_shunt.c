@@ -1676,12 +1676,53 @@ static void shunt_dcch_sacch_present(uint16_t *d)
     }
 
     if (!g_shunt.sacch_have) {
-        /* Rien de valide a presenter : on ne met PAS de bourrage (le mobile le
-         * refuserait), on laisse le camp reprendre la main -- ses 0x07 sont un
-         * NOTICE, alors qu une trame invalide leve une MDL-Error. */
+        /* [2026-08-27] « le mobile le refuserait » ETAIT FAUX, ET C EST DE LA QUE
+         * VENAIENT LES 0x07.
+         *
+         * L ancien texte disait : « Rien de valide a presenter : on ne met PAS de
+         * bourrage (le mobile le refuserait), on laisse le camp reprendre la main
+         * -- ses 0x07 sont un NOTICE, alors qu une trame invalide leve une
+         * MDL-Error. » Les deux moities de l arbitrage sont fausses.
+         *
+         * 1. Le mobile ne refuse PAS une trame de bourrage. mobile.log le montre
+         *    87 fois sur le canal principal : « lapd_core.c:1131 length=0
+         *    (discarding) » -- UI recue, L3 vide, jetee EN SILENCE, zero erreur.
+         *    C est le comportement normal d une trame de remplissage LAPDm.
+         *
+         * 2. Laisser le camp reprendre la main n est pas neutre. Le bloc du camp
+         *    est du BCCH (format Bbis : pseudo-longueur en tete, PAS d en-tete
+         *    LAPDm). Lu sur un lien SACCH, lapdm.c saute l en-tete L1 de 2 octets
+         *    et prend l2h[2] pour l octet d adresse. Pour SI4 (« 31 06 1c ») c est
+         *    0x1c, le type de message : 0x1c & 3 == 0 -> LAPDm_ADDR_SHORT_L2 nul
+         *    -> format Bter -> gsm48_rr_rx_acch lit msg_type = (0x1c >> 2) & 0x1F
+         *    = 0x07 -> « Short header message type 0x07 unsupported ». Pour
+         *    SI1/SI2/SI3 (0x19/0x1a/0x1b) c est sapi 6 -> « unsupported SAPI ».
+         *    Et quand l octet de controle tombe sur un type U inconnu, c est
+         *    lapd_core.c:1345 -> MDL-ERROR-IND cause 12, precisement l erreur que
+         *    l arbitrage disait vouloir eviter.
+         *
+         * MESURE (run du 27/08, 10920 lignes de mobile.log) : 68 « 0x07 », 95
+         * « Unnumbered frame not allowed », 220 MDL-ERROR-IND, et sur le seul lien
+         * SACCH 106 trames recues pour 11 acceptees. Le « NOTICE inoffensif » etait
+         * en fait 90 % du SACCH descendant a la poubelle.
+         *
+         * On presente donc une trame B4 de bourrage, batie comme le seed de
+         * calypso_dsp_shunt_feed_si : en-tete L1 SACCH (2 o) + adresse + controle
+         * UI + pseudo-longueur L3 nulle + 0x2B. Le mobile la range en B4 (0x03 & 3
+         * == 3, donc pas de Bter), lit L3 = 0 et la jette sans un mot. */
+        uint8_t fill[23];
+        memset(fill, 0x2b, sizeof(fill));
+        fill[0] = 0x00;                     /* en-tete L1 SACCH : tx_power       */
+        fill[1] = 0x00;                     /* en-tete L1 SACCH : timing advance */
+        fill[2] = 0x03;                     /* LAPDm adresse : SAPI 0, EA=1      */
+        fill[3] = 0x03;                     /* LAPDm controle : UI -> format B4  */
+        fill[4] = (uint8_t)((0 << 2) | 0x01);   /* pseudo-longueur L3 = 0        */
+        shunt_ndb_hdr(d, ndb_w(g_ndb.a_cd), true);
+        shunt_ndb_put_l2(d, ndb_w(g_ndb.a_cd), fill);
         static unsigned long long muet;
         if (++muet % 5000 == 1)
-            SHUNT_LOG("DCCH-SACCH : aucun SI6 disponible (#%llu) -- le camp reprend\n", muet);
+            SHUNT_LOG("DCCH-SACCH : aucun SI5/SI6 disponible (#%llu) -- bourrage "
+                      "LAPDm B4 presente (le camp ne reprend plus la main)\n", muet);
         return;
     }
 

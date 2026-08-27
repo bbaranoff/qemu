@@ -64,7 +64,29 @@ MOD_ENABLED_IF[gabarits]='[ "${NO_OSMO_START:-0}" != 1 ] && [ "${NO_GABARITS:-0}
 : "${MCC:=001}"
 : "${MNC:=01}"
 : "${OPERATOR_NAME:=OsmoDirect}"
+# --- CHIFFREMENT : LA VALEUR DOIT SORTIR DE CE SHELL ---------------------------
+# `:=` posait la valeur dans le shell du module SANS l'exporter. generate_configs.sh
+# ne la voyait donc pas et retombait sur SON propre defaut -- « a5 1 » (table de
+# generate_configs.sh, section « Securite et carte SIM »). Selon le point d'entree
+# du run, la meme maquette se retrouvait deployee en a5 0 ou en a5 1, sans que rien
+# ne le signale : deux runs, deux chiffrements.
+#
+# POURQUOI CA COMPTE, MESURE DU 2026-08-27. Le mobile derriere QEMU ne dechiffre
+# pas l'A5/1 : le chemin cipher du modele n'est pas exerce (cf. l1ctl_sock.c,
+# « s'execute donc JAMAIS -- a verifier avant d'activer l'A5/1 »). Comptage des
+# rejets LAPDm dans mobile.log, de part et d'autre du CIPHERING MODE COMPLETE :
+#     avant :   2 « unsupported SAPI »
+#     apres : 477
+# Un facteur 240 a l'instant precis ou le reseau chiffre. Le LU s'arretait la --
+# CIPHERING MODE COMPLETE envoye, puis plus rien jusqu'a T3210. Le side-car
+# (osmocom-bb pur logiciel) traite l'A5/1 sans broncher et obtient son LU ACCEPT :
+# c'est bien le chemin emule qui ne suit pas, pas le reseau.
+#
+# Le defaut reste donc « a5 0 », et il est maintenant EXPORTE pour que ce soit
+# vrai jusqu'au fichier pose. ENCRYPTION="a5 1" reste possible a la main, pour le
+# jour ou le dechiffrement du modele sera en place.
 : "${ENCRYPTION:=a5 0}"
+export ENCRYPTION
 
 # Fichiers dont on relit le résultat. osmo-bsc porte __ENCRYPTION__ et le plan
 # radio, osmo-msc l'identité réseau : si ces deux-là sont propres, la
@@ -169,12 +191,25 @@ mod_gabarits_wait() {
     local cfg
     for cfg in "${OSMOCOM_CFG:-/etc/osmocom}/osmo-bsc.cfg" \
                "${OSMOCOM_CFG:-/etc/osmocom}/osmo-msc.cfg"; do
-        if grep -q '__ENCRYPTION__' "$cfg" 2>/dev/null || ! grep -qF "$ENCRYPTION" "$cfg" 2>/dev/null; then
-            mod_hint "attendu « $ENCRYPTION » dans $cfg ; vérifiez que le gabarit porte bien __ENCRYPTION__"
+        # Le contrôle portait sur le FICHIER ENTIER (`grep -qF "$ENCRYPTION"`).
+        # Les gabarits sont abondamment commentés : « a5 0 » cité dans un
+        # commentaire suffisait à valider un fichier posé en « encryption a5 1 ».
+        # C'est exactement ce qui est arrivé le 27/08 — le run affichait
+        # « chiffrement « a5 0 » confirmé » pendant que le BSC tournait en A5/1.
+        # On lit donc la DIRECTIVE, et on dit ce qu'on a trouvé quand ça diverge.
+        local pose
+        pose="$(awk '$1 == "encryption" { $1 = ""; sub(/^ /, ""); print; exit }' "$cfg" 2>/dev/null)"
+        if grep -q '__ENCRYPTION__' "$cfg" 2>/dev/null; then
+            mod_hint "le gabarit n'a pas été substitué ; vérifiez apply_config_templates"
+            mod_fail "jeton __ENCRYPTION__ encore présent dans $cfg"
+            return $MOD_RC_FAIL
+        fi
+        if [ "$pose" != "$ENCRYPTION" ]; then
+            mod_hint "posé « ${pose:-<aucune directive encryption>} », demandé « $ENCRYPTION » — ENCRYPTION est-il exporté jusqu'au générateur ?"
             mod_fail "le chiffrement demandé n'est pas dans la configuration installée ($cfg)"
             return $MOD_RC_FAIL
         fi
-        mod_say "chiffrement « $ENCRYPTION » confirmé dans $cfg"
+        mod_say "chiffrement « $ENCRYPTION » confirmé dans $cfg (directive lue)"
     done
     mod_ok
 }
