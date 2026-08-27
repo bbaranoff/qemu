@@ -992,9 +992,17 @@ void calypso_dsp_shunt_set_dcch_active(int on)
  * (TCH compris, c'est ce qui avait tue le 0x07 en signalisation), la
  * presentation continuait de tirer pendant tout l'appel voix sur une fenetre
  * fn%51 qui ne veut rien dire dans une multitrame de 26 -> le firmware relisait
- * du SI5/SI6 pose hors phase dans a_cd et rendait « Short header message type
+ * un bloc de SI pose hors phase dans a_cd et rendait « Short header message type
  * 0x07 unsupported » EN RAFALE PENDANT LA COMMUNICATION (mesure du 10/08 :
  * 5 occurrences entre 09:12:05 et 09:12:29, sur un run ou le LU passait).
+ *
+ * [2026-08-27] ATTRIBUTION CORRIGEE : ce n'est pas SI5/SI6, c'est SI4 -- et le
+ * « 0x07 » n'est pas l'octet lu. Sur un lien SACCH, lapdm.c saute l'en-tete L1
+ * de deux octets et lit l2h[2] ; pour le bloc SI4 (« 31 06 1c ») c'est 0x1c, le
+ * TYPE DE MESSAGE de SI4. Or 0x1c & 0x3 == 0 -> LAPDm_ADDR_SHORT_L2 nul ->
+ * format Bter -> gsm48_rr_rx_acch lit msg_type = (0x1c >> 2) & 0x1F = 0x07.
+ * SI5 (0x1d) et SI6 (0x1e) donneraient « unsupported SAPI 7 », qu'aucun run
+ * ne montre : 0 occurrence sur le run 14:06 pour 51 « 0x07 ».
  * On coupe donc la presentation sur TCH : le SACCH de l'appel arrive par le
  * decodeur TCH (si_bridge, is_sacch = fn%26), pas par cette fenetre-ci. */
 void calypso_dsp_shunt_set_dcch_tch(int on);   /* -Werror=missing-prototypes */
@@ -1012,6 +1020,47 @@ void calypso_dsp_shunt_set_dcch_tch(int on)
 /* Declaration anticipee : la garde interroge la fraicheur du SACCH dedie,
  * defini plus bas. Idiome du fichier, il n y a pas d en-tete. */
 static bool shunt_tch_fresh(bool valid, uint32_t tick);
+/* [2026-08-27] FENETRE DU CANAL DEDIE -- LA MEME QUE CELLE DE L ANNEAU SDCCH.
+ *
+ * a_cd a TROIS ecrivains : le SI du camp, la presentation SACCH dediee, et
+ * l anneau SDCCH de calypso_dsp_helper.c. Seul le troisieme se donne une
+ * fenetre : il ne pose son bloc que si (shunt_l1s_fn() + ofs) % 51 tombe dans la
+ * region SDCCH du type de canal (« fenetre-UNION », calypso_dsp_helper.c). Le
+ * camp, lui, ecrit a CHAQUE tick des que la garde est basse -- y compris dans
+ * cette fenetre, ou le bloc n a pour lecteur que le canal dedie. C est de la que
+ * sortent les « unsupported SAPI » chiffres dans la garde ci-dessous.
+ *
+ * Cette fonction REJOUE la fenetre de l anneau pour pouvoir en exclure le camp.
+ * Les deux doivent rester en phase : si la fenetre-union bouge dans
+ * calypso_dsp_helper.c, elle bouge ici.
+ *
+ * @BEQUILLE INVERSE -- DCCH_SI_WINDOW_MUTE (CALYPSO_DCCH_SI_WINDOW_MUTE, def. 0)
+ *   L etat OFF est le comportement historique : le camp ecrit dans la fenetre et
+ *   on ravale les rejets. ON = le camp se tait dans la fenetre, l anneau SDCCH et
+ *   la presentation SACCH y restant seuls maitres. Le defaut est 0 parce que ce
+ *   chemin n a PAS ete valide en run : la garde voisine documente quatre
+ *   corrections successives dont trois se sont revelees fausses, on n ajoute pas
+ *   la cinquieme sans mesure.
+ *   retirer : quand a_cd est alimente par la demodulation native -- chaque bloc
+ *             arrive alors a SA place dans la multitrame (TODO shunt_dispatch_nb).
+ */
+static bool shunt_dcch_si_window(void)
+{
+    static int on = -1, ofs = 0;
+    if (on < 0) {
+        const char *e = getenv("CALYPSO_DCCH_SI_WINDOW_MUTE"); on  = (e && *e == '1');
+        const char *o = getenv("CALYPSO_SHUNT_SDCCH_OFS");     ofs = o ? atoi(o) : 0;
+    }
+    if (!on) return false;
+    /* Memes bornes que l anneau : arme -> [0,31] en /8, [22,39] en /4 ; pas
+     * encore arme -> union [0,39], le type n etant pas positivement connu. */
+    int armed = g_shunt.sdcch_ss_set;
+    int lo = armed ? (g_shunt.sdcch_ch8 ? 0  : 22) : 0;
+    int hi = armed ? (g_shunt.sdcch_ch8 ? 31 : 39) : 39;
+    int tc = (int)((((long)shunt_l1s_fn() + ofs) % 51 + 51) % 51);
+    return tc >= lo && tc <= hi;
+}
+
 static bool shunt_dcch_si_guard(void)
 {
     static int ttl = -1;
@@ -1030,14 +1079,34 @@ static bool shunt_dcch_si_guard(void)
      * precis ou le mobile doit monter son LAPDm.
      *
      * L ARBITRAGE. Un SI du camp presente sur un canal dedie est un contenu FAUX :
-     * la couche 3 le rejette avec un simple NOTICE (« Short header message type
-     * 0x07 unsupported »), le canal survit. Un SACCH absent est une FAMINE : le
-     * compteur de lien radio descend et l etablissement echoue. Entre les deux,
+     * la couche 3 le rejette avec un simple NOTICE, le canal survit. Un SACCH
+     * absent est une FAMINE : le compteur de lien radio descend et
+     * l etablissement echoue. Entre les deux,
      * le bruit vaut mieux que le silence -- d ou les REJ puis DISC observes sur
      * a_fu, et l ASSIGNMENT COMPLETE qui ne trouvait aucun lien pour partir.
      *
      * On ne supprime donc que si un SACCH dedie alimente REELLEMENT a_cd. Sinon
      * on laisse passer le camp, on ravale les 0x07, et le canal vit. */
+    /* [2026-08-27] CE QUE COUTE EXACTEMENT LE BRUIT -- MESURE, ET PAS CELUI QUE
+     * L ARBITRAGE CI-DESSUS NOMME. Le rejet dominant n est pas
+     * « Short header 0x07 » mais lapdm.c:909
+     * « Received frame for unsupported SAPI N! ». LAPDm lit le PREMIER octet du
+     * bloc comme octet d adresse -- sapi = (octet >> 2) & 7 -- alors qu un bloc
+     * BCCH commence par la PSEUDO-LONGUEUR L3, jamais par une adresse. Pose sur
+     * le canal PRINCIPAL (lien DCCH, l2h[0]) :
+     *     SI1 « 55 06 19 » -> sapi 5      SI2 « 59 06 1a » -> sapi 6
+     *     SI3 « 49 06 1b » -> sapi 2      SI4 « 31 06 1c » -> sapi 4
+     * Pose sur le lien SACCH (l2h[2], apres saut de l en-tete L1) :
+     *     SI1/SI2/SI3 (0x19/0x1a/0x1b) -> sapi 6 ; SI4 (0x1c) -> Bter, d ou le
+     *     « Short header 0x07 » (cf. calypso_dsp_shunt_set_dcch_tch).
+     * Et un bloc SACCH pose sur le canal principal donne l2h[0] = 0x07 --
+     * l octet tx_power de l en-tete L1 -- donc sapi 1.
+     *
+     * RELEVE DU RUN 14:06 (mobile.log) : SAPI 6 x95, 4 x38, 2 x37, 5 x33, 1 x6,
+     * plus 51 « Short header 0x07 ». 209 blocs descendants jetes sur le canal
+     * dedie, donc autant de retransmissions LAPDm. Le canal survit -- l arbitrage
+     * tient -- mais ce n est pas gratuit, et la part la plus grosse est evitable
+     * sans y toucher : cf. shunt_dcch_si_window() juste au-dessus. */
     /* [2026-08-09] LE REMPLACANT EXISTE MAINTENANT — cf. shunt_dcch_sacch_fill().
      * La revision precedente renoncait a supprimer quand aucun SACCH dedie
      * n alimentait a_cd (mesure : elle renoncait 3 fois sur 4, faute de source
@@ -2363,6 +2432,7 @@ void calypso_dsp_shunt_on_frame_tick(void)
              * garde-fou sdcch_valid juste a cote. En dedie le mobile ne lit pas le
              * BCCH : aucun SI n'est perdu. */
             if (g_shunt.si_valid && !g_shunt.sdcch_valid && !shunt_dcch_si_guard()
+                && !shunt_dcch_si_window()
                 && !g_shunt.tch_cfg_valid
                 && !(g_shunt.agch_valid && (g_shunt.agch_buf[2] == 0x3f
                      || g_shunt.agch_buf[2] == 0x3a || g_shunt.agch_buf[2] == 0x3b))

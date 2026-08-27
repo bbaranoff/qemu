@@ -63,8 +63,10 @@ _RADIO_LIB_LOADED=1
 
 # --- side-car hybride : BTS#1 sur fake_trx, à côté du BTS#0 de QEMU ----------
 # Profil « hybrid » = deux stations sur UN SEUL cœur :
-#   BTS#0  QEMU Calypso   ARFCN 514  unit-id 6001  TRXD 5700   MS#1 (osmocon)
-#   BTS#1  side-car       ARFCN 516  unit-id 6002  TRXD 5720   MS#2 (trxcon)
+#   BTS#0  QEMU Calypso   ARFCN 514  unit-id 6010  TRXD 5700   MS#1 (osmocon)
+#   BTS#1  side-car       ARFCN 516  unit-id 6012  TRXD 5720   MS#2 (trxcon)
+# Les unit-id ne sont PAS choisis ici : osmo_egprs/generate_configs.sh les
+# calcule (6000 + opérateur*10, +2 pour le side-car) — cf. radio_sc_unit_id.
 # Les deux mobiles campent sur le même MSC : on peut donc appeler MS#1 depuis
 # MS#2 sans sortir de la maquette. Tout est décalé pour ne RIEN partager avec le
 # BTS#0 — ports UDP, VTY, socket L1CTL, fichier de configuration.
@@ -72,9 +74,40 @@ _RADIO_LIB_LOADED=1
 : "${SC_BB_PORT:=6720}"           # côté bande de base : fake_trx -p, trxcon -p
 : "${SC_BTS_VTY_PORT:=4250}"      # VTY du 2e osmo-bts-trx (le 1er tient 4241)
 : "${SC_MOBILE_VTY_PORT:=4248}"   # VTY du MS#2 (le MS#1 tient 4247)
-: "${SC_UNIT_ID:=6002}"
 : "${SC_ARFCN:=516}"
 : "${SC_BTS_CFG:=${OSMOCOM_CFG:-/etc/osmocom}/osmo-bts-trx-bts1.cfg}"
+
+# --- unit-id du BTS#1 : LU, PAS CHOISI ---------------------------------------
+# Il appartient au plan d'adressage d'osmo_egprs, pas à ce dépôt :
+# generate_configs.sh calcule 6000 + opérateur*10 + 2 (donc 6012 pour
+# l'opérateur 1) et l'inscrit À LA FOIS dans osmo-bts-trx-bts1.cfg et dans le
+# bloc « bts 1 » du gabarit osmo-bsc.cfg.
+#
+# LE FIGER ICI À 6002 CASSAIT LE DÉMARRAGE. 13-sidecar-cfg sondait « ipa unit-id
+# 6002 » dans osmo-bsc.cfg, ne le trouvait pas — le gabarit déclare 6012 — et
+# insérait donc un SECOND bloc « bts 1 ». Or « bts N » en VTY ne crée un nœud que
+# si N == num_bts ; sinon il RE-SÉLECTIONNE l'existant (osmo-bsc bts_vty.c). Le
+# second bloc écrasait donc le premier, et le BSC n'attendait plus que 6002 :
+#     "Unable to find BTS configuration for 6012/0/0, disconnecting"
+# -> Abis close -> jamais de POWERON -> fake_trx sans horloge -> le module de
+# démarrage concluait à une « course No clock », qui désigne le mauvais coupable.
+#
+# On lit donc la valeur dans la configuration réellement déployée. La résolution
+# est TARDIVE : ce fichier est sourcé à l'enregistrement des modules, AVANT que
+# le module « config » n'ait déployé les gabarits — la lire ici ne verrait que
+# le run précédent, ou rien du tout au premier démarrage.
+: "${SC_UNIT_ID_DEFAUT:=6002}"
+
+# Unit-id du BTS#1, résolu au premier appel puis mémorisé dans SC_UNIT_ID.
+# Un SC_UNIT_ID posé par l'environnement fait foi et court-circuite la lecture.
+radio_sc_unit_id() {
+    if [ -z "${SC_UNIT_ID:-}" ]; then
+        SC_UNIT_ID="$(awk '$1 == "ipa" && $2 == "unit-id" { print $3; exit }' \
+                      "$SC_BTS_CFG" 2>/dev/null)"
+        : "${SC_UNIT_ID:=$SC_UNIT_ID_DEFAUT}"
+    fi
+    printf '%s' "$SC_UNIT_ID"
+}
 : "${SC_MOBILE_CFG:=/root/.osmocom/bb/mobile_faketrx_bts1.cfg}"
 : "${SC_L2_SOCK:=/tmp/ms2_l2}"
 : "${SC_IMSI:=001010001000002}"
