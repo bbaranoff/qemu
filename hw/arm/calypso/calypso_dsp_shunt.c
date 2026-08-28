@@ -1085,7 +1085,7 @@ static uint32_t shunt_dcch_sacch_base(void)
     }
 }
 
-static bool shunt_dcch_si_window(void)
+static int shunt_dcch_si_window(void)   /* 0 = aucune, 1 = canal principal, 2 = SACCH */
 {
     static int on = -1, ofs = 0;
     if (on < 0) {
@@ -1100,7 +1100,7 @@ static bool shunt_dcch_si_window(void)
         const char *e = getenv("CALYPSO_DCCH_SI_WINDOW_MUTE"); on  = (!e || *e != '0');
         const char *o = getenv("CALYPSO_SHUNT_SDCCH_OFS");     ofs = o ? atoi(o) : 0;
     }
-    if (!on) return false;
+    if (!on) return 0;
 
     /* 1. Fenetre du canal PRINCIPAL -- memes bornes que l anneau SDCCH de
      *    calypso_dsp_helper.c : arme -> [0,31] en /8, [22,39] en /4 ; pas encore
@@ -1112,7 +1112,7 @@ static bool shunt_dcch_si_window(void)
         int lo = armed ? (g_shunt.sdcch_ch8 ? 0  : 22) : 0;
         int hi = armed ? (g_shunt.sdcch_ch8 ? 31 : 39) : 39;
         int tc = (int)((((long)shunt_l1s_fn() + ofs) % 51 + 51) % 51);
-        if (tc >= lo && tc <= hi) return true;
+        if (tc >= lo && tc <= hi) return 1;
     }
 
     /* 2. Fenetre SACCH du canal dedie -- fn%102, cadence DIFFERENTE de la
@@ -1126,9 +1126,54 @@ static bool shunt_dcch_si_window(void)
     if (g_shunt.sdcch_ss_set && !g_shunt.dcch_is_tch) {
         uint32_t b = shunt_dcch_sacch_base();
         uint32_t f102 = (uint32_t)calypso_trx_get_fn() % 102u;
-        if (f102 >= b && f102 <= b + 3u) return true;
+        if (f102 >= b && f102 <= b + 3u) return 2;
     }
-    return false;
+    return 0;
+}
+
+/* [2026-08-27] MUSELER NE SUFFIT PAS : IL FAUT REMPLACER.
+ *
+ * La premiere version de la fenetre se contentait de NE PAS ecrire. Or a_cd est
+ * un buffer : ne pas ecrire, c est laisser le bloc PRECEDENT, que le firmware
+ * relit tel quel. Le mobile recevait donc une trame LAPDm rejouee -- d ou deux
+ * erreurs qui n existaient pas avant la fenetre, mesurees sur le run de 15:46 :
+ *     6 x « Timeout T200 state=LAPD_STATE_SABM_SENT »  (l UA n arrive jamais)
+ *     4 x « S frame ignored in this state »            (supervision rejouee)
+ * L echec remontait de MF_EST a l ETABLISSEMENT : pire qu avant.
+ *
+ * On presente donc une trame de BOURRAGE LAPDm valide, ce que fait un vrai
+ * reseau quand il n a rien a dire. Le mobile la range, lit L3 = 0 et la jette
+ * sans un mot : c est exactement le « length=0 (discarding) » deja observe 45
+ * fois sur le canal principal, sans une seule erreur associee.
+ *
+ * Deux formats, parce que les deux fenetres ne se lisent pas pareil :
+ *   canal principal : le bloc EST la trame L2      -> 03 03 01 puis 0x2B
+ *   SACCH           : en-tete L1 (2 o) NON strippe -> 00 00 03 03 01 puis 0x2B
+ * (adresse 0x03 = SAPI 0, C/R, EA=1 ; controle 0x03 = UI -> format B/B4 ;
+ *  longueur 0x01 = L3 vide. Meme convention que le seed de feed_si.) */
+/* Declarations anticipees : les primitives NDB sont definies plus bas.
+ * Idiome du fichier, il n y a pas d en-tete. */
+static void shunt_ndb_hdr(uint16_t *d, unsigned w, bool blud);
+static void shunt_ndb_put_l2(uint16_t *d, unsigned w, const uint8_t *l2);
+
+static void shunt_dcch_present_fill(uint16_t *d, int kind)
+{
+    uint8_t f[23];
+    memset(f, 0x2b, sizeof(f));
+    if (kind == 2) {                 /* SACCH : en-tete L1 devant */
+        f[0] = 0x00; f[1] = 0x00;
+        f[2] = 0x03; f[3] = 0x03; f[4] = 0x01;
+    } else {                         /* canal principal : L2 directement */
+        f[0] = 0x03; f[1] = 0x03; f[2] = 0x01;
+    }
+    shunt_ndb_hdr(d, ndb_w(g_ndb.a_cd), true);
+    shunt_ndb_put_l2(d, ndb_w(g_ndb.a_cd), f);
+    {
+        static unsigned long long n_fill = 0;
+        if (n_fill++ < 20 || (n_fill % 500) == 0)
+            SHUNT_LOG("DCCH-BOURRAGE #%llu : fenetre %s -> trame LAPDm vide dans a_cd\n",
+                      n_fill, kind == 2 ? "SACCH" : "principale");
+    }
 }
 
 static bool shunt_dcch_si_guard(void)
@@ -2419,8 +2464,11 @@ void calypso_dsp_shunt_on_frame_tick(void)
              * la ou il attend un rapport de mesure. Meme raison, meme forme que le
              * garde-fou sdcch_valid juste a cote. En dedie le mobile ne lit pas le
              * BCCH : aucun SI n'est perdu. */
+            int _win = shunt_dcch_si_window();
+            if (_win && g_shunt.c54x && g_shunt.c54x->data)
+                shunt_dcch_present_fill(g_shunt.c54x->data, _win);
             if (g_shunt.si_valid && !g_shunt.sdcch_valid && !shunt_dcch_si_guard()
-                && !shunt_dcch_si_window()
+                && !_win
                 && !g_shunt.tch_cfg_valid
                 && !(g_shunt.agch_valid && (g_shunt.agch_buf[2] == 0x3f
                      || g_shunt.agch_buf[2] == 0x3a || g_shunt.agch_buf[2] == 0x3b))
