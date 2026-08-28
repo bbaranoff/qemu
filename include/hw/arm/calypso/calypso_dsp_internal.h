@@ -282,39 +282,7 @@ extern void calypso_trx_api_commit_w(uint32_t arm_offset, uint16_t value);
 
 /* ---- Log tag helper + macros (both TUs use them) ---- */
 const char *shunt_tag(void);
-
-/* [2026-08-27] SHUNT_LOG A UN INTERRUPTEUR -- IL N'EN AVAIT AUCUN.
- *
- * La macro etait un fprintf(stderr) INCONDITIONNEL, et stderr part dans
- * qemu.log : chaque sonde coutait un write() synchrone, depuis l'interieur du
- * tick DSP. Mesure du 27/08, run de 188 s : 37835 lignes, 2,9 Mo, soit ~200
- * ecritures formatees par seconde -- LATCH 65/s, DISPATCH ALLC 58/s, CAMP 22/s.
- * Une trame GSM dure 4,615 ms (~217/s) : on ecrivait presque une ligne par
- * trame. Sur le meme run, osmo-bts comptait 31 compensations d'horloge par
- * seconde sur le BTS derriere QEMU contre 0,9 sur le BTS logiciel ; une trame
- * parole part toutes les 20 ms, d'ou une voix hachee.
- *
- * Le defaut reste ACTIF : aucun run existant ne change de comportement.
- *   CALYPSO_SHUNT_LOG=0   coupe toutes les sondes du modele.
- * C'est aussi l'experience qui tranche la question du temps reel : un run avec,
- * un run sans, et on compare `grep -cE "FN (faster|slower) than TRX"` sur
- * bts.log. Si l'ecart s'effondre, le cout du journal etait la cause ; sinon il
- * faut chercher ailleurs, et on aura elimine une variable.
- *
- * static inline dans le header : chaque TU garde son propre cache, pas de
- * symbole a definir ni de changement d'edition de liens. */
-static inline int shunt_log_on(void)
-{
-    static int on = -1;
-    if (on < 0) {
-        const char *e = getenv("CALYPSO_SHUNT_LOG");
-        on = (!e || *e != '0');
-    }
-    return on;
-}
-#define SHUNT_LOG(fmt, ...) \
-    do { if (shunt_log_on()) \
-             fprintf(stderr, "%s " fmt, shunt_tag(), ##__VA_ARGS__); } while (0)
+#define SHUNT_LOG(fmt, ...) fprintf(stderr, "%s " fmt, shunt_tag(), ##__VA_ARGS__)
 #define SHUNT_ERR(fmt, ...) error_report("%s " fmt, shunt_tag(), ##__VA_ARGS__)
 
 /* ---- Mode-neutral NDB-write primitives (calypso_dsp_helper.c) ---- */
