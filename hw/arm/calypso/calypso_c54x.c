@@ -41,6 +41,7 @@ static uint16_t g_vec28_sp_entry = 0;
 static unsigned g_vec28_trace_pops = 0;
 
 #include "hw/arm/calypso/calypso_debug.h"
+#include "hw/arm/calypso/calypso_gsm0502.h"   /* predicats FCCH/SCH partages (GSM 05.02) */
 
 /* Legacy C54_LOG : gated par CALYPSO_DEBUG containing "C54X" or "ALL".
  * Pour gating fin par probe, utiliser C54_DBG("PROBE_NAME", fmt, ...). */
@@ -7013,8 +7014,8 @@ static int c54x_exec_one(C54xState *s)
                 fprintf(stderr, "[c54x] SBFN-PROBE #%u fn=%u p51=%u %s depots_depuis_SB=%u "
                         "iq=[%d..%d] energie=%ld insn=%u\n",
                         n, fn, fn % 51,
-                        ((fn % 51) % 10 == 1 && (fn % 51) <= 41) ? "SCH" :
-                        ((fn % 51) % 10 == 0 && (fn % 51) <= 40) ? "FCCH" : "AUTRE",
+                        gsm0502_fn_is_sch(fn)  ? "SCH" :
+                        gsm0502_fn_is_fcch(fn) ? "FCCH" : "AUTRE",
                         calypso_daram_wr_count - prevwr, mn, mx, en, s->insn_count);
                 prevwr = calypso_daram_wr_count;
             }
@@ -21270,8 +21271,27 @@ void c54x_bsp_load(C54xState *s, const uint16_t *samples, int n)
                  * du sens à TS0. On pousse donc FCCH **et** SCH (=FCCH+1). Le DMA route
                  * par AAD (FCCH→0x0cce, SCH→0x0e4e) sur des trames DIFFÉRENTES, donc
                  * 0x0cce reste propre (que du FCCH), 0x0e4e reçoit enfin un vrai SCH. */
-                int _is_fcch = ((_p % 10) == 1) && (_p <= 41); /* FCCH ∈ {1,11,21,31,41} */
-                int _is_sch  = ((_p % 10) == 2) && (_p <= 42); /* SCH  ∈ {2,12,22,32,42} */
+                /* [2026-08-28] CE SITE ETAIT LA DERNIERE COPIE « +1 ».
+                 * Les trois autres copies du predicat (calypso_bsp.c,
+                 * calypso_dsp_shunt.c x2) sont passees aux positions
+                 * canoniques de GSM 05.02, et le feed du shunt les emploie
+                 * PAR DEFAUT (feed_fn_canon -> CALYPSO_FEED_FN_CANON=1).
+                 * Celle-ci, elle, restait figee sur l'ancien decalage - et
+                 * elle etiquetait « FCCH » des positions qui sont le SCH.
+                 * Avec CALYPSO_RIF_FCCH_ONLY=1, le filtre jetait donc TOUTES
+                 * les vraies FCCH : la tache FB correlait le burst SCH, et la
+                 * tache SB recevait la trame D'APRES le SCH. C'est exactement
+                 * la derive que calypso_gsm0502.h a ete ecrit pour rendre
+                 * impossible - header ajoute sur RELEASE-0.1, mais jamais
+                 * inclus nulle part, donc reste sans effet jusqu'ici.
+                 * On lit la MEME variable que le shunt : les deux extremites
+                 * du chemin ne peuvent plus diverger, et l'A/B reste possible. */
+                static int _canon_fn = -1;
+                if (_canon_fn < 0) _canon_fn = calypso_gate("CALYPSO_FEED_FN_CANON", 1);
+                int _is_fcch = _canon_fn ? gsm0502_p51_is_fcch((unsigned)_p)
+                                         : gsm0502_p51_is_fcch_legacy_plus1((unsigned)_p);
+                int _is_sch  = _canon_fn ? gsm0502_p51_is_sch((unsigned)_p)
+                                         : gsm0502_p51_is_sch_legacy_plus1((unsigned)_p);
                 _push = _is_fcch || _is_sch;
             }
         }
