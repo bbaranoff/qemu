@@ -20,27 +20,6 @@ sont émulés et se parlent par la mailbox `0xFFD00000`.
 
 ---
 
-Standalone mode (no interstp)
-```bash
-sudo docker pull bastienbaranoff/norf_gsm
-sudo docker tag bastienbaranoff/norf_gsm osmocom-nitb
-git clone https://github.com/bbaranoff/osmo_egprs
-cd osmo_egprs
-sudo ./start.sh
-```
-To go in container
-```bash
-sudo docker exec -ti osmo-operator-1 bash
-``` 
-
-then in docker container
-```bash
-cd /opt/GSM/osmo_egprs
-./start-direct.sh --regen
-./start-direct.sh --stop
-./start-direct.sh
-```
-
 ## Où en est le projet, honnêtement
 
 Le statut **dépend entièrement du mode**, et c'est le point le plus important de ce

@@ -33,23 +33,7 @@ MOD_TIMEOUT[sidecar-cfg]=10
 
 : "${BSC_CFG:=${OSMOCOM_CFG:-/etc/osmocom}/osmo-bsc.cfg}"
 
-# --- le BSC déclare-t-il DÉJÀ un « bts 1 » ? ---------------------------------
-# On sonde le NŒUD, pas notre propre identifiant. L'ancienne sonde cherchait
-# « ipa unit-id <le nôtre> » : depuis que le gabarit d'osmo_egprs déclare
-# lui-même un « bts 1 » (avec l'unit-id du plan, 6012), elle répondait « absent »
-# alors que le nœud existait, et on insérait un SECOND « bts 1 ». En VTY,
-# « bts N » ne crée un nœud que si N == num_bts, sinon il re-sélectionne
-# l'existant : le second bloc écrasait donc le premier. Cf. radio_sc_unit_id.
-_sc_bsc_bts1_unit() {
-    awk '
-        /^[[:space:]]*bts[[:space:]]+1[[:space:]]*$/     { dans = 1; next }
-        /^[[:space:]]*bts[[:space:]]+[0-9]+[[:space:]]*$/ { dans = 0 }
-        /^[^[:space:]]/                                   { dans = 0 }
-        dans && $1 == "ipa" && $2 == "unit-id"            { print $3; exit }
-    ' "$BSC_CFG" 2>/dev/null
-}
-_sc_bsc_has_bts1() { [ -n "$(_sc_bsc_bts1_unit)" ]; }
-_sc_bsc_declare()  { [ "$(_sc_bsc_bts1_unit)" = "$(radio_sc_unit_id)" ]; }
+_sc_bsc_declare() { grep -qE "^[[:space:]]*ipa unit-id ${SC_UNIT_ID} 0" "$BSC_CFG" 2>/dev/null; }
 
 mod_sidecar_cfg_check() {
     [ -r "$BSC_CFG" ] || {
@@ -70,7 +54,7 @@ _sc_bts_block() {
  bts 1
   type osmo-bts
   band DCS1800
-  cell_identity $(radio_sc_unit_id)
+  cell_identity ${SC_UNIT_ID}
   location_area_code 0x0001
   base_station_id_code 8
   ms max power 15
@@ -82,7 +66,7 @@ _sc_bts_block() {
   channel allocator mode handover ascending
   rach tx integer 9
   rach max transmission 7
-  ipa unit-id $(radio_sc_unit_id) 0
+  ipa unit-id ${SC_UNIT_ID} 0
   oml ipa stream-id 255 line 0
   neighbor-list mode automatic
   codec-support fr
@@ -110,16 +94,7 @@ BLOC
 mod_sidecar_cfg_start() {
     # --- 1. le bloc « bts 1 » dans la configuration du BSC -------------------
     if _sc_bsc_declare; then
-        mod_say "bloc « bts 1 » (unit-id $(radio_sc_unit_id)) déjà déclaré dans $BSC_CFG"
-    elif _sc_bsc_has_bts1; then
-        # Un « bts 1 » existe, mais sur un autre unit-id. En insérer un second
-        # ne créerait pas de seconde station : il écraserait celle-ci. On
-        # s'arrête ici, avec le désaccord sous les yeux — plutôt que de le
-        # laisser ressortir dix modules plus loin en « course No clock ».
-        local u; u="$(_sc_bsc_bts1_unit)"
-        mod_hint "alignez les deux : SC_UNIT_ID=$u, ou régénérez $SC_BTS_CFG en $(radio_sc_unit_id)"
-        mod_fail "désaccord d'unit-id : $BSC_CFG attend $u pour « bts 1 », $SC_BTS_CFG s'annonce en $(radio_sc_unit_id)"
-        return $MOD_RC_FAIL
+        mod_say "bloc « bts 1 » (unit-id $SC_UNIT_ID) déjà déclaré dans $BSC_CFG"
     else
         grep -qE '^msc 0' "$BSC_CFG" || {
             mod_hint "le bloc « bts 1 » s'insère avant « msc 0 » ; cette ancre est absente"

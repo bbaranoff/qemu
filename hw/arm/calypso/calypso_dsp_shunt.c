@@ -289,13 +289,11 @@ QEMU_BUILD_BUG_ON(!(NDB_W_CHECK));
  * ═══════════════════════════════════════════════════════════════════════════ */
 struct ndb_offsets {
     uint32_t a_cd, a_fd, a_dd_0, a_cu, a_fu, a_du_1;
-    uint32_t d_a5mode, a_kc;
     bool     resolved;
 };
 static struct ndb_offsets g_ndb = {
     .a_cd = NDB_A_CD, .a_fd = NDB_A_FD, .a_dd_0 = NDB_A_DD_0,
     .a_cu = NDB_A_CU, .a_fu = NDB_A_FU, .a_du_1 = NDB_A_DU_1,
-    .d_a5mode = NDB_D_A5MODE, .a_kc = NDB_A_KC,
     .resolved = false,
 };
 
@@ -338,8 +336,6 @@ static void shunt_ndb_resolve_offsets(void)
         { "a_cu",   &g_ndb.a_cu,   NDB_A_CU   },
         { "a_fu",   &g_ndb.a_fu,   NDB_A_FU   },
         { "a_du_1", &g_ndb.a_du_1, NDB_A_DU_1 },
-        { "d_a5mode", &g_ndb.d_a5mode, NDB_D_A5MODE },
-        { "a_kc",     &g_ndb.a_kc,     NDB_A_KC     },
     };
     int got = 0, diff = 0;
     char line[256];
@@ -371,10 +367,9 @@ static void shunt_ndb_resolve_offsets(void)
     /* La sonde s'annonce TOUJOURS, meme quand tout concorde : un silence ne doit
      * jamais pouvoir passer pour une verification reussie. */
     SHUNT_LOG("NDB-OFFSETS resolus du DWARF de %s : a_cd=0x%03x a_fd=0x%03x "
-              "a_dd_0=0x%03x a_cu=0x%03x a_fu=0x%03x a_du_1=0x%03x "
-              "d_a5mode=0x%03x a_kc=0x%03x (%s)\n",
+              "a_dd_0=0x%03x a_cu=0x%03x a_fu=0x%03x a_du_1=0x%03x (%s)\n",
               elf, g_ndb.a_cd, g_ndb.a_fd, g_ndb.a_dd_0, g_ndb.a_cu,
-              g_ndb.a_fu, g_ndb.a_du_1, g_ndb.d_a5mode, g_ndb.a_kc,
+              g_ndb.a_fu, g_ndb.a_du_1,
               diff ? "DIVERGENCES ci-dessus" : "identiques aux #define");
     /* Le chemin a_cd du camp ecrit data[0x9D2] en CONSTANTE LITTERALE (hors de
      * ce resolveur). On ne le reecrit pas — il campe — mais on refuse qu'il
@@ -510,98 +505,6 @@ static bool shunt_ndb_take_ul(uint32_t ndb_off, uint8_t *out, int n)
  * Rend true si la tache a ete traitee ici (le chemin SDCCH ne doit alors pas
  * tourner : il lirait a_cu avec la fenetre SDCCH et publierait sur le mauvais
  * sideband — c'est ce que faisait le code du 27/07, 4804 fois par run). */
-/* ============================ Kc : PUBLICATION ==============================
- * CE QUI NE MARCHAIT PAS. /dev/shm/calypso_kc etait alimente par un TIERS qui
- * espionne le L1CTL au passage : osmocon (osmocon.c:1289) sur le lien serie, et
- * un doublon MORT ici meme (l1ctl_sock.c:522, << RX<-mobile >> = 0 occurrence).
- * Deux ecrivains, deux compteurs `seq` independants, et surtout un effaceur :
- * osmocon remet le fichier a ZERO sur DM_EST_REQ **et** DM_REL_REQ. Or le mobile
- * emet un DM_EST_REQ pour ouvrir un lien de plus sur un canal DEJA chiffre (le
- * SAPI 3 du SMS, un re-etablissement LAPDm). La cle disparaissait donc en pleine
- * session pendant que le reseau continuait de chiffrer.
- *
- * MESURE (run 19:3x, SMS qui ne passent pas) : 446 DEDIE-TRACE cote pont, dont
- * 338 << A5=non decode=NON >> et 12 << A5=non decode=OUI >> -- A5 jamais
- * applique, 97 % d echecs de decodage sur le canal dedie -- alors qu osmocon
- * avait bien capte la cle neuf fois dans le meme run.
- *
- * LA SOURCE QUI NE MENT PAS. Le firmware charge lui-meme le chiffrement dans le
- * DSP : dsp_load_ciph_param(mode, key) pose d_a5mode et a_kc[4] (dsp.c:563), et
- * les remet a zero (mode 0) quand la couche 1 repart en clair -- l1ctl reset,
- * liberation du canal. QEMU voit cette memoire directement. On ne devine plus,
- * on ne court plus apres un message : on RECOPIE l etat de la L1.
- *
- * On reecrit aussi PERIODIQUEMENT a valeur inchangee (1 fois sur 200 latches,
- * ~100 ms) : si un ecrivain tiers efface le fichier, la reparation vient toute
- * seule au lieu d attendre le prochain changement de cle.
- *
- * Convention du fichier, inchangee (contrat avec pont.py et si_bridge.py) :
- *   [0..3] seq LE | [4] algo | [5] key_len=8 | [6..13] Kc | [14] CKSN
- * En clair (d_a5mode = 0) on ecrit 32 zeros, seq compris : c est deja la
- * convention << efface >> que les lecteurs connaissent. */
-#define SHUNT_KC_PATH "/dev/shm/calypso_kc"
-static void shunt_publish_kc(void)
-{
-    static int      fd = -2;
-    static uint8_t  last[32];
-    static bool     have = false;
-    static uint32_t kc_seq = 0;
-    static unsigned tick = 0;
-    uint16_t *d = (g_shunt.c54x && g_shunt.c54x->data) ? g_shunt.c54x->data : NULL;
-    uint8_t   buf[32];
-    uint16_t  mode;
-    unsigned  kw;
-    bool      cipher, changed;
-
-    if (!d)
-        return;
-    mode = d[ndb_w(g_ndb.d_a5mode)];
-    kw   = ndb_w(g_ndb.a_kc);
-    cipher = (mode >= 1 && mode <= 3);
-
-    memset(buf, 0, sizeof(buf));
-    if (cipher) {
-        uint16_t k0 = d[kw], k1 = d[kw + 1], k2 = d[kw + 2], k3 = d[kw + 3];
-        buf[4]  = (uint8_t)mode;
-        buf[5]  = 8;
-        /* a_kc est charge a l envers par dsp.c : key[7] dans a_kc[0], etc. */
-        buf[6]  = (uint8_t)(k3 >> 8); buf[7]  = (uint8_t)(k3 & 0xff);
-        buf[8]  = (uint8_t)(k2 >> 8); buf[9]  = (uint8_t)(k2 & 0xff);
-        buf[10] = (uint8_t)(k1 >> 8); buf[11] = (uint8_t)(k1 & 0xff);
-        buf[12] = (uint8_t)(k0 >> 8); buf[13] = (uint8_t)(k0 & 0xff);
-        buf[14] = 0xff;                 /* CKSN : inconnu de ce cote */
-    }
-
-    changed = !have || memcmp(buf + 4, last + 4, sizeof(buf) - 4) != 0;
-    if (!changed && (tick++ % 200) != 0)
-        return;                          /* rien de neuf, et pas l heure de reaffirmer */
-    if (cipher) {
-        if (changed)
-            kc_seq++;
-        memcpy(buf, &kc_seq, 4);
-    }
-
-    if (fd == -2) {
-        fd = open(SHUNT_KC_PATH, O_WRONLY | O_CREAT, 0666);
-        if (fd < 0) {
-            fd = -1;
-            SHUNT_ERR("KC-NDB : ouverture de %s impossible -- le Kc ne sera pas "
-                      "publie, tout le canal dedie restera indechiffrable",
-                      SHUNT_KC_PATH);
-        }
-    }
-    if (fd < 0)
-        return;
-    if (pwrite(fd, buf, sizeof(buf), 0) < 0) { /* best-effort */ }
-    memcpy(last, buf, sizeof(buf));
-    have = true;
-    if (changed)
-        SHUNT_LOG("KC-NDB : d_a5mode=%u -> %s (Kc=%02x%02x%02x%02x%02x%02x%02x%02x "
-                  "seq=%u)\n", mode, cipher ? "A5 arme" : "CLAIR (32 zeros)",
-                  buf[6], buf[7], buf[8], buf[9], buf[10], buf[11], buf[12], buf[13],
-                  kc_seq);
-}
-
 static bool shunt_capture_tch_ul(uint16_t task_u)
 {
     static int fd_facch = -2, fd_sacch = -2;
@@ -769,9 +672,6 @@ static void shunt_latch_task(uint16_t new_d_dsp_page)
      * run 08/08 : 4804 latch task_u=13 et 200 task_u=14, pour 6 SDCCH-UL publies (tous
      * task_u=12). L'ASSIGNMENT COMPLETE ne pouvait donc pas partir, et l'appel mourait
      * en ASSIGNMENT FAILURE (cause #1) six secondes plus tard, MO comme MT. */
-    /* L etat de chiffrement de la L1 est dans le NDB : on le recopie ici, a
-     * chaque latch, plutot que de dependre d un espion sur le lien L1CTL. */
-    shunt_publish_kc();
     if (g_shunt.d_task_u != 0 && shunt_capture_tch_ul(g_shunt.d_task_u)) {
         /* traite par le chemin TCH ; ne pas retomber sur la fenetre SDCCH */
     } else if (g_shunt.d_task_u != 0) {
