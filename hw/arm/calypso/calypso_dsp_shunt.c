@@ -3542,6 +3542,8 @@ static FILE                 *g_iq_cfile2;  /* cfile #2 FN-espace (zero-fill) -> 
  * Cf. la règle « toute sonde PLAFONNÉE » (TODO.md §4). */
 static int64_t g_c2_written;    /* octets écrits */
 static int64_t g_c2_max = -1;   /* -1 = non résolu, 0 = illimité */
+static char    g_c2_path[4096]; /* chemin du cfile #2, pour la rotation au plafond */
+static int     g_c2_wrap = -1;  /* -1 non resolu ; 1 = rm+recommence (defaut) ; 0 = fermer */
 
 static void cfile2_wr(const void *buf, size_t nfloats)
 {
@@ -3551,13 +3553,40 @@ static void cfile2_wr(const void *buf, size_t nfloats)
         int mb = (e && *e) ? atoi(e) : 512;
         g_c2_max = (mb <= 0) ? 0 : (int64_t)mb * 1024 * 1024;
     }
+    if (g_c2_wrap < 0) {
+        /* [2026-08-29] Comportement au plafond. DEFAUT = rm+recommence (buffer
+         * roulant, l enregistrement ne s arrete jamais, /dev/shm reste borne).
+         * CALYPSO_IQ_CFILE2_WRAP=0 -> ancien comportement : fermeture propre, le
+         * fichier est garde (decodable), PAS de rm. */
+        const char *e = getenv("CALYPSO_IQ_CFILE2_WRAP");
+        g_c2_wrap = (e && *e) ? (atoi(e) != 0) : 1;
+    }
     if (g_c2_max && g_c2_written >= g_c2_max) {
-        SHUNT_ERR("cfile #2 : plafond %lld Mo atteint -> fermeture, le fichier "
-                  "reste decodable (CALYPSO_IQ_CFILE2_MAX_MB=0 pour illimite)",
+        if (!g_c2_wrap) {
+            /* gate CALYPSO_IQ_CFILE2_WRAP=0 : on ferme et on GARDE le fichier. */
+            SHUNT_ERR("cfile #2 : plafond %lld Mo atteint -> fermeture (WRAP=0, "
+                      "fichier garde, decodable ; =1 pour rm+recommence)",
+                      (long long)(g_c2_max / (1024 * 1024)));
+            fclose(g_iq_cfile2);
+            g_iq_cfile2 = NULL;
+            return;
+        }
+        /* DEFAUT : rm + recommence -> buffer roulant borne a MAX_MB */
+        SHUNT_ERR("cfile #2 : plafond %lld Mo atteint -> rotation (rm + redemarrage)",
                   (long long)(g_c2_max / (1024 * 1024)));
         fclose(g_iq_cfile2);
         g_iq_cfile2 = NULL;
-        return;
+        if (g_c2_path[0]) {
+            remove(g_c2_path);
+            g_iq_cfile2 = fopen(g_c2_path, "wb");
+        }
+        g_c2_written = 0;
+        if (!g_iq_cfile2) {
+            SHUNT_ERR("cfile #2 : reouverture apres rotation echouee (%s)",
+                      g_c2_path[0] ? g_c2_path : "chemin inconnu");
+            return;
+        }
+        /* fichier tout neuf : on tombe dans le fwrite ci-dessous */
     }
     fwrite(buf, sizeof(float), nfloats, g_iq_cfile2);
     g_c2_written += (int64_t)nfloats * (int64_t)sizeof(float);
@@ -3641,8 +3670,10 @@ static void shunt_shm_init(void)
     const char *cf2 = getenv("CALYPSO_SHUNT_IQ_CFILE2");
     if (cf2 && *cf2) {
         g_iq_cfile2 = fopen(cf2, "wb");
-        if (g_iq_cfile2)
+        if (g_iq_cfile2) {
+            snprintf(g_c2_path, sizeof(g_c2_path), "%s", cf2);
             SHUNT_ERR("cfile #2 FN-espace -> %s (gap zero-fill)", cf2);
+        }
     }
 }
 
