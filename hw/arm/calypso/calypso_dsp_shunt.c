@@ -65,6 +65,7 @@ extern int g_c54x_int3_src;  /* diag source INT3 (RO) */
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include "hw/arm/calypso/calypso_gsm0502.h"   /* predicats FCCH/SCH partages (GSM 05.02) */
 
 /* FN TDMA reelle (calypso_trx.c) pour recoder la FN du shunt (LATCH d_fn=0) :
  * declaree dans calypso_dsp_internal.h (partagee avec le helper). */
@@ -1034,6 +1035,139 @@ void calypso_dsp_shunt_set_dcch_tch(int on)
 /* Declaration anticipee : la garde interroge la fraicheur du SACCH dedie,
  * defini plus bas. Idiome du fichier, il n y a pas d en-tete. */
 static bool shunt_tch_fresh(bool valid, uint32_t tick);
+/* [2026-08-27] FENETRE DU CANAL DEDIE -- LA MEME QUE CELLE DE L ANNEAU SDCCH.
+ *
+ * a_cd a TROIS ecrivains : le SI du camp, la presentation SACCH dediee, et
+ * l anneau SDCCH de calypso_dsp_helper.c. Seul le troisieme se donne une
+ * fenetre : il ne pose son bloc que si (shunt_l1s_fn() + ofs) % 51 tombe dans la
+ * region SDCCH du type de canal (« fenetre-UNION », calypso_dsp_helper.c). Le
+ * camp, lui, ecrit a CHAQUE tick des que la garde est basse -- y compris dans
+ * cette fenetre, ou le bloc n a pour lecteur que le canal dedie. C est de la que
+ * sortent les « unsupported SAPI » chiffres dans la garde ci-dessous.
+ *
+ * Cette fonction REJOUE la fenetre de l anneau pour pouvoir en exclure le camp.
+ * Les deux doivent rester en phase : si la fenetre-union bouge dans
+ * calypso_dsp_helper.c, elle bouge ici.
+ *
+ * @BEQUILLE INVERSE -- DCCH_SI_WINDOW_MUTE (CALYPSO_DCCH_SI_WINDOW_MUTE, def. 0)
+ *   L etat OFF est le comportement historique : le camp ecrit dans la fenetre et
+ *   on ravale les rejets. ON = le camp se tait dans la fenetre, l anneau SDCCH et
+ *   la presentation SACCH y restant seuls maitres. Le defaut est 0 parce que ce
+ *   chemin n a PAS ete valide en run : la garde voisine documente quatre
+ *   corrections successives dont trois se sont revelees fausses, on n ajoute pas
+ *   la cinquieme sans mesure.
+ *   retirer : quand a_cd est alimente par la demodulation native -- chaque bloc
+ *             arrive alors a SA place dans la multitrame (TODO shunt_dispatch_nb).
+ */
+/* Base fn%102 de la SACCH du sous-canal dedie courant -- MEME table que
+ * shunt_dcch_sacch_present(), factorisee pour que les deux ne divergent pas.
+ * GSM 05.02 : SACCH/C4 SS0..3 -> 42, 46, 93, 97 ; SACCH/C8 SS0..7 -> 32, 36,
+ * 40, 44, 83, 87, 91, 95. */
+static uint32_t shunt_dcch_sacch_base(void)
+{
+    static const uint8_t base4[4] = { 42, 46, 93, 97 };
+    static const uint8_t base8[8] = { 32, 36, 40, 44, 83, 87, 91, 95 };
+    if (g_shunt.sdcch_ch8)
+        return base8[(g_shunt.sdcch_ss / 4u) & 7u];
+    switch (g_shunt.sdcch_ss) {
+    case 26: return base4[1];
+    case 32: return base4[2];
+    case 36: return base4[3];
+    default: return base4[0];            /* 22 = SS0 */
+    }
+}
+
+static int shunt_dcch_si_window(void)   /* 0 = aucune, 1 = canal principal, 2 = SACCH */
+{
+    static int on = -1, ofs = 0;
+    if (on < 0) {
+        /* [2026-08-27] DEFAUT PASSE A 1. La premiere version etait a 0, faute de
+         * mesure. La mesure existe : sur un run de 4576 lignes de mobile.log,
+         * 425 « unsupported SAPI » (6 x181, 4 x79, 2 x78, 5 x72, 1 x15), 39
+         * « Short header 0x07 », 49 « Unnumbered frame not allowed » (-> 50
+         * MDL-ERROR cause 12) et 3 « multi-octet length ». Sur le seul lien
+         * SACCH : 46 trames recues, 9 acceptees, 37 rejetees -- QUATRE BLOCS SUR
+         * CINQ jetes. Poser 0 revenait a garder ce taux.
+         * CALYPSO_DCCH_SI_WINDOW_MUTE=0 retablit l ancien comportement. */
+        const char *e = getenv("CALYPSO_DCCH_SI_WINDOW_MUTE"); on  = (!e || *e != '0');
+        const char *o = getenv("CALYPSO_SHUNT_SDCCH_OFS");     ofs = o ? atoi(o) : 0;
+    }
+    if (!on) return 0;
+
+    /* 1. Fenetre du canal PRINCIPAL -- memes bornes que l anneau SDCCH de
+     *    calypso_dsp_helper.c : arme -> [0,31] en /8, [22,39] en /4 ; pas encore
+     *    arme -> union [0,39], le type n etant pas positivement connu.
+     *    C est de la que sortent les SAPI 5/6/2/4 (l2h[0] = pseudo-longueur du
+     *    bloc BCCH lue comme octet d adresse LAPDm). */
+    {
+        int armed = g_shunt.sdcch_ss_set;
+        int lo = armed ? (g_shunt.sdcch_ch8 ? 0  : 22) : 0;
+        int hi = armed ? (g_shunt.sdcch_ch8 ? 31 : 39) : 39;
+        int tc = (int)((((long)shunt_l1s_fn() + ofs) % 51 + 51) % 51);
+        if (tc >= lo && tc <= hi) return 1;
+    }
+
+    /* 2. Fenetre SACCH du canal dedie -- fn%102, cadence DIFFERENTE de la
+     *    precedente, donc non couverte par elle. C est de la que sortent le
+     *    « Short header 0x07 » (SI4 : l2h[2] = 0x1c, & 3 == 0 -> Bter ->
+     *    msg_type 0x07), les SAPI 6 issus de SI1/SI2/SI3 (l2h[2] = 0x19/1a/1b)
+     *    et les « Unnumbered frame not allowed » du lien SACCH.
+     *    Inutile sur TCH : la fenetre fn%102 heritee du SDCCH y est hors phase
+     *    (multitrame de 26) -- meme raison qu au point 22 de
+     *    calypso_dsp_shunt_set_dcch_tch. */
+    if (g_shunt.sdcch_ss_set && !g_shunt.dcch_is_tch) {
+        uint32_t b = shunt_dcch_sacch_base();
+        uint32_t f102 = (uint32_t)calypso_trx_get_fn() % 102u;
+        if (f102 >= b && f102 <= b + 3u) return 2;
+    }
+    return 0;
+}
+
+/* [2026-08-27] MUSELER NE SUFFIT PAS : IL FAUT REMPLACER.
+ *
+ * La premiere version de la fenetre se contentait de NE PAS ecrire. Or a_cd est
+ * un buffer : ne pas ecrire, c est laisser le bloc PRECEDENT, que le firmware
+ * relit tel quel. Le mobile recevait donc une trame LAPDm rejouee -- d ou deux
+ * erreurs qui n existaient pas avant la fenetre, mesurees sur le run de 15:46 :
+ *     6 x « Timeout T200 state=LAPD_STATE_SABM_SENT »  (l UA n arrive jamais)
+ *     4 x « S frame ignored in this state »            (supervision rejouee)
+ * L echec remontait de MF_EST a l ETABLISSEMENT : pire qu avant.
+ *
+ * On presente donc une trame de BOURRAGE LAPDm valide, ce que fait un vrai
+ * reseau quand il n a rien a dire. Le mobile la range, lit L3 = 0 et la jette
+ * sans un mot : c est exactement le « length=0 (discarding) » deja observe 45
+ * fois sur le canal principal, sans une seule erreur associee.
+ *
+ * Deux formats, parce que les deux fenetres ne se lisent pas pareil :
+ *   canal principal : le bloc EST la trame L2      -> 03 03 01 puis 0x2B
+ *   SACCH           : en-tete L1 (2 o) NON strippe -> 00 00 03 03 01 puis 0x2B
+ * (adresse 0x03 = SAPI 0, C/R, EA=1 ; controle 0x03 = UI -> format B/B4 ;
+ *  longueur 0x01 = L3 vide. Meme convention que le seed de feed_si.) */
+/* Declarations anticipees : les primitives NDB sont definies plus bas.
+ * Idiome du fichier, il n y a pas d en-tete. */
+static void shunt_ndb_hdr(uint16_t *d, unsigned w, bool blud);
+static void shunt_ndb_put_l2(uint16_t *d, unsigned w, const uint8_t *l2);
+
+static void shunt_dcch_present_fill(uint16_t *d, int kind)
+{
+    uint8_t f[23];
+    memset(f, 0x2b, sizeof(f));
+    if (kind == 2) {                 /* SACCH : en-tete L1 devant */
+        f[0] = 0x00; f[1] = 0x00;
+        f[2] = 0x03; f[3] = 0x03; f[4] = 0x01;
+    } else {                         /* canal principal : L2 directement */
+        f[0] = 0x03; f[1] = 0x03; f[2] = 0x01;
+    }
+    shunt_ndb_hdr(d, ndb_w(g_ndb.a_cd), true);
+    shunt_ndb_put_l2(d, ndb_w(g_ndb.a_cd), f);
+    {
+        static unsigned long long n_fill = 0;
+        if (n_fill++ < 20 || (n_fill % 500) == 0)
+            SHUNT_LOG("DCCH-BOURRAGE #%llu : fenetre %s -> trame LAPDm vide dans a_cd\n",
+                      n_fill, kind == 2 ? "SACCH" : "principale");
+    }
+}
+
 static bool shunt_dcch_si_guard(void)
 {
     static int ttl = -1;
@@ -2413,7 +2547,11 @@ void calypso_dsp_shunt_on_frame_tick(void)
              * la ou il attend un rapport de mesure. Meme raison, meme forme que le
              * garde-fou sdcch_valid juste a cote. En dedie le mobile ne lit pas le
              * BCCH : aucun SI n'est perdu. */
+            int _win = shunt_dcch_si_window();
+            if (_win && g_shunt.c54x && g_shunt.c54x->data)
+                shunt_dcch_present_fill(g_shunt.c54x->data, _win);
             if (g_shunt.si_valid && !g_shunt.sdcch_valid && !shunt_dcch_si_guard()
+                && !_win
                 && !g_shunt.tch_cfg_valid
                 && !(g_shunt.agch_valid && (g_shunt.agch_buf[2] == 0x3f
                      || g_shunt.agch_buf[2] == 0x3a || g_shunt.agch_buf[2] == 0x3b))
@@ -3787,8 +3925,8 @@ void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
          * s2=0x0000` — le feed ecrivait des ZEROS depuis le debut. Confirme
          * independamment par tools_/corr_iq.py : bursts non nuls a fn%51 ∈
          * {0,10,20,30,40}. Gate CALYPSO_FEED_FN_CANON=0 pour restaurer le +1. */
-        int _is_fcch = feed_fn_canon() ? ((_p % 10 == 0) && (_p <= 40))
-                                       : ((_p % 10 == 1) && (_p <= 41));
+        int _is_fcch = feed_fn_canon() ? gsm0502_p51_is_fcch((unsigned)_p)
+                                       : gsm0502_p51_is_fcch_legacy_plus1((unsigned)_p);
         /* @BEQUILLE — FB_IQ_MARKER  (CALYPSO_FB_IQ_MARKER, atoi>0, defaut OFF)
          *   masque  : rien de reel — remplace l'IQ par une RAMPE 0x1000+woff pour tester
          *             la reachabilite de la vue DARAM du noyau. Court-circuite la branche
@@ -3882,8 +4020,8 @@ void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
             /* [2026-08-22] CORRIGE : le SCH est en {1,11,21,31,41} (canonique
              * GSM 05.02, prouve par FN-ALIGN sch%51). J'avais herite de la fausse
              * premisse « FCCH=+1 » du bloc FB et vise {2,12,22,32,42} -> zeros. */
-            int _is_sch = feed_fn_canon() ? ((_sp % 10 == 1) && (_sp <= 41))
-                                          : ((_sp % 10 == 2) && (_sp <= 42));
+            int _is_sch = feed_fn_canon() ? gsm0502_p51_is_sch((unsigned)_sp)
+                                          : gsm0502_p51_is_sch_legacy_plus1((unsigned)_sp);
             if (_is_sch) {
                 uint16_t base = _sbbase; int dl = 0x128; int woff = 0;
                 /* /!\ 0x0e4e est DANS la fenetre API (0x0800..0x27FF) : c'est

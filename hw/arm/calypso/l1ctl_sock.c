@@ -359,9 +359,27 @@ static void sercomm_frame_complete(L1CTLSock *s)
          * ═══════════════════════════════════════════════════════════════════ */
         if ((payload[0] == 0x0f || payload[0] == 0x03) && plen >= 5) {
             uint8_t chan_nr = payload[4];
+            /* [2026-08-27] LE DEDIE PUBLIE NE SE RESUMAIT PAS AU SDCCH.
+             * `kind` ne valait >= 0 que pour SDCCH/4 et SDCCH/8. Sur un TCH il
+             * restait -1, donc le bloc de publication plus bas ne s'executait
+             * PAS : /dev/shm/calypso_dcch_cfg gardait le dernier SDCCH pendant
+             * TOUT l'appel. Le pont, qui lit cette bande laterale pour savoir
+             * quel canal dedie suivre, continuait donc de croire a un SDCCH/8
+             * SS0 sur TS1 alors que le mobile etait passe sur un TCH/F.
+             * Rien ne signalait l'ecart : la bande laterale ne MENT pas, elle
+             * n'est simplement jamais rafraichie -- indiscernable d'un canal
+             * inchange.
+             * On publie donc TOUS les canaux dedies, avec leur TYPE et leur TN.
+             * Le TN vient du chan_nr lui-meme (bits 2..0), donc « TS1 = TCH/F »
+             * se decrit tout seul, sans table de configuration a tenir a jour.
+             *   kind 0 = SDCCH/4 · 1 = SDCCH/8 · 2 = TCH/F · 3 = TCH/H
+             * La fenetre de presentation a_cd, elle, n'a de sens que sur SDCCH :
+             * set_dcch() reste donc reservee a kind <= 1 (cf. set_dcch_tch). */
             int kind = -1, ss = 0;
             if ((chan_nr & 0xE0) == 0x20)      { kind = 0; ss = (chan_nr >> 3) & 0x03; }
             else if ((chan_nr & 0xC0) == 0x40) { kind = 1; ss = (chan_nr >> 3) & 0x07; }
+            else if ((chan_nr & 0xF8) == 0x08) { kind = 2; ss = 0; }               /* TCH/F */
+            else if ((chan_nr & 0xF0) == 0x10) { kind = 3; ss = (chan_nr >> 3) & 1; } /* TCH/H */
             static uint8_t last_chan_nr = 0xFF;
             /* [2026-08-09] FRONT DE LIBERATION DU DEDIE, dans le sens que QEMU
              * parse REELLEMENT. Premiere tentative : accrocher DM_REL_REQ (0x12)
@@ -421,12 +439,19 @@ static void sercomm_frame_complete(L1CTLSock *s)
                     if (write(dfd, b, sizeof(b)) < 0) { /* ignore */ }
                     close(dfd);
                 }
-                L1CTL_LOG("DCCH #%u : chan_nr=0x%02x -> SDCCH/%d SS=%d TN=%u "
-                          "(vu sur %s)", dcch_seq, chan_nr, kind ? 8 : 4, ss,
+                static const char *const knom[4] = { "SDCCH/4", "SDCCH/8",
+                                                    "TCH/F", "TCH/H" };
+                L1CTL_LOG("DCCH #%u : chan_nr=0x%02x -> %s SS=%d TN=%u "
+                          "(vu sur %s)", dcch_seq, chan_nr, knom[kind], ss,
                           chan_nr & 0x07, l1ctl_tname(payload[0]));
                 /* La MEME verite pilote la fenetre de presentation a_cd du shunt,
-                 * qui suivait jusqu'ici les IMM ASSIGN des autres abonnes. */
-                calypso_dsp_shunt_set_dcch(kind, ss);
+                 * qui suivait jusqu'ici les IMM ASSIGN des autres abonnes.
+                 * Uniquement sur SDCCH : sur TCH la fenetre fn%51 n'a pas de sens
+                 * dans une multitrame de 26 (cf. calypso_dsp_shunt_set_dcch_tch),
+                 * et set_dcch() calculerait une base a partir d'un `kind` qu'elle
+                 * ne connait pas. */
+                if (kind <= 1)
+                    calypso_dsp_shunt_set_dcch(kind, ss);
             }
         }
         L1CTL_LOG("TX→mobile: dlci=%d len=%d type=0x%02x %s", dlci, plen, payload[0],
