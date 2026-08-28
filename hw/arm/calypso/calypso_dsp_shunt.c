@@ -65,6 +65,7 @@ extern int g_c54x_int3_src;  /* diag source INT3 (RO) */
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include "hw/arm/calypso/calypso_gsm0502.h"   /* predicats FCCH/SCH partages (GSM 05.02) */
 
 /* FN TDMA reelle (calypso_trx.c) pour recoder la FN du shunt (LATCH d_fn=0) :
  * declaree dans calypso_dsp_internal.h (partagee avec le helper). */
@@ -3924,8 +3925,8 @@ void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
          * s2=0x0000` — le feed ecrivait des ZEROS depuis le debut. Confirme
          * independamment par tools_/corr_iq.py : bursts non nuls a fn%51 ∈
          * {0,10,20,30,40}. Gate CALYPSO_FEED_FN_CANON=0 pour restaurer le +1. */
-        int _is_fcch = feed_fn_canon() ? ((_p % 10 == 0) && (_p <= 40))
-                                       : ((_p % 10 == 1) && (_p <= 41));
+        int _is_fcch = feed_fn_canon() ? gsm0502_p51_is_fcch((unsigned)_p)
+                                       : gsm0502_p51_is_fcch_legacy_plus1((unsigned)_p);
         /* @BEQUILLE — FB_IQ_MARKER  (CALYPSO_FB_IQ_MARKER, atoi>0, defaut OFF)
          *   masque  : rien de reel — remplace l'IQ par une RAMPE 0x1000+woff pour tester
          *             la reachabilite de la vue DARAM du noyau. Court-circuite la branche
@@ -4019,8 +4020,8 @@ void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
             /* [2026-08-22] CORRIGE : le SCH est en {1,11,21,31,41} (canonique
              * GSM 05.02, prouve par FN-ALIGN sch%51). J'avais herite de la fausse
              * premisse « FCCH=+1 » du bloc FB et vise {2,12,22,32,42} -> zeros. */
-            int _is_sch = feed_fn_canon() ? ((_sp % 10 == 1) && (_sp <= 41))
-                                          : ((_sp % 10 == 2) && (_sp <= 42));
+            int _is_sch = feed_fn_canon() ? gsm0502_p51_is_sch((unsigned)_sp)
+                                          : gsm0502_p51_is_sch_legacy_plus1((unsigned)_sp);
             if (_is_sch) {
                 uint16_t base = _sbbase; int dl = 0x128; int woff = 0;
                 /* /!\ 0x0e4e est DANS la fenetre API (0x0800..0x27FF) : c'est

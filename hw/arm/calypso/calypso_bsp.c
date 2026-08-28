@@ -47,6 +47,7 @@ static uint32_t d_rach_word_offset(void);
 static int rach_force_bsic(void);
 
 #include "hw/arm/calypso/calypso_debug.h"
+#include "hw/arm/calypso/calypso_gsm0502.h"   /* predicats FCCH/SCH partages (GSM 05.02) */
 
 /* [2026-07-27] DARAM-FNSTAMP : publiees pour le dump c54x (diag). */
 unsigned calypso_daram_last_fn;
@@ -1631,8 +1632,11 @@ void calypso_bsp_rx_burst(uint8_t tn, uint32_t fn,
              *   FCCH = {0,10,20,30,40} mod 51   (tache FB)
              *   SCH  = {1,11,21,31,41} mod 51   (tache SB, canonique GSM 05.02)
              * Mettre 2 pour restreindre a la FCCH seule (ancien comportement). */
-            int _is_fcch = (_p51 % 10 == 0) && (_p51 <= 40);
-            int _is_sch  = (_p51 % 10 == 1) && (_p51 <= 41);
+            /* [2026-08-28] Comportement INCHANGE : ce site etait deja
+             * canonique. On le branche sur la definition partagee pour qu'il
+             * ne puisse plus rederiver a la main. */
+            int _is_fcch = gsm0502_p51_is_fcch((unsigned)_p51);
+            int _is_sch  = gsm0502_p51_is_sch((unsigned)_p51);
             _skip_nonfcch = (_dfo >= 2) ? !_is_fcch : !(_is_fcch || _is_sch);
             if (_skip_nonfcch) {
                 static unsigned _sk2 = 0;
