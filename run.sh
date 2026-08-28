@@ -245,21 +245,6 @@ calypso-ipc-device fake_trx trxcon grgsm_decode si_bridge.py qemu_bcch_grgsm"
         [ -e "$art" ] && rm -f "$art" 2>/dev/null && printf '  supprimé              %s\n' "$art" >&2
     done
 
-    # ── BALAYAGE FINAL DE _reset ────────────────────────────────────────────
-    # Le `"$0" --stop` du debut fait deja un killall python3. Mais il tourne
-    # AVANT l'archivage des journaux, qui peut durer des dizaines de secondes
-    # (mesure du 30/07 : 62 Mo -> ~40 s). Pendant cette fenetre, le lanceur
-    # differe du pont arme par start-direct.sh peut se reveiller et re-binder
-    # 5700-5702 : on repart alors avec un pont de la generation PRECEDENTE,
-    # desynchronise du BTS qui vient de redemarrer -- SABM sans UA, LU en echec.
-    # C'est exactement la course que documente 09-teardown.sh l.60-65.
-    # On repasse donc un coup a la toute fin, quand plus rien ne doit tourner.
-    if [ "${CALYPSO_STOP_KILL_PYTHON:-1}" != 0 ]; then
-        if killall -9 python3 2>/dev/null; then
-            printf '  python3 rescapes terminés (killall de fin)\n' >&2
-        fi
-    fi
-
     printf '\nÉtat propre. Relancez, la ligne de commande fera foi :\n' >&2
     printf '   CALYPSO_MODE=native ./run.sh\n\n' >&2
 }
@@ -309,28 +294,6 @@ if [ "$ACTION" = reset ]; then _reset; exit 0; fi
 # (ça relirait load.env dans un environnement déjà pollué) : on enchaîne dans
 # le même processus, dont l'environnement est exactement la ligne de commande.
 if [ "$ACTION" = restart ]; then _reset; ACTION=start; fi
-
-# ── BALAYAGE AU DEMARRAGE ─────────────────────────────────────────────────────
-# [2026-08-27] Le balayage n'existait que sur --stop et en fin de _reset. Or un
-# `./run.sh` simple ne passe par NI l'un NI l'autre : le module d'arret se declare
-# « already running » et rend la main, si bien qu'aucun python3 de la generation
-# precedente n'est touche. Il suffit alors d'UN orphelin pour tuer le run :
-#     [SKIP] Shutting down recorded processes (already running)
-#     [FAIL] BTS#1 simulated transceiver (port UDP 5720 deja pris)
-# -- et c'etait un fake_trx.py rescape, invisible du registre des modules.
-#
-# On balaie donc aussi a l'entree du demarrage. -9 et pas -15 : un python3 bloque
-# dans un recvfrom ignore SIGTERM et garde son port, ce qui est exactement le cas
-# qu'on veut eliminer.
-#
-# PORTEE : tue TOUS les python3 de la machine, pas seulement ceux de la maquette.
-# Assume sur un banc dedie. CALYPSO_STOP_KILL_PYTHON=0 le desactive.
-if [ "$ACTION" = start ] && [ "${CALYPSO_STOP_KILL_PYTHON:-1}" != 0 ]; then
-    if killall -9 python3 2>/dev/null; then
-        printf '  python3 de la generation precedente termines (killall -9)\n' >&2
-        sleep 1     # laisse le noyau rendre les ports UDP avant le premier bind
-    fi
-fi
 
 LOGDIR="${LOG_DIR:-/root/calypso/logs}"
 mkdir -p "$LOGDIR/mod" 2>/dev/null || true
@@ -514,28 +477,6 @@ for m in "${selected[@]}"; do
     say_end " $(t ok) " "$C_OK" "$(t_mod "$m")"
     STATE[$m]=ok; nb_ok=$((nb_ok+1))
 done
-
-# --- ARRET : BALAYAGE FINAL DES PYTHON DE LA MAQUETTE -------------------------
-# Les modules arretent ce qu'ils ont ENREGISTRE. Or la chaine compte plusieurs
-# scripts Python qui survivent a un run interrompu ou qui n'ont jamais ete
-# enregistres : pont.py, fake_trx.py, trxcon, si_bridge.py, gsm_sniff.py,
-# qemu_bcch_grgsm.py, record_drain.py. Il suffit qu'UN SEUL garde son port pour
-# que le run suivant echoue -- mesure du 2026-08-27 :
-#     [FAIL] BTS#1 simulated transceiver (port UDP 5720 deja pris par un autre
-#            processus)
-# et c'etait un fake_trx.py orphelin, invisible du registre.
-#
-# PORTEE, A SAVOIR AVANT DE LANCER CECI AILLEURS : killall python3 tue TOUS les
-# python3 de la machine, pas seulement ceux de la maquette. C'est assume sur un
-# banc dedie, et c'est exactement ce qui a ete demande. Sur une machine partagee,
-# poser CALYPSO_STOP_KILL_PYTHON=0.
-if [ "$ACTION" = stop ] && [ "${CALYPSO_STOP_KILL_PYTHON:-1}" != 0 ]; then
-    if killall -9 python3 2>/dev/null; then
-        printf '  %spython3 restants termines (killall)%s\n' "${C_DIM:-}" "${C_Z:-}"
-    else
-        printf '  %saucun python3 restant%s\n' "${C_DIM:-}" "${C_Z:-}"
-    fi
-fi
 
 printf '\n%s\n' "$(t bilan "$nb_ok" "$nb_skip" "$nb_fail")"
 

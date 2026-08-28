@@ -901,28 +901,8 @@ void shunt_dispatch_allc(uint8_t page_idx)
                       (canned_on || shunt_is_canned(CAN_SNR)) ? SHUNT_CANNED_SNR : g_shunt.rx_snr);
     }
 
-    /* [2026-08-27] PLAFOND -- cette sonde etait la SEULE du fichier sans garde.
-     * Ses voisines en ont toutes une : DISPATCH AGCH (n_agch < 40 ou % 50),
-     * DISPATCH SB (deduplication + % 2000), DISPATCH SDCCH/SACCH (compteurs),
-     * et LATCH cote shunt ne tire que sur changement de cle. Celle-ci tirait a
-     * CHAQUE dispatch ALLC, donc dans le chemin chaud du tick DSP.
-     *
-     * MESURE, run de 188 s : 10817 lignes pour cette seule sonde, ~58 ecritures
-     * formatees SYNCHRONES par seconde vers qemu.log (2,9 Mo, ~200 lignes/s
-     * toutes sondes confondues). Une trame GSM dure 4,615 ms -- ~217 trames/s --
-     * donc une ligne toutes les quatre trames, ecrite depuis l'interieur du tick.
-     * Sur le meme run, osmo-bts comptait 31 compensations d'horloge par seconde
-     * sur le BTS derriere QEMU contre 0,9 sur le BTS logiciel, et une trame
-     * parole part toutes les 20 ms : de quoi rendre la voix hachee.
-     *
-     * On garde le debut du run puis un echantillon, rythme calque sur AGCH. */
-    {
-        static unsigned n_allc = 0;
-        if (n_allc++ < 40 || (n_allc % 200) == 0)
-            SHUNT_LOG("DISPATCH ALLC #%u page=%u burst_d=%u -> SI3 a_cd[3..14] "
-                      "+ a_serv_demod %s\n", n_allc,
-                      page_idx, g_shunt.d_burst_d, canned_on ? "CANNED(hack)" : "reel");
-    }
+    SHUNT_LOG("DISPATCH ALLC page=%u burst_d=%u -> SI3 a_cd[3..14] + a_serv_demod %s\n",
+        page_idx, g_shunt.d_burst_d, canned_on ? "CANNED(hack)" : "reel");
 }
 
 /* ---- DISPATCH PM : tâche power-measurement (md=1). Écrit a_pm[3] @ +0x18,
