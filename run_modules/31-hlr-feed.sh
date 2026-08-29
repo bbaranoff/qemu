@@ -110,16 +110,37 @@ mod_hlr_feed_start() {
     # Le legacy attendait ici le VTY 90 × 2 s en tâche de fond (L1578) : le HLR
     # pouvait ne pas être prêt. Ce sleep n'a plus lieu d'être — la barrière du
     # module `core` garantit déjà que 4258 écoute, sinon ce module est sauté.
-    # Convention de la maquette : MSISDN = 1000 + rang du mobile, le rang étant
-    # le dernier chiffre significatif de l'IMSI (…000001 -> 1, …000002 -> 2).
-    # Prendre bêtement les 5 derniers chiffres de l'IMSI donnait « 00001 », un
-    # numéro que personne n'appelle : « show subscriber msisdn 10001 » répondait
-    # « No subscriber found » et tout SMS vers le MS#1 échouait en silence.
-    # CALYPSO_MSISDN_BASE permet de changer de plan de numérotation sans toucher
-    # au code.
-    local rang msisdn out
-    rang="$(printf '%s' "${_HLRF_IMSI: -4}" | sed 's/^0*//')"; : "${rang:=1}"
-    msisdn="${CALYPSO_MSISDN_BASE:-1000}${rang}"
+    # ── LE PLAN DE NUMÉROTATION : <nœud>00<opérateur><rang> ─────────────
+    # 100101, 100102 pour le nœud 1 opérateur 1 ; 200101 pour le nœud 2.
+    #
+    # Ce module concaténait « CALYPSO_MSISDN_BASE » (1000 par défaut) et le
+    # rang, soit 10001, 10002. Deux défauts, et le second est le grave :
+    #   - le numéro ne disait RIEN du nœud qui le porte ; sur un banc à
+    #     plusieurs nœuds, l'opérateur 1 de chacun revendiquait 10001, et un
+    #     appel ou un SMS partait chez le premier qui répond ;
+    #   - il ne disait rien non plus de l'OPÉRATEUR : la base était la même
+    #     pour tous, alors que l'IMSI, lui, le porte.
+    # Le dialplan (extensions.conf) et les routes SMS attendent désormais
+    # <nœud>00<op><rang> — le HLR restait seul sur l'ancien plan, l'abonné
+    # s'attachait mais nul ne pouvait le joindre.
+    #
+    # Opérateur et rang sont LUS DANS L'IMSI (MCC MNC %04d(op) %06d(ms)), pas
+    # redevinés : c'est le même IMSI qui vient d'être extrait de la cfg mobile,
+    # donc celui que le mobile présentera vraiment. Le nœud vient de
+    # l'environnement (start-direct.sh l'exporte) puis de radio-plan.env.
+    # CALYPSO_MSISDN_BASE reste honoré, en surcharge complète, pour un banc qui
+    # aurait son propre plan.
+    local rang msisdn out node op
+    node="${OSMO_WAN_NODE:-${WAN_NODE_ID:-}}"
+    [ -n "$node" ] || node="$(sed -n 's/^PLAN_NODE=//p' "${OSMOCOM_CFG:-/etc/osmocom}/radio-plan.env" 2>/dev/null | tail -1)"
+    case "$node" in [1-9]) ;; *) node=1 ;; esac
+    op="$(printf '%s' "${_HLRF_IMSI:5:4}" | sed 's/^0*//')";   : "${op:=1}"
+    rang="$(printf '%s' "${_HLRF_IMSI:9:6}" | sed 's/^0*//')"; : "${rang:=1}"
+    if [ -n "${CALYPSO_MSISDN_BASE:-}" ]; then
+        msisdn="${CALYPSO_MSISDN_BASE}${rang}"
+    else
+        msisdn=$(( node * 100000 + op * 100 + rang ))
+    fi
     out="$(_hlrf_vty \
         "subscriber imsi $_HLRF_IMSI create" \
         "subscriber imsi $_HLRF_IMSI update msisdn $msisdn" \
@@ -128,7 +149,7 @@ mod_hlr_feed_start() {
         mod_fail "VTY HLR ${CALYPSO_HLR_VTY_IP}:${OSMO_VTY_HLR} injoignable"
         return $MOD_RC_FAIL
     }
-    mod_say "$out"
+    mod_say "MSISDN $msisdn (nœud $node, opérateur $op, rang $rang) — $out"
     mod_ok
 }
 
