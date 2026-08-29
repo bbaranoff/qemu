@@ -6,7 +6,7 @@
 #            rejeté (« IMSI unknown in HLR ») et l'on croit à une panne radio.
 #            Reprend la dérivation exacte de feed_hlr (start-direct.sh) :
 #              IMSI   = MCC MNC %04d(op) %06d(ms)
-#              MSISDN = op * 10000 + ms
+#              MSISDN = <nœud>00<op><ms>       (100101, 100102, 100201...)
 #              Ki     = 00112233445566778899aabbccdd %02x(ms) %02x(op)
 #  PRÉREQUIS HLR prêt (VTY joignable) ; socat ou telnet pour parler au VTY.
 #  SUCCÈS    le DERNIER abonné de la série est réellement relu depuis le HLR —
@@ -40,6 +40,30 @@ _abo_mnc() { printf '%s\n' "${MNC:-$(core_cfg_field "$(core_cfg osmo-msc)" '^[[:
 _abo_imsi() { printf '%s%s%04d%06d\n' "$(_abo_mcc)" "$(_abo_mnc)" "$OPERATOR_ID" "$1"; }
 _abo_ki()   { printf '00112233445566778899aabbccdd%02x%02x\n' "$1" "$OPERATOR_ID"; }
 
+# ── LE NŒUD N'ENTRE QUE DANS LE MSISDN ────────────────────────────────
+# IMSI et Ki gardent EXACTEMENT leur dérivation : ils sont recalculés à
+# l'identique par start-direct.sh (ms_imsi/ms_ki), start.sh et le gabarit de
+# mobile.cfg. Y glisser le nœud ferait diverger le Ki du mobile de celui du
+# HLR, et l'authentification échouerait sur un Kc différent des deux côtés —
+# sans autre trace qu'un CIPHER MODE rejeté.
+# Le MSISDN, lui, ne sert à aucun calcul : c'est une adresse, et elle doit dire
+# de quel nœud elle vient, sinon deux nœuds revendiquent les mêmes numéros.
+#
+# L'ancien plan était « op * 10000 + ms » — 10001, 10002. Cinq chiffres dont le
+# premier EST le numéro d'opérateur : le numéro ne disait rien de la machine
+# qui le porte, et sur un banc à plusieurs nœuds l'opérateur 1 du nœud 1 et
+# celui du nœud 2 revendiquaient tous deux 10001. Le dépôt osmo_egprs a changé
+# de plan (generate_configs.sh, osmo_msisdn) ; ce module était resté en arrière
+# et c'est LUI que run.sh exécute — le HLR gardait donc 10001/10002 pendant que
+# le dialplan et les routes SMS attendaient 100101/100102.
+_abo_node() {
+    local n="${OSMO_WAN_NODE:-${WAN_NODE_ID:-}}"
+    [ -n "$n" ] || n="$(sed -n 's/^PLAN_NODE=//p' "${OSMOCOM_CFG:-/etc/osmocom}/radio-plan.env" 2>/dev/null | tail -1)"
+    case "$n" in [1-9]) ;; *) n=1 ;; esac
+    printf '%s' "$n"
+}
+_abo_msisdn() { echo $(( $(_abo_node) * 100000 + OPERATOR_ID * 100 + $1 )); }
+
 # Relecture de l'abonné : base sqlite en lecture seule d'abord (fiable et
 # instantanée), VTY en repli si sqlite est indisponible.
 _abo_present() {
@@ -64,20 +88,48 @@ mod_abonnes_hlr_check() {
     mod_ok
 }
 
-mod_abonnes_hlr_status() { _abo_present "$(_abo_imsi "$N_MS")"; }
+# ── L'ÉTAT, C'EST L'IMSI *ET* SON MSISDN ────────────────────────────
+# Ne vérifier que la présence de l'IMSI rend cette étape aveugle à tout
+# changement de numérotation : après un « ./start-direct.sh --regen », les
+# configs repartent sur <nœud>00<op><ms> pendant que le HLR garde les MSISDN
+# de l'ancien plan. L'IMSI, lui, n'a pas bougé — le module se déclarait donc
+# « déjà fait » et ne mettait rien à jour. L'abonné s'attachait (l'IMSI est
+# connu) mais restait injoignable : aucun appel, aucun SMS, et rien nulle part
+# pour dire que le numéro du HLR n'était plus celui du dialplan.
+# « subscriber ... update msisdn » est idempotent : rejouer ne coûte rien.
+_abo_msisdn_now() {
+    local imsi="$1" v=""
+    if [ -r "$HLR_DB" ] && command -v sqlite3 >/dev/null 2>&1; then
+        v="$(sqlite3 -readonly "$HLR_DB" "select msisdn from subscriber where imsi='$imsi';" 2>/dev/null)"
+        [ -n "$v" ] && { printf '%s' "$v"; return 0; }
+    fi
+    core_vty_ask "$HLR_VTY_PORT" "enable" "subscriber imsi $imsi show" 2>/dev/null \
+        | sed -n 's/.*MSISDN: *\([0-9][0-9]*\).*/\1/p' | head -1
+}
+
+mod_abonnes_hlr_status() {
+    local imsi; imsi="$(_abo_imsi "$N_MS")"
+    _abo_present "$imsi" || return 1
+    [ "$(_abo_msisdn_now "$imsi")" = "$(_abo_msisdn "$N_MS")" ]
+}
 
 mod_abonnes_hlr_start() {
     local m cmds=() imsi msisdn
     cmds+=("enable")
     for m in $(seq 1 "$N_MS"); do
         imsi="$(_abo_imsi "$m")"
-        msisdn=$(( OPERATOR_ID * 10000 + m ))
+        msisdn="$(_abo_msisdn "$m")"
         cmds+=("subscriber imsi $imsi create")
         cmds+=("subscriber imsi $imsi update msisdn $msisdn")
         cmds+=("subscriber imsi $imsi update aud2g comp128v1 ki $(_abo_ki "$m")")
     done
-    cmds+=("end")
-    mod_say "provisionnement de $N_MS abonné(s), opérateur $OPERATOR_ID, PLMN $(_abo_mcc)-$(_abo_mnc)"
+    # « exit » et non « end » : au nœud enable, end n'existe pas — le VTY
+    # répondait « % Unknown command. » et surtout laissait la session OUVERTE.
+    # telnet, contrairement à socat, ne rend pas la main sur EOF de stdin : il
+    # restait pendu jusqu'au timeout, qui le tuait avec un code non nul, et le
+    # provisionnement était compté en échec alors qu'il avait eu lieu.
+    cmds+=("exit")
+    mod_say "provisionnement de $N_MS abonné(s), nœud $(_abo_node), opérateur $OPERATOR_ID, PLMN $(_abo_mcc)-$(_abo_mnc) — MSISDN $(_abo_msisdn 1)..$(_abo_msisdn "$N_MS")"
     core_vty_ask "$HLR_VTY_PORT" "${cmds[@]}" || {
         mod_hint "vérifiez le VTY : socat STDIO TCP:127.0.0.1:$HLR_VTY_PORT,crlf"
         mod_fail "le dialogue VTY avec le HLR n'a rien retourné"; return $MOD_RC_FAIL; }
